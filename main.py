@@ -241,7 +241,7 @@ async def trigger_store_scrape(store_id: int, db: Session = Depends(get_db)):
     return {"success": True, "products_found": len(products)}
 
 # --- Serve Frontend ---
-frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend")
+frontend_path = os.path.join(os.path.dirname(__file__), ".")
 
 @app.get("/")
 async def serve_root():
