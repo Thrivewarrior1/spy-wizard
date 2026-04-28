@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spy Wizard — Product Intelligence</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0a0f;--bg2:#12121a;--surface:#1a1a26;--surface2:#222233;
+  --accent:#8b5cf6;--accent2:#a78bfa;--accent3:#6d28d9;
+  --green:#10b981;--red:#ef4444;--yellow:#f59e0b;
+  --text:#e2e8f0;--text2:#94a3b8;--text3:#64748b;
+  --border:rgba(139,92,246,.12);--border2:rgba(255,255,255,.06);
+}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+::selection{background:var(--accent);color:#fff}
+
+/* Login */
+.login-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;background:var(--bg)}
+.login-box{background:var(--surface);border:1px solid var(--border2);border-radius:20px;padding:3rem;width:380px;text-align:center}
+.login-box h1{font-size:1.8rem;margin-bottom:.5rem;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.login-box p{color:var(--text3);font-size:.85rem;margin-bottom:2rem}
+.login-box input{width:100%;padding:.8rem 1rem;background:var(--bg2);border:1px solid var(--border2);border-radius:10px;color:var(--text);font-size:.9rem;outline:none;margin-bottom:1rem}
+.login-box input:focus{border-color:var(--accent)}
+.login-box button{width:100%;padding:.8rem;background:var(--accent);color:#fff;border:none;border-radius:10px;font-weight:600;font-size:.9rem;cursor:pointer;transition:.3s}
+.login-box button:hover{background:var(--accent3)}
+.login-error{color:var(--red);font-size:.8rem;margin-top:.5rem}
+
+/* App Layout */
+.app{display:none}
+.header{background:var(--bg2);border-bottom:1px solid var(--border2);padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50}
+.header h1{font-size:1.3rem;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.header-actions{display:flex;gap:.5rem;align-items:center}
+.btn{padding:.5rem 1rem;border-radius:8px;font-size:.8rem;font-weight:500;cursor:pointer;transition:.2s;border:none}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:var(--accent3)}
+.btn-ghost{background:transparent;color:var(--text2);border:1px solid var(--border2)}.btn-ghost:hover{background:var(--surface)}
+.btn-sm{padding:.4rem .8rem;font-size:.75rem}
+
+/* Tabs */
+.tabs{display:flex;gap:0;background:var(--bg2);padding:0 2rem;border-bottom:1px solid var(--border2)}
+.tab{padding:.8rem 1.5rem;font-size:.85rem;font-weight:500;color:var(--text3);cursor:pointer;border-bottom:2px solid transparent;transition:.2s}
+.tab:hover{color:var(--text2)}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+
+/* Content */
+.content{padding:1.5rem 2rem;max-width:1400px;margin:0 auto}
+.section-title{font-size:1.1rem;font-weight:600;margin-bottom:1rem;display:flex;align-items:center;gap:.5rem}
+.section-title span{font-size:.7rem;color:var(--text3);font-weight:400}
+
+/* Controls */
+.controls{display:flex;gap:.8rem;margin-bottom:1.5rem;flex-wrap:wrap;align-items:center}
+select,.search-input{padding:.5rem .8rem;background:var(--surface);border:1px solid var(--border2);border-radius:8px;color:var(--text);font-size:.8rem;outline:none}
+select:focus,.search-input:focus{border-color:var(--accent)}
+.filter-pills{display:flex;gap:.4rem}
+.pill{padding:.35rem .8rem;border-radius:20px;font-size:.72rem;font-weight:500;cursor:pointer;border:1px solid var(--border2);background:transparent;color:var(--text3);transition:.2s}
+.pill:hover{border-color:var(--accent);color:var(--text)}
+.pill.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.pill.hero{border-color:var(--green)}.pill.hero.active{background:var(--green);border-color:var(--green)}
+.pill.villain{border-color:var(--red)}.pill.villain.active{background:var(--red);border-color:var(--red)}
+.pill.normal{border-color:var(--yellow)}.pill.normal.active{background:var(--yellow);border-color:var(--yellow);color:#000}
+
+/* Product Grid */
+.product-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:1rem}
+.product-card{background:var(--surface);border:1px solid var(--border2);border-radius:14px;overflow:hidden;transition:.3s;cursor:pointer}
+.product-card:hover{border-color:var(--border);transform:translateY(-2px);box-shadow:0 8px 30px rgba(0,0,0,.3)}
+.product-img{width:100%;height:200px;object-fit:cover;background:var(--bg2)}
+.product-info{padding:1rem}
+.product-rank{display:flex;align-items:center;justify-content:space-between;margin-bottom:.5rem}
+.rank-num{font-size:1.5rem;font-weight:800;color:var(--accent)}
+.label-badge{padding:.2rem .6rem;border-radius:20px;font-size:.65rem;font-weight:600;text-transform:uppercase}
+.label-hero{background:rgba(16,185,129,.15);color:var(--green)}
+.label-villain{background:rgba(239,68,68,.15);color:var(--red)}
+.label-normal{background:rgba(245,158,11,.15);color:var(--yellow)}
+.product-title{font-size:.85rem;font-weight:500;margin-bottom:.4rem;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.product-meta{display:flex;justify-content:space-between;align-items:center;font-size:.75rem;color:var(--text3)}
+.product-price{font-weight:600;color:var(--text)}
+.product-store{font-size:.7rem;color:var(--text3);margin-top:.3rem}
+.position-change{font-size:.7rem;font-weight:600;display:flex;align-items:center;gap:.2rem}
+.position-change.up{color:var(--green)}
+.position-change.down{color:var(--red)}
+.position-change.same{color:var(--text3)}
+
+/* Stores Tab */
+.stores-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:1rem}
+.store-card{background:var(--surface);border:1px solid var(--border2);border-radius:14px;padding:1.2rem;transition:.2s}
+.store-card:hover{border-color:var(--border)}
+.store-header{display:flex;justify-content:space-between;align-items:start;margin-bottom:.8rem}
+.store-name{font-weight:600;font-size:.95rem}
+.store-url{font-size:.72rem;color:var(--accent2);text-decoration:none}
+.store-url:hover{text-decoration:underline}
+.store-stats{display:flex;gap:1rem;margin-top:.6rem}
+.store-stat{font-size:.72rem;color:var(--text3)}
+.store-stat b{color:var(--text)}
+.store-actions{display:flex;gap:.4rem}
+
+/* Modal */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border2);border-radius:16px;padding:2rem;width:420px;max-width:90vw}
+.modal h2{font-size:1.1rem;margin-bottom:1.5rem}
+.modal label{display:block;font-size:.8rem;color:var(--text2);margin-bottom:.3rem}
+.modal input{width:100%;padding:.6rem .8rem;background:var(--bg2);border:1px solid var(--border2);border-radius:8px;color:var(--text);font-size:.85rem;outline:none;margin-bottom:1rem}
+.modal-actions{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1rem}
+
+/* Loading */
+.loading{text-align:center;padding:3rem;color:var(--text3)}
+.spinner{width:32px;height:32px;border:3px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 1rem}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Empty state */
+.empty{text-align:center;padding:3rem;color:var(--text3);font-size:.9rem}
+
+/* Responsive */
+@media(max-width:768px){
+  .content{padding:1rem}
+  .product-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}
+  .product-img{height:140px}
+  .controls{flex-direction:column;align-items:stretch}
+}
+</style>
+</head>
+<body>
+
+<!-- Login Screen -->
+<div class="login-screen" id="loginScreen">
+  <div class="login-box">
+    <h1>Spy Wizard</h1>
+    <p>Product Intelligence Dashboard</p>
+    <input type="password" id="passwordInput" placeholder="Enter password" onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()">Access Dashboard</button>
+    <div class="login-error" id="loginError"></div>
+  </div>
+</div>
+
+<!-- App -->
+<div class="app" id="app">
+  <div class="header">
+    <h1>🧙 Spy Wizard</h1>
+    <div class="header-actions">
+      <button class="btn btn-ghost btn-sm" onclick="triggerScrape()">↻ Refresh Data</button>
+      <button class="btn btn-ghost btn-sm" onclick="logout()">Logout</button>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="fashion" onclick="switchTab('fashion')">Fashion</div>
+    <div class="tab" data-tab="stores" onclick="switchTab('stores')">Stores</div>
+  </div>
+
+  <!-- Fashion Tab -->
+  <div class="content" id="fashionTab">
+    <!-- Combined Bestsellers -->
+    <div class="section-title">🏆 Top 30 Bestsellers — All Stores Combined <span>(across all competitors)</span></div>
+    <div class="controls">
+      <select id="combinedSort" onchange="loadCombined()">
+        <option value="high-low">High → Low</option>
+        <option value="low-high">Low → High</option>
+        <option value="volume">Volume Ranked</option>
+      </select>
+      <div class="filter-pills">
+        <div class="pill active" onclick="setFilter(this,'all')" data-filter="all">All</div>
+        <div class="pill hero" onclick="setFilter(this,'hero')" data-filter="hero">🚀 Heroes</div>
+        <div class="pill villain" onclick="setFilter(this,'villain')" data-filter="villain">📉 Villains</div>
+        <div class="pill normal" onclick="setFilter(this,'normal')" data-filter="normal">— Normal</div>
+      </div>
+    </div>
+    <div class="product-grid" id="combinedGrid">
+      <div class="loading"><div class="spinner"></div>Loading bestsellers...</div>
+    </div>
+
+    <div style="margin-top:3rem"></div>
+
+    <!-- Per-Store Bestsellers -->
+    <div class="section-title">🏪 Bestsellers by Store</div>
+    <div class="controls">
+      <select id="storeSelect" onchange="loadStoreProducts()">
+        <option value="">Select a store...</option>
+      </select>
+      <select id="storeSort" onchange="loadStoreProducts()">
+        <option value="high-low">High → Low</option>
+        <option value="low-high">Low → High</option>
+        <option value="volume">Volume Ranked</option>
+      </select>
+      <div class="filter-pills">
+        <div class="pill active" onclick="setStoreFilter(this,'all')" data-filter="all">All</div>
+        <div class="pill hero" onclick="setStoreFilter(this,'hero')" data-filter="hero">🚀 Heroes</div>
+        <div class="pill villain" onclick="setStoreFilter(this,'villain')" data-filter="villain">📉 Villains</div>
+        <div class="pill normal" onclick="setStoreFilter(this,'normal')" data-filter="normal">— Normal</div>
+      </div>
+    </div>
+    <div class="product-grid" id="storeGrid">
+      <div class="empty">Select a store above to view its bestsellers</div>
+    </div>
+  </div>
+
+  <!-- Stores Tab -->
+  <div class="content" id="storesTab" style="display:none">
+    <div class="section-title">📊 Competitor Stores
+      <button class="btn btn-primary btn-sm" onclick="openAddStore()" style="margin-left:auto">+ Add Store</button>
+    </div>
+    <div class="stores-grid" id="storesGrid">
+      <div class="loading"><div class="spinner"></div>Loading stores...</div>
+    </div>
+  </div>
+</div>
+
+<!-- Add/Edit Store Modal -->
+<div class="modal-overlay" id="storeModal">
+  <div class="modal">
+    <h2 id="modalTitle">Add Store</h2>
+    <label>Store Name</label>
+    <input id="modalName" placeholder="e.g. Zoe Sydney">
+    <label>Store URL</label>
+    <input id="modalUrl" placeholder="e.g. https://zoesydney.com/">
+    <label>Monthly Visitors</label>
+    <input id="modalVisitors" placeholder="e.g. 108K">
+    <label>Niche</label>
+    <input id="modalNiche" placeholder="e.g. Fashion" value="Fashion">
+    <label>Country</label>
+    <input id="modalCountry" placeholder="e.g. USA, UK">
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="modalSubmit" onclick="submitStore()">Add Store</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = window.location.origin + '/api';
+let currentFilter = 'all';
+let currentStoreFilter = 'all';
+let editingStoreId = null;
+
+// Auth
+function doLogin() {
+  const pw = document.getElementById('passwordInput').value;
+  fetch(API + '/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password: pw})
+  })
+  .then(r => {if(!r.ok) throw new Error('Wrong password'); return r.json()})
+  .then(() => {
+    localStorage.setItem('sw_auth', 'true');
+    showApp();
+  })
+  .catch(() => {
+    document.getElementById('loginError').textContent = 'Invalid password. Try again.';
+  });
+}
+
+function logout() {
+  localStorage.removeItem('sw_auth');
+  location.reload();
+}
+
+function showApp() {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  loadCombined();
+  loadStores();
+}
+
+if (localStorage.getItem('sw_auth') === 'true') showApp();
+
+// Tabs
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
+  document.getElementById('fashionTab').style.display = tab === 'fashion' ? 'block' : 'none';
+  document.getElementById('storesTab').style.display = tab === 'stores' ? 'block' : 'none';
+  if (tab === 'stores') loadStores();
+}
+
+// Filters
+function setFilter(el, f) {
+  currentFilter = f;
+  el.parentElement.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  loadCombined();
+}
+function setStoreFilter(el, f) {
+  currentStoreFilter = f;
+  el.parentElement.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  loadStoreProducts();
+}
+
+// Load combined bestsellers
+function loadCombined() {
+  const sort = document.getElementById('combinedSort').value;
+  let url = `${API}/bestsellers/combined?sort=${sort}&limit=30`;
+  if (currentFilter !== 'all') url += `&label=${currentFilter}`;
+
+  document.getElementById('combinedGrid').innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
+
+  fetch(url).then(r => r.json()).then(products => {
+    if (!products.length) {
+      document.getElementById('combinedGrid').innerHTML = '<div class="empty">No products found. Click "Refresh Data" to scrape stores.</div>';
+      return;
+    }
+    document.getElementById('combinedGrid').innerHTML = products.map((p, i) => productCard(p, i + 1)).join('');
+  }).catch(() => {
+    document.getElementById('combinedGrid').innerHTML = '<div class="empty">Failed to load. Try refreshing.</div>';
+  });
+}
+
+// Load store products
+function loadStoreProducts() {
+  const storeId = document.getElementById('storeSelect').value;
+  if (!storeId) return;
+  const sort = document.getElementById('storeSort').value;
+  let url = `${API}/bestsellers/store/${storeId}?sort=${sort}&limit=30`;
+  if (currentStoreFilter !== 'all') url += `&label=${currentStoreFilter}`;
+
+  document.getElementById('storeGrid').innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
+
+  fetch(url).then(r => r.json()).then(products => {
+    if (!products.length) {
+      document.getElementById('storeGrid').innerHTML = '<div class="empty">No products found for this store.</div>';
+      return;
+    }
+    document.getElementById('storeGrid').innerHTML = products.map((p, i) => productCard(p, i + 1)).join('');
+  });
+}
+
+// Product card HTML
+function productCard(p, rank) {
+  const labelClass = p.label === 'hero' ? 'label-hero' : p.label === 'villain' ? 'label-villain' : 'label-normal';
+  const labelText = p.label === 'hero' ? '🚀 Hero' : p.label === 'villain' ? '📉 Villain' : '— Normal';
+
+  let posChange = '';
+  if (p.previous_position > 0 && p.previous_position !== p.current_position) {
+    const diff = p.previous_position - p.current_position;
+    if (diff > 0) posChange = `<span class="position-change up">▲ ${diff}</span>`;
+    else posChange = `<span class="position-change down">▼ ${Math.abs(diff)}</span>`;
+  } else {
+    posChange = '<span class="position-change same">—</span>';
+  }
+
+  const price = p.price ? (p.price.includes('.') ? `€${p.price}` : `€${(parseInt(p.price)/100).toFixed(2)}`) : '';
+
+  return `
+    <div class="product-card" onclick="window.open('${p.product_url}','_blank')">
+      <img class="product-img" src="${p.image_url || ''}" onerror="this.style.display='none'" loading="lazy">
+      <div class="product-info">
+        <div class="product-rank">
+          <span class="rank-num">#${rank}</span>
+          <span class="label-badge ${labelClass}">${labelText}</span>
+        </div>
+        <div class="product-title">${p.title}</div>
+        <div class="product-meta">
+          <span class="product-price">${price}</span>
+          ${posChange}
+        </div>
+        <div class="product-store">${p.store_name} · Position #${p.current_position}</div>
+      </div>
+    </div>
+  `;
+}
+
+// Stores
+function loadStores() {
+  fetch(API + '/stores').then(r => r.json()).then(stores => {
+    // Update store dropdown
+    const select = document.getElementById('storeSelect');
+    const currentVal = select.value;
+    select.innerHTML = '<option value="">Select a store...</option>' +
+      stores.map(s => `<option value="${s.id}">${s.name} (${s.monthly_visitors})</option>`).join('');
+    if (currentVal) select.value = currentVal;
+
+    // Update stores grid
+    document.getElementById('storesGrid').innerHTML = stores.map(s => `
+      <div class="store-card">
+        <div class="store-header">
+          <div>
+            <div class="store-name">${s.name}</div>
+            <a class="store-url" href="${s.url}" target="_blank">${s.url}</a>
+          </div>
+          <div class="store-actions">
+            <button class="btn btn-ghost btn-sm" onclick="editStore(${s.id},'${s.name}','${s.url}','${s.monthly_visitors}','${s.niche}','${s.country}')">Edit</button>
+            <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteStore(${s.id},'${s.name}')">Delete</button>
+          </div>
+        </div>
+        <div class="store-stats">
+          <div class="store-stat"><b>${s.monthly_visitors}</b> visitors/mo</div>
+          <div class="store-stat"><b>${s.niche}</b></div>
+          <div class="store-stat"><b>${s.country}</b></div>
+          <div class="store-stat"><b>${s.product_count}</b> products tracked</div>
+        </div>
+      </div>
+    `).join('');
+  });
+}
+
+// Scrape
+function triggerScrape() {
+  if (!confirm('Start scraping all stores? This may take a minute.')) return;
+  const btn = event.target;
+  btn.textContent = '⏳ Scraping...';
+  btn.disabled = true;
+  fetch(API + '/scrape', {method: 'POST'}).then(r => r.json()).then(() => {
+    btn.textContent = '↻ Refresh Data';
+    btn.disabled = false;
+    loadCombined();
+    loadStores();
+    alert('Scrape complete!');
+  }).catch(() => {
+    btn.textContent = '↻ Refresh Data';
+    btn.disabled = false;
+    alert('Scrape failed. Check console.');
+  });
+}
+
+// Store Modal
+function openAddStore() {
+  editingStoreId = null;
+  document.getElementById('modalTitle').textContent = 'Add Store';
+  document.getElementById('modalSubmit').textContent = 'Add Store';
+  document.getElementById('modalName').value = '';
+  document.getElementById('modalUrl').value = '';
+  document.getElementById('modalVisitors').value = '';
+  document.getElementById('modalNiche').value = 'Fashion';
+  document.getElementById('modalCountry').value = '';
+  document.getElementById('storeModal').classList.add('open');
+}
+
+function editStore(id, name, url, visitors, niche, country) {
+  editingStoreId = id;
+  document.getElementById('modalTitle').textContent = 'Edit Store';
+  document.getElementById('modalSubmit').textContent = 'Save Changes';
+  document.getElementById('modalName').value = name;
+  document.getElementById('modalUrl').value = url;
+  document.getElementById('modalVisitors').value = visitors;
+  document.getElementById('modalNiche').value = niche;
+  document.getElementById('modalCountry').value = country;
+  document.getElementById('storeModal').classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('storeModal').classList.remove('open');
+}
+
+function submitStore() {
+  const data = {
+    name: document.getElementById('modalName').value,
+    url: document.getElementById('modalUrl').value,
+    monthly_visitors: document.getElementById('modalVisitors').value,
+    niche: document.getElementById('modalNiche').value,
+    country: document.getElementById('modalCountry').value,
+  };
+
+  const method = editingStoreId ? 'PUT' : 'POST';
+  const url = editingStoreId ? `${API}/stores/${editingStoreId}` : `${API}/stores`;
+
+  fetch(url, {
+    method,
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(data)
+  }).then(r => {
+    if (!r.ok) throw new Error('Failed');
+    return r.json();
+  }).then(() => {
+    closeModal();
+    loadStores();
+  }).catch(e => alert('Failed to save store: ' + e.message));
+}
+
+function deleteStore(id, name) {
+  if (!confirm(`Delete "${name}" and all its tracked products?`)) return;
+  fetch(`${API}/stores/${id}`, {method: 'DELETE'}).then(() => loadStores());
+}
+</script>
+</body>
+</html>
