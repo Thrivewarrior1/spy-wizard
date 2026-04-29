@@ -6,10 +6,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel
 from typing import Optional
@@ -23,6 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 APP_PASSWORD = os.getenv("APP_PASSWORD", "mats2310")
+PORT = int(os.getenv("PORT", "8000"))
 
 scheduler = AsyncIOScheduler()
 
@@ -37,29 +37,19 @@ async def daily_scrape():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     Base.metadata.create_all(bind=engine)
     seed_stores()
-
     # Schedule daily scrape at 6 AM UTC
-    scheduler.add_job(daily_scrape, "cron", hour=6, minute=0)
+    scheduler.add_job(daily_scrape, "cron", hour=6, minute=0, id="daily_scrape")
+    # Also scrape every 12 hours as backup
+    scheduler.add_job(daily_scrape, "interval", hours=12, id="backup_scrape")
     scheduler.start()
-    logger.info("Scheduler started - daily scrape at 06:00 UTC")
-
+    logger.info("Scheduler started - daily scrape at 06:00 UTC + every 12h backup")
     yield
-
-    # Shutdown
     scheduler.shutdown()
 
 app = FastAPI(title="Spy Wizard", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- Auth ---
 class LoginRequest(BaseModel):
@@ -71,7 +61,7 @@ async def login(req: LoginRequest):
         return {"success": True, "token": "authenticated"}
     raise HTTPException(status_code=401, detail="Invalid password")
 
-# --- Stores ---
+# --- Stores CRUD ---
 class StoreCreate(BaseModel):
     name: str
     url: str
@@ -90,14 +80,10 @@ class StoreUpdate(BaseModel):
 async def get_stores(db: Session = Depends(get_db)):
     stores = db.query(Store).order_by(Store.name).all()
     return [{
-        "id": s.id,
-        "name": s.name,
-        "url": s.url,
-        "monthly_visitors": s.monthly_visitors,
-        "niche": s.niche,
-        "country": s.country,
-        "product_count": len(s.products),
-        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "id": s.id, "name": s.name, "url": s.url,
+        "monthly_visitors": s.monthly_visitors, "niche": s.niche,
+        "country": s.country, "product_count": len(s.products),
+        "last_scraped": max((p.last_scraped for p in s.products), default=None),
     } for s in stores]
 
 @app.post("/api/stores")
@@ -130,133 +116,168 @@ async def delete_store(store_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"success": True}
 
-# --- Products / Bestsellers ---
-def parse_visitors(visitors_str: str) -> int:
-    """Convert '1.9M', '314K', etc. to an integer for sorting."""
-    s = visitors_str.strip().upper()
+# --- Bestsellers ---
+def parse_visitors(v: str) -> int:
+    s = v.strip().upper()
     try:
-        if s.endswith("M"):
-            return int(float(s[:-1]) * 1_000_000)
-        elif s.endswith("K"):
-            return int(float(s[:-1]) * 1_000)
-        else:
-            return int(s)
-    except (ValueError, TypeError):
-        return 0
+        if s.endswith("M"): return int(float(s[:-1]) * 1_000_000)
+        elif s.endswith("K"): return int(float(s[:-1]) * 1_000)
+        else: return int(s)
+    except: return 0
+
+# Translation map for multi-language search
+TRANSLATIONS = {
+    "dress": ["kleid", "robe", "vestido", "jurk", "abito"],
+    "summer": ["sommer", "été", "verano", "zomer", "estate"],
+    "shirt": ["hemd", "chemise", "camisa", "overhemd", "camicia"],
+    "pants": ["hose", "pantalon", "pantalones", "broek", "pantaloni"],
+    "jacket": ["jacke", "veste", "chaqueta", "jas", "giacca"],
+    "coat": ["mantel", "manteau", "abrigo", "jas", "cappotto"],
+    "skirt": ["rock", "jupe", "falda", "rok", "gonna"],
+    "sweater": ["pullover", "pull", "suéter", "trui", "maglione"],
+    "shoes": ["schuhe", "chaussures", "zapatos", "schoenen", "scarpe"],
+    "boots": ["stiefel", "bottes", "botas", "laarzen", "stivali"],
+    "bag": ["tasche", "sac", "bolso", "tas", "borsa"],
+    "jeans": ["jeans", "jean", "vaqueros", "spijkerbroek"],
+    "blouse": ["bluse", "chemisier", "blusa", "blouse"],
+    "top": ["oberteil", "haut", "parte superior", "top"],
+    "winter": ["winter", "hiver", "invierno", "inverno"],
+    "spring": ["frühling", "printemps", "primavera", "lente"],
+    "autumn": ["herbst", "automne", "otoño", "herfst", "autunno"],
+    "cotton": ["baumwolle", "coton", "algodón", "katoen", "cotone"],
+    "silk": ["seide", "soie", "seda", "zijde", "seta"],
+    "linen": ["leinen", "lin", "lino", "linnen"],
+    "wool": ["wolle", "laine", "lana", "wol"],
+    "men": ["herren", "homme", "hombre", "heren", "uomo"],
+    "women": ["damen", "femme", "mujer", "dames", "donna"],
+}
+
+def expand_search(query: str) -> list:
+    """Expand a search query to include translations."""
+    terms = query.lower().split()
+    all_terms = set(terms)
+    for term in terms:
+        if term in TRANSLATIONS:
+            all_terms.update(TRANSLATIONS[term])
+        # Also check if the search term IS a translation
+        for eng, trans in TRANSLATIONS.items():
+            if term in trans:
+                all_terms.add(eng)
+                all_terms.update(trans)
+    return list(all_terms)
 
 @app.get("/api/bestsellers/combined")
 async def get_combined_bestsellers(
-    sort: str = Query("high-low", regex="^(high-low|low-high|volume)$"),
-    label: Optional[str] = Query(None, regex="^(hero|villain|normal)$"),
+    sort: str = Query("high-low"),
+    label: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     limit: int = Query(30, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """Get combined top bestsellers from all stores."""
     query = db.query(Product).join(Store)
-
-    if label:
+    if label and label != "all":
         query = query.filter(Product.label == label)
+
+    if search and search.strip():
+        search_terms = expand_search(search.strip())
+        conditions = []
+        for term in search_terms:
+            conditions.append(Product.title.ilike(f"%{term}%"))
+            conditions.append(Product.product_type.ilike(f"%{term}%"))
+            conditions.append(Product.vendor.ilike(f"%{term}%"))
+        query = query.filter(or_(*conditions))
 
     products = query.all()
 
-    # Sort based on parameter
     if sort == "volume":
-        # Sort by store monthly visitors (highest first), then by position
         products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position))
     elif sort == "low-high":
-        products.sort(key=lambda p: p.current_position)
-    else:  # high-low (default - best sellers first)
+        products.sort(key=lambda p: (-p.current_position,))
+    else:
         products.sort(key=lambda p: p.current_position)
 
-    products = products[:limit]
-
-    return [{
-        "id": p.id,
-        "title": p.title,
-        "image_url": p.image_url,
-        "price": p.price,
-        "vendor": p.vendor,
-        "product_url": p.product_url,
-        "current_position": p.current_position,
-        "previous_position": p.previous_position,
-        "label": p.label,
-        "store_name": p.store.name,
-        "store_url": p.store.url,
-        "store_visitors": p.store.monthly_visitors,
-        "last_scraped": p.last_scraped.isoformat() if p.last_scraped else None,
-    } for p in products]
+    return [_product_dict(p) for p in products[:limit]]
 
 @app.get("/api/bestsellers/store/{store_id}")
 async def get_store_bestsellers(
     store_id: int,
-    sort: str = Query("high-low", regex="^(high-low|low-high|volume)$"),
-    label: Optional[str] = Query(None, regex="^(hero|villain|normal)$"),
+    sort: str = Query("high-low"),
+    label: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     limit: int = Query(30, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """Get top bestsellers for a specific store."""
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
-
     query = db.query(Product).filter(Product.store_id == store_id)
-
-    if label:
+    if label and label != "all":
         query = query.filter(Product.label == label)
-
+    if search and search.strip():
+        search_terms = expand_search(search.strip())
+        conditions = []
+        for term in search_terms:
+            conditions.append(Product.title.ilike(f"%{term}%"))
+        query = query.filter(or_(*conditions))
     products = query.order_by(Product.current_position).limit(limit).all()
+    return [_product_dict(p) for p in products]
 
-    return [{
-        "id": p.id,
-        "title": p.title,
-        "image_url": p.image_url,
-        "price": p.price,
-        "vendor": p.vendor,
-        "product_url": p.product_url,
+def _product_dict(p):
+    pos_diff = 0
+    if p.previous_position > 0:
+        pos_diff = p.previous_position - p.current_position
+    return {
+        "id": p.id, "title": p.title, "image_url": p.image_url,
+        "price": p.price, "vendor": p.vendor, "product_url": p.product_url,
         "current_position": p.current_position,
         "previous_position": p.previous_position,
+        "position_change": pos_diff,
         "label": p.label,
-        "store_name": store.name,
-        "store_url": store.url,
+        "store_name": p.store.name, "store_url": p.store.url,
+        "store_visitors": p.store.monthly_visitors,
         "last_scraped": p.last_scraped.isoformat() if p.last_scraped else None,
-    } for p in products]
+    }
 
-# --- Manual Scrape Trigger ---
+# --- Scrape triggers ---
 @app.post("/api/scrape")
 async def trigger_scrape(db: Session = Depends(get_db)):
-    """Manually trigger a scrape of all stores."""
     await scrape_all_stores(db)
     return {"success": True, "message": "Scrape completed"}
 
 @app.post("/api/scrape/{store_id}")
 async def trigger_store_scrape(store_id: int, db: Session = Depends(get_db)):
-    """Manually trigger a scrape for a specific store."""
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
-
     products = await scrape_store_bestsellers(store.url)
     if products:
         update_products_in_db(db, store, products)
     return {"success": True, "products_found": len(products)}
 
+@app.get("/api/stats")
+async def get_stats(db: Session = Depends(get_db)):
+    total_stores = db.query(Store).count()
+    total_products = db.query(Product).count()
+    heroes = db.query(Product).filter(Product.label == "hero").count()
+    villains = db.query(Product).filter(Product.label == "villain").count()
+    return {"stores": total_stores, "products": total_products, "heroes": heroes, "villains": villains}
+
 # --- Serve Frontend ---
-frontend_path = os.path.join(os.path.dirname(__file__), ".")
+frontend_path = os.path.dirname(__file__)
 
 @app.get("/")
 async def serve_root():
     index_path = os.path.join(frontend_path, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
-    return HTMLResponse("<h1>Spy Wizard API</h1><p>Frontend not found.</p>")
+    return HTMLResponse("<h1>Spy Wizard API</h1>")
 
 @app.get("/{path:path}")
 async def serve_static(path: str):
     file_path = os.path.join(frontend_path, path)
     if os.path.exists(file_path) and os.path.isfile(file_path):
         return FileResponse(file_path)
-    # Fallback to index.html for SPA routing
     index_path = os.path.join(frontend_path, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
-    raise HTTPException(status_code=404, detail="Not found")
+    raise HTTPException(status_code=404)

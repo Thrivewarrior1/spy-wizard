@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spy Wizard — Product Intelligence</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#08080d;--bg2:#0e0e16;--s1:#14141f;--s2:#1c1c2b;--s3:#252538;--accent:#7c3aed;--accent2:#a78bfa;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--text:#f1f5f9;--text2:#94a3b8;--text3:#64748b;--border:rgba(124,58,237,.1);--border2:rgba(255,255,255,.06)}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
+::selection{background:var(--accent);color:#fff}
+::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:var(--bg2)}::-webkit-scrollbar-thumb{background:var(--s3);border-radius:3px}
+
+.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at 50% 30%,rgba(124,58,237,.08),transparent 60%)}
+.login-box{background:var(--s1);border:1px solid var(--border2);border-radius:20px;padding:2.5rem;width:360px;text-align:center}
+.login-box h1{font-size:1.6rem;margin-bottom:.3rem;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.login-box .sub{color:var(--text3);font-size:.8rem;margin-bottom:2rem}
+.login-box input{width:100%;padding:.7rem 1rem;background:var(--bg2);border:1px solid var(--border2);border-radius:10px;color:var(--text);font-size:.85rem;outline:none;margin-bottom:.8rem;transition:.2s}
+.login-box input:focus{border-color:var(--accent)}
+.login-box button{width:100%;padding:.7rem;background:linear-gradient(135deg,var(--accent),#6d28d9);color:#fff;border:none;border-radius:10px;font-weight:600;font-size:.85rem;cursor:pointer;transition:.2s}
+.login-box button:hover{opacity:.9}
+.login-err{color:var(--red);font-size:.75rem;margin-top:.5rem}
+
+.app{display:none}
+.topbar{background:var(--bg2);border-bottom:1px solid var(--border2);padding:.7rem 1.5rem;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50}
+.topbar .brand{font-size:1.1rem;font-weight:700;display:flex;align-items:center;gap:.5rem}
+.topbar .brand span{background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.topbar-r{display:flex;gap:.5rem;align-items:center}
+
+.stats-bar{display:flex;gap:1rem;padding:.8rem 1.5rem;background:var(--bg2);border-bottom:1px solid var(--border2)}
+.stat-card{background:var(--s1);border:1px solid var(--border2);border-radius:10px;padding:.6rem 1rem;flex:1;text-align:center}
+.stat-card .num{font-size:1.2rem;font-weight:700;color:var(--accent2)}
+.stat-card .label{font-size:.65rem;color:var(--text3);text-transform:uppercase;letter-spacing:.08em}
+
+.btn{padding:.45rem .9rem;border-radius:8px;font-size:.75rem;font-weight:500;cursor:pointer;transition:.2s;border:none;display:inline-flex;align-items:center;gap:.3rem}
+.btn-p{background:var(--accent);color:#fff}.btn-p:hover{background:#6d28d9}
+.btn-g{background:var(--s2);color:var(--text2);border:1px solid var(--border2)}.btn-g:hover{background:var(--s3)}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+
+.tabs{display:flex;gap:0;background:var(--bg2);padding:0 1.5rem;border-bottom:1px solid var(--border2)}
+.tab{padding:.7rem 1.2rem;font-size:.8rem;font-weight:500;color:var(--text3);cursor:pointer;border-bottom:2px solid transparent;transition:.2s}
+.tab:hover{color:var(--text2)}.tab.active{color:var(--accent2);border-bottom-color:var(--accent)}
+
+.content{padding:1.2rem 1.5rem;max-width:1440px;margin:0 auto}
+.sec-title{font-size:.95rem;font-weight:600;margin-bottom:.8rem;display:flex;align-items:center;gap:.4rem}
+.sec-title .badge{font-size:.6rem;background:var(--s2);color:var(--text3);padding:.2rem .5rem;border-radius:20px}
+
+.controls{display:flex;gap:.6rem;margin-bottom:1rem;flex-wrap:wrap;align-items:center}
+select,.search-box{padding:.45rem .7rem;background:var(--s1);border:1px solid var(--border2);border-radius:8px;color:var(--text);font-size:.78rem;outline:none}
+select:focus,.search-box:focus{border-color:var(--accent)}
+.search-box{min-width:220px}
+.pills{display:flex;gap:.3rem}
+.pill{padding:.3rem .7rem;border-radius:20px;font-size:.68rem;font-weight:500;cursor:pointer;border:1px solid var(--border2);background:transparent;color:var(--text3);transition:.2s}
+.pill:hover{border-color:var(--accent);color:var(--text)}.pill.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.pill.hero.active{background:var(--green);border-color:var(--green)}.pill.villain.active{background:var(--red);border-color:var(--red)}.pill.normal.active{background:var(--amber);border-color:var(--amber);color:#000}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:.8rem}
+.card{background:var(--s1);border:1px solid var(--border2);border-radius:12px;overflow:hidden;transition:.25s;cursor:pointer;position:relative}
+.card:hover{border-color:var(--border);transform:translateY(-2px);box-shadow:0 12px 40px rgba(0,0,0,.4)}
+.card img{width:100%;height:180px;object-fit:cover;background:var(--bg2)}
+.card-body{padding:.8rem}
+.card-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem}
+.rank{font-size:1.3rem;font-weight:800;color:var(--accent2)}
+.lbl{padding:.15rem .5rem;border-radius:20px;font-size:.6rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+.lbl-hero{background:rgba(34,197,94,.12);color:var(--green)}.lbl-villain{background:rgba(239,68,68,.12);color:var(--red)}.lbl-normal{background:rgba(245,158,11,.12);color:var(--amber)}
+.card-title{font-size:.8rem;font-weight:500;margin-bottom:.3rem;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card-meta{display:flex;justify-content:space-between;align-items:center;font-size:.7rem;color:var(--text3)}
+.card-price{font-weight:600;color:var(--text)}
+.pos-change{font-size:.68rem;font-weight:600;display:flex;align-items:center;gap:.15rem}
+.pos-change.up{color:var(--green)}.pos-change.down{color:var(--red)}.pos-change.same{color:var(--text3)}
+.card-store{font-size:.65rem;color:var(--text3);margin-top:.3rem}
+
+/* Store Table */
+.store-table{width:100%;border-collapse:collapse;margin-top:.5rem}
+.store-table th{text-align:left;padding:.6rem .8rem;font-size:.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid var(--border2);font-weight:500}
+.store-table td{padding:.7rem .8rem;font-size:.8rem;border-bottom:1px solid var(--border2);vertical-align:middle}
+.store-table tr:hover td{background:var(--s1)}
+.store-table .store-link{color:var(--accent2);text-decoration:none;font-size:.72rem}.store-table .store-link:hover{text-decoration:underline}
+.store-table .actions{display:flex;gap:.3rem}
+
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100;align-items:center;justify-content:center}
+.modal-bg.open{display:flex}
+.modal{background:var(--s1);border:1px solid var(--border2);border-radius:16px;padding:1.8rem;width:400px;max-width:90vw}
+.modal h2{font-size:1rem;margin-bottom:1.2rem}
+.modal label{display:block;font-size:.72rem;color:var(--text2);margin-bottom:.2rem;margin-top:.8rem}
+.modal input{width:100%;padding:.55rem .7rem;background:var(--bg2);border:1px solid var(--border2);border-radius:8px;color:var(--text);font-size:.8rem;outline:none}
+.modal input:focus{border-color:var(--accent)}
+.modal-btns{display:flex;gap:.4rem;justify-content:flex-end;margin-top:1.2rem}
+
+.loading{text-align:center;padding:2.5rem;color:var(--text3);font-size:.85rem}
+.spinner{width:28px;height:28px;border:3px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;margin:0 auto .8rem}
+@keyframes spin{to{transform:rotate(360deg)}}
+.empty{text-align:center;padding:2.5rem;color:var(--text3);font-size:.82rem}
+
+.divider{height:1px;background:var(--border2);margin:2rem 0}
+
+@media(max-width:768px){.content{padding:.8rem}.grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}.card img{height:130px}.controls{flex-direction:column;align-items:stretch}.stats-bar{flex-wrap:wrap}}
+</style>
+</head>
+<body>
+
+<div class="login-wrap" id="loginScreen">
+  <div class="login-box">
+    <h1>🧙 Spy Wizard</h1>
+    <div class="sub">Product Intelligence Dashboard</div>
+    <input type="password" id="pw" placeholder="Enter password" onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()">Access Dashboard</button>
+    <div class="login-err" id="loginErr"></div>
+  </div>
+</div>
+
+<div class="app" id="app">
+  <div class="topbar">
+    <div class="brand">🧙 <span>Spy Wizard</span></div>
+    <div class="topbar-r">
+      <button class="btn btn-p" onclick="triggerScrape()" id="scrapeBtn">↻ Scrape All Stores</button>
+      <button class="btn btn-g" onclick="logout()">Logout</button>
+    </div>
+  </div>
+
+  <div class="stats-bar" id="statsBar">
+    <div class="stat-card"><div class="num" id="statStores">-</div><div class="label">Stores</div></div>
+    <div class="stat-card"><div class="num" id="statProducts">-</div><div class="label">Products</div></div>
+    <div class="stat-card"><div class="num" id="statHeroes" style="color:var(--green)">-</div><div class="label">🚀 Heroes</div></div>
+    <div class="stat-card"><div class="num" id="statVillains" style="color:var(--red)">-</div><div class="label">📉 Villains</div></div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="fashion" onclick="switchTab('fashion')">Fashion</div>
+    <div class="tab" data-tab="stores" onclick="switchTab('stores')">Stores</div>
+  </div>
+
+  <div class="content" id="fashionTab">
+    <div class="sec-title">🏆 Top 30 — All Stores Combined <span class="badge">Cross-competitor ranking</span></div>
+    <div class="controls">
+      <input class="search-box" type="text" id="searchAll" placeholder="🔍 Search products (e.g. Summer Dress, Kleid, Robe...)" oninput="debounceSearch(loadCombined)">
+      <select id="sortAll" onchange="loadCombined()">
+        <option value="high-low">Best Sellers First</option>
+        <option value="low-high">Lowest Rank First</option>
+        <option value="volume">Volume Ranked</option>
+      </select>
+      <div class="pills" id="filterAll">
+        <div class="pill active" onclick="setFilter('all',this)" data-f="all">All</div>
+        <div class="pill hero" onclick="setFilter('hero',this)" data-f="hero">🚀 Heroes</div>
+        <div class="pill villain" onclick="setFilter('villain',this)" data-f="villain">📉 Villains</div>
+        <div class="pill normal" onclick="setFilter('normal',this)" data-f="normal">— Normal</div>
+      </div>
+    </div>
+    <div class="grid" id="gridAll"><div class="loading"><div class="spinner"></div>Loading bestsellers...</div></div>
+
+    <div class="divider"></div>
+
+    <div class="sec-title">🏪 Per-Store Bestsellers</div>
+    <div class="controls">
+      <select id="storeSelect" onchange="loadStore()"><option value="">Select a store...</option></select>
+      <input class="search-box" type="text" id="searchStore" placeholder="🔍 Search this store..." oninput="debounceSearch(loadStore)">
+      <select id="sortStore" onchange="loadStore()">
+        <option value="high-low">Best Sellers First</option>
+        <option value="low-high">Lowest Rank First</option>
+        <option value="volume">Volume Ranked</option>
+      </select>
+      <div class="pills" id="filterStore">
+        <div class="pill active" onclick="setStoreFilter('all',this)" data-f="all">All</div>
+        <div class="pill hero" onclick="setStoreFilter('hero',this)" data-f="hero">🚀 Heroes</div>
+        <div class="pill villain" onclick="setStoreFilter('villain',this)" data-f="villain">📉 Villains</div>
+        <div class="pill normal" onclick="setStoreFilter('normal',this)" data-f="normal">— Normal</div>
+      </div>
+    </div>
+    <div class="grid" id="gridStore"><div class="empty">Select a store above to view its bestsellers</div></div>
+  </div>
+
+  <div class="content" id="storesTab" style="display:none">
+    <div class="sec-title" style="justify-content:space-between">📊 Competitor Stores <button class="btn btn-p" onclick="openAdd()">+ Add Store</button></div>
+    <div style="overflow-x:auto">
+      <table class="store-table" id="storeTable">
+        <thead><tr><th>#</th><th>Store</th><th>URL</th><th>Monthly Visitors</th><th>Niche</th><th>Country</th><th>Products</th><th>Actions</th></tr></thead>
+        <tbody id="storeRows"><tr><td colspan="8" class="loading"><div class="spinner"></div>Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="modal">
+  <div class="modal">
+    <h2 id="modalTitle">Add Store</h2>
+    <label>Store Name</label><input id="mName" placeholder="e.g. Zoe Sydney">
+    <label>Store URL</label><input id="mUrl" placeholder="e.g. https://zoesydney.com/">
+    <label>Monthly Visitors</label><input id="mVisitors" placeholder="e.g. 108K">
+    <label>Niche</label><input id="mNiche" value="Fashion">
+    <label>Country</label><input id="mCountry" placeholder="e.g. USA, UK">
+    <div class="modal-btns">
+      <button class="btn btn-g" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-p" id="mSubmit" onclick="submitStore()">Add Store</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API=location.origin+'/api';
+let cFilter='all',sFilter='all',editId=null,searchTimer=null;
+
+function doLogin(){
+  fetch(API+'/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})})
+  .then(r=>{if(!r.ok)throw 0;return r.json()}).then(()=>{localStorage.setItem('sw','1');showApp()})
+  .catch(()=>document.getElementById('loginErr').textContent='Invalid password');
+}
+function logout(){localStorage.removeItem('sw');location.reload()}
+function showApp(){document.getElementById('loginScreen').style.display='none';document.getElementById('app').style.display='block';loadCombined();loadStores();loadStats()}
+if(localStorage.getItem('sw')==='1')showApp();
+
+function switchTab(t){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelector(`[data-tab="${t}"]`).classList.add('active');document.getElementById('fashionTab').style.display=t==='fashion'?'block':'none';document.getElementById('storesTab').style.display=t==='stores'?'block':'none';if(t==='stores')loadStores()}
+function setFilter(f,el){cFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadCombined()}
+function setStoreFilter(f,el){sFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadStore()}
+function debounceSearch(fn){clearTimeout(searchTimer);searchTimer=setTimeout(fn,400)}
+
+function loadStats(){fetch(API+'/stats').then(r=>r.json()).then(d=>{document.getElementById('statStores').textContent=d.stores;document.getElementById('statProducts').textContent=d.products;document.getElementById('statHeroes').textContent=d.heroes;document.getElementById('statVillains').textContent=d.villains})}
+
+function loadCombined(){
+  const sort=document.getElementById('sortAll').value;
+  const search=document.getElementById('searchAll').value;
+  let url=`${API}/bestsellers/combined?sort=${sort}&limit=30&label=${cFilter}`;
+  if(search)url+=`&search=${encodeURIComponent(search)}`;
+  document.getElementById('gridAll').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
+  fetch(url).then(r=>r.json()).then(products=>{
+    if(!products.length){document.getElementById('gridAll').innerHTML='<div class="empty">No products found. Click "Scrape All Stores" to fetch data.</div>';return}
+    document.getElementById('gridAll').innerHTML=products.map((p,i)=>card(p,i+1)).join('')
+  }).catch(()=>document.getElementById('gridAll').innerHTML='<div class="empty">Failed to load.</div>')
+}
+
+function loadStore(){
+  const id=document.getElementById('storeSelect').value;if(!id)return;
+  const sort=document.getElementById('sortStore').value;
+  const search=document.getElementById('searchStore').value;
+  let url=`${API}/bestsellers/store/${id}?sort=${sort}&limit=30&label=${sFilter}`;
+  if(search)url+=`&search=${encodeURIComponent(search)}`;
+  document.getElementById('gridStore').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
+  fetch(url).then(r=>r.json()).then(products=>{
+    if(!products.length){document.getElementById('gridStore').innerHTML='<div class="empty">No products found for this store.</div>';return}
+    document.getElementById('gridStore').innerHTML=products.map((p,i)=>card(p,i+1)).join('')
+  })
+}
+
+function card(p,rank){
+  const lc=p.label==='hero'?'lbl-hero':p.label==='villain'?'lbl-villain':'lbl-normal';
+  const lt=p.label==='hero'?'🚀 Hero':p.label==='villain'?'📉 Villain':'— Normal';
+  let pc='';
+  if(p.position_change>0)pc=`<span class="pos-change up">▲${p.position_change}</span>`;
+  else if(p.position_change<0)pc=`<span class="pos-change down">▼${Math.abs(p.position_change)}</span>`;
+  else pc='<span class="pos-change same">—</span>';
+  const price=p.price?(p.price.includes('.')?`€${p.price}`:`€${(parseInt(p.price)/100).toFixed(2)}`):'';
+  return`<div class="card" onclick="window.open('${p.product_url}','_blank')">
+    <img src="${p.image_url||''}" onerror="this.style.background='var(--s2)';this.style.height='80px'" loading="lazy">
+    <div class="card-body"><div class="card-top"><span class="rank">#${rank}</span><span class="lbl ${lc}">${lt}</span></div>
+    <div class="card-title">${p.title}</div><div class="card-meta"><span class="card-price">${price}</span>${pc}</div>
+    <div class="card-store">${p.store_name} · Pos #${p.current_position}${p.previous_position>0?' (was #'+p.previous_position+')':''}</div></div></div>`
+}
+
+function loadStores(){
+  fetch(API+'/stores').then(r=>r.json()).then(stores=>{
+    const sel=document.getElementById('storeSelect');const cv=sel.value;
+    sel.innerHTML='<option value="">Select a store...</option>'+stores.map(s=>`<option value="${s.id}">${s.name} (${s.monthly_visitors})</option>`).join('');
+    if(cv)sel.value=cv;
+    document.getElementById('storeRows').innerHTML=stores.map((s,i)=>`<tr>
+      <td style="color:var(--text3)">${i+1}</td>
+      <td><strong>${s.name}</strong></td>
+      <td><a class="store-link" href="${s.url}" target="_blank">${s.url}</a></td>
+      <td>${s.monthly_visitors}</td><td>${s.niche}</td><td>${s.country}</td>
+      <td>${s.product_count}</td>
+      <td class="actions">
+        <button class="btn btn-g" onclick="event.stopPropagation();editStore(${s.id},'${s.name.replace(/'/g,"\\'")}','${s.url}','${s.monthly_visitors}','${s.niche}','${s.country.replace(/'/g,"\\'")}')">Edit</button>
+        <button class="btn btn-danger" onclick="event.stopPropagation();delStore(${s.id},'${s.name.replace(/'/g,"\\'")}')">Delete</button>
+        <button class="btn btn-g" onclick="event.stopPropagation();scrapeOne(${s.id})">Scrape</button>
+      </td></tr>`).join('')
+  })
+}
+
+function triggerScrape(){const b=document.getElementById('scrapeBtn');b.textContent='⏳ Scraping...';b.disabled=true;
+  fetch(API+'/scrape',{method:'POST'}).then(r=>r.json()).then(()=>{b.textContent='↻ Scrape All Stores';b.disabled=false;loadCombined();loadStores();loadStats();alert('Scrape complete!')}).catch(()=>{b.textContent='↻ Scrape All Stores';b.disabled=false;alert('Scrape failed')})}
+function scrapeOne(id){fetch(`${API}/scrape/${id}`,{method:'POST'}).then(r=>r.json()).then(d=>{alert(`Scraped ${d.products_found} products`);loadStores();loadCombined();loadStats()})}
+
+function openAdd(){editId=null;document.getElementById('modalTitle').textContent='Add Store';document.getElementById('mSubmit').textContent='Add Store';['mName','mUrl','mVisitors','mCountry'].forEach(x=>document.getElementById(x).value='');document.getElementById('mNiche').value='Fashion';document.getElementById('modal').classList.add('open')}
+function editStore(id,n,u,v,ni,co){editId=id;document.getElementById('modalTitle').textContent='Edit Store';document.getElementById('mSubmit').textContent='Save';document.getElementById('mName').value=n;document.getElementById('mUrl').value=u;document.getElementById('mVisitors').value=v;document.getElementById('mNiche').value=ni;document.getElementById('mCountry').value=co;document.getElementById('modal').classList.add('open')}
+function closeModal(){document.getElementById('modal').classList.remove('open')}
+function submitStore(){const d={name:document.getElementById('mName').value,url:document.getElementById('mUrl').value,monthly_visitors:document.getElementById('mVisitors').value,niche:document.getElementById('mNiche').value,country:document.getElementById('mCountry').value};
+  fetch(editId?`${API}/stores/${editId}`:`${API}/stores`,{method:editId?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>{if(!r.ok)throw 0;return r.json()}).then(()=>{closeModal();loadStores()}).catch(()=>alert('Failed to save'))}
+function delStore(id,n){if(!confirm(`Delete "${n}"?`))return;fetch(`${API}/stores/${id}`,{method:'DELETE'}).then(()=>{loadStores();loadStats()})}
+</script>
+</body>
+</html>
