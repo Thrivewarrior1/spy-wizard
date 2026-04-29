@@ -184,27 +184,26 @@ def expand_single_term(term: str) -> list:
     variants = {term}
     if term in TRANSLATIONS:
         variants.update(TRANSLATIONS[term])
-    # Also check if the term IS a translation
     for eng, trans in TRANSLATIONS.items():
         if term in trans:
             variants.add(eng)
             variants.update(trans)
     return list(variants)
 
-def build_search_filter(search_query: str):
-    """Build AND-based search: each word must match (with translations), ALL words required."""
+def build_search_filters(search_query: str):
+    """Smart search: returns (strict_AND_filters, loose_OR_filters)."""
     words = search_query.lower().split()
-    # For each word, create an OR group of its translations
-    # Then AND all the groups together
-    and_conditions = []
+    strict_conditions = []
     for word in words:
         variants = expand_single_term(word)
-        # This word (or any of its translations) must appear in the title
-        word_conditions = []
+        word_or = [Product.title.ilike(f"%{v}%") for v in variants]
+        strict_conditions.append(or_(*word_or))
+    loose_conditions = []
+    for word in words:
+        variants = expand_single_term(word)
         for v in variants:
-            word_conditions.append(Product.title.ilike(f"%{v}%"))
-        and_conditions.append(or_(*word_conditions))
-    return and_conditions  # Each element is ANDed together
+            loose_conditions.append(Product.title.ilike(f"%{v}%"))
+    return strict_conditions, loose_conditions
 
 @app.get("/api/bestsellers/combined")
 async def get_combined_bestsellers(
@@ -219,11 +218,17 @@ async def get_combined_bestsellers(
         query = query.filter(Product.label == label)
 
     if search and search.strip():
-        and_conditions = build_search_filter(search.strip())
-        for condition in and_conditions:
-            query = query.filter(condition)
-
-    products = query.all()
+        strict, loose = build_search_filters(search.strip())
+        strict_query = query
+        for cond in strict:
+            strict_query = strict_query.filter(cond)
+        strict_results = strict_query.all()
+        if strict_results:
+            products = strict_results
+        else:
+            products = query.filter(or_(*loose)).all()
+    else:
+        products = query.all()
 
     if sort == "volume":
         products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position))
@@ -250,10 +255,17 @@ async def get_store_bestsellers(
     if label and label != "all":
         query = query.filter(Product.label == label)
     if search and search.strip():
-        and_conditions = build_search_filter(search.strip())
-        for condition in and_conditions:
-            query = query.filter(condition)
-    products = query.order_by(Product.current_position).limit(limit).all()
+        strict, loose = build_search_filters(search.strip())
+        strict_query = query
+        for cond in strict:
+            strict_query = strict_query.filter(cond)
+        strict_results = strict_query.order_by(Product.current_position).limit(limit).all()
+        if strict_results:
+            products = strict_results
+        else:
+            products = query.filter(or_(*loose)).order_by(Product.current_position).limit(limit).all()
+    else:
+        products = query.order_by(Product.current_position).limit(limit).all()
     return [_product_dict(p) for p in products]
 
 def _product_dict(p):
