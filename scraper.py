@@ -19,6 +19,7 @@ import asyncio
 import httpx
 import json
 import logging
+import random
 import re
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
@@ -34,12 +35,28 @@ MAX_PAGES = 10
 PRODUCT_FETCH_CONCURRENCY = 8
 
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
 PRODUCT_HREF_RE = re.compile(r"^/products/([a-zA-Z0-9][a-zA-Z0-9\-_]*)")
+
+
+async def _fetch_with_retry(client, url, headers=None, max_retries=3):
+    """Fetch URL with retry on 429 rate limiting."""
+    for attempt in range(max_retries):
+        resp = await client.get(url, headers=headers) if headers is not None else await client.get(url)
+        if resp.status_code == 429:
+            wait = 15 + (attempt * 15) + random.uniform(0, 5)
+            logger.warning(
+                f"Rate limited (429) on {url}, waiting {wait:.0f}s "
+                f"(attempt {attempt+1}/{max_retries})"
+            )
+            await asyncio.sleep(wait)
+            continue
+        return resp
+    return resp  # Return last response even if still 429
 
 
 def _find_product_grid_container(soup: BeautifulSoup):
@@ -111,7 +128,7 @@ async def _fetch_product_json(
     url = f"{base_url}/products/{handle}.json"
     async with semaphore:
         try:
-            response = await client.get(url)
+            response = await _fetch_with_retry(client, url)
             if response.status_code != 200:
                 logger.warning(
                     f"Non-200 fetching product {handle} from {base_url}: {response.status_code}"
@@ -121,7 +138,7 @@ async def _fetch_product_json(
         except (httpx.HTTPError, json.JSONDecodeError) as e:
             logger.warning(f"Failed to fetch product {handle} from {base_url}: {e}")
             return None
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5 + random.uniform(0, 0.5))
 
     product = data.get("product")
     if not product:
@@ -161,8 +178,11 @@ async def scrape_store_bestsellers(store_url: str, max_pages: int = MAX_PAGES) -
     base_url = store_url.rstrip("/")
     headers = {
         "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
     }
 
     ordered_handles: list = []
@@ -173,7 +193,7 @@ async def scrape_store_bestsellers(store_url: str, max_pages: int = MAX_PAGES) -
             for page in range(1, max_pages + 1):
                 url = f"{base_url}/collections/all?sort_by=best-selling&page={page}"
                 try:
-                    response = await client.get(url)
+                    response = await _fetch_with_retry(client, url)
                 except httpx.HTTPError as e:
                     logger.warning(f"HTTP error for {url}: {e}")
                     break
@@ -201,7 +221,7 @@ async def scrape_store_bestsellers(store_url: str, max_pages: int = MAX_PAGES) -
                 if new_count == 0:
                     break
 
-                await asyncio.sleep(1)
+                await asyncio.sleep(2 + random.uniform(0, 2))
 
             if not ordered_handles:
                 logger.warning(f"No product handles parsed from {base_url}")
@@ -375,7 +395,7 @@ async def scrape_all_stores(db: Session):
         except Exception as e:
             logger.error(f"  ✗ Failed to scrape {store.name}: {e}")
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(5 + random.uniform(0, 3))
 
     try:
         cleanup_old_history(db)
