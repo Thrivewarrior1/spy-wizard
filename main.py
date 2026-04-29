@@ -150,21 +150,61 @@ TRANSLATIONS = {
     "wool": ["wolle", "laine", "lana", "wol"],
     "men": ["herren", "homme", "hombre", "heren", "uomo"],
     "women": ["damen", "femme", "mujer", "dames", "donna"],
+    "trousers": ["hose", "hosen", "pantalon", "pantalones", "broek", "pantaloni", "pants"],
+    "t-shirt": ["t-shirt", "tshirt", "tee"],
+    "hoodie": ["hoodie", "kapuzenpullover", "sweat"],
+    "cardigan": ["cardigan", "strickjacke"],
+    "vest": ["weste", "gilet", "chaleco"],
+    "shorts": ["shorts", "kurze hose", "bermuda"],
+    "tracksuit": ["trainingsanzug", "jogging", "survêtement"],
+    "blazer": ["blazer", "sakko"],
+    "polo": ["polo", "poloshirt"],
+    "sneakers": ["sneaker", "turnschuhe", "baskets"],
+    "sandals": ["sandalen", "sandales", "sandalias"],
+    "heels": ["absatzschuhe", "talons", "tacones"],
+    "accessories": ["accessoires", "zubehör", "accesorios"],
+    "hat": ["hut", "mütze", "chapeau", "sombrero"],
+    "scarf": ["schal", "écharpe", "bufanda"],
+    "belt": ["gürtel", "ceinture", "cinturón"],
+    "sunglasses": ["sonnenbrille", "lunettes", "gafas"],
+    "lingerie": ["unterwäsche", "dessous", "lencería"],
+    "swimwear": ["bademode", "maillot", "bañador", "bikini"],
+    "maxi": ["maxi", "lang"],
+    "mini": ["mini", "kurz"],
+    "casual": ["casual", "lässig", "décontracté"],
+    "elegant": ["elegant", "élégant", "elegante", "festlich"],
+    "vintage": ["vintage", "retro"],
+    "floral": ["blumen", "floral", "blumenmuster"],
+    "striped": ["gestreift", "rayé", "rayado"],
 }
 
-def expand_search(query: str) -> list:
-    """Expand a search query to include translations."""
-    terms = query.lower().split()
-    all_terms = set(terms)
-    for term in terms:
-        if term in TRANSLATIONS:
-            all_terms.update(TRANSLATIONS[term])
-        # Also check if the search term IS a translation
-        for eng, trans in TRANSLATIONS.items():
-            if term in trans:
-                all_terms.add(eng)
-                all_terms.update(trans)
-    return list(all_terms)
+def expand_single_term(term: str) -> list:
+    """Expand a single search term to include its translations."""
+    term = term.lower()
+    variants = {term}
+    if term in TRANSLATIONS:
+        variants.update(TRANSLATIONS[term])
+    # Also check if the term IS a translation
+    for eng, trans in TRANSLATIONS.items():
+        if term in trans:
+            variants.add(eng)
+            variants.update(trans)
+    return list(variants)
+
+def build_search_filter(search_query: str):
+    """Build AND-based search: each word must match (with translations), ALL words required."""
+    words = search_query.lower().split()
+    # For each word, create an OR group of its translations
+    # Then AND all the groups together
+    and_conditions = []
+    for word in words:
+        variants = expand_single_term(word)
+        # This word (or any of its translations) must appear in the title
+        word_conditions = []
+        for v in variants:
+            word_conditions.append(Product.title.ilike(f"%{v}%"))
+        and_conditions.append(or_(*word_conditions))
+    return and_conditions  # Each element is ANDed together
 
 @app.get("/api/bestsellers/combined")
 async def get_combined_bestsellers(
@@ -179,13 +219,9 @@ async def get_combined_bestsellers(
         query = query.filter(Product.label == label)
 
     if search and search.strip():
-        search_terms = expand_search(search.strip())
-        conditions = []
-        for term in search_terms:
-            conditions.append(Product.title.ilike(f"%{term}%"))
-            conditions.append(Product.product_type.ilike(f"%{term}%"))
-            conditions.append(Product.vendor.ilike(f"%{term}%"))
-        query = query.filter(or_(*conditions))
+        and_conditions = build_search_filter(search.strip())
+        for condition in and_conditions:
+            query = query.filter(condition)
 
     products = query.all()
 
@@ -214,11 +250,9 @@ async def get_store_bestsellers(
     if label and label != "all":
         query = query.filter(Product.label == label)
     if search and search.strip():
-        search_terms = expand_search(search.strip())
-        conditions = []
-        for term in search_terms:
-            conditions.append(Product.title.ilike(f"%{term}%"))
-        query = query.filter(or_(*conditions))
+        and_conditions = build_search_filter(search.strip())
+        for condition in and_conditions:
+            query = query.filter(condition)
     products = query.order_by(Product.current_position).limit(limit).all()
     return [_product_dict(p) for p in products]
 
