@@ -8,8 +8,10 @@ from classifier import classify_products_batch
 
 logger = logging.getLogger(__name__)
 
-async def scrape_store_bestsellers(store_url: str, limit: int = 30) -> list:
+async def scrape_store_bestsellers(store_url: str, limit: int = 250) -> list:
     """Scrape top bestsellers from a Shopify store using their JSON API."""
+    # Shopify caps a single products.json call at 250 items; if a future caller
+    # asks for more, this function would need pagination via ?page=N.
     products = []
     base_url = store_url.rstrip("/")
     headers = {
@@ -18,7 +20,7 @@ async def scrape_store_bestsellers(store_url: str, limit: int = 30) -> list:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
             # Try JSON API first
             url = f"{base_url}/collections/all/products.json?sort_by=best-selling&limit={limit}"
             response = await client.get(url, headers=headers)
