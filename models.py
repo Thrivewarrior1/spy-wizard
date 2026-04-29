@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum as SQLEnum, Text
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum as SQLEnum, Text, Boolean
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
 import enum
@@ -40,6 +40,9 @@ class Product(Base):
     current_position = Column(Integer, default=0)
     previous_position = Column(Integer, default=0)
     label = Column(String(20), default=LabelEnum.NORMAL.value)
+
+    ai_tags = Column(Text, default="")
+    is_fashion = Column(Boolean, default=True)
 
     last_scraped = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)

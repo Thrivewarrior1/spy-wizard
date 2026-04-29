@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from sqlalchemy.orm import Session
 from models import Store, Product, PositionHistory
+from classifier import classify_products_batch
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,9 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
 
     now = datetime.utcnow()
 
+    # Classify products with AI (or keyword fallback) before persisting
+    classify_products_batch(scraped_products)
+
     for product_data in scraped_products:
         shopify_id = product_data["shopify_id"]
         new_position = product_data["position"]
@@ -106,6 +110,8 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
             product.product_url = product_data["product_url"]
             product.vendor = product_data.get("vendor", "")
             product.product_type = product_data.get("product_type", "")
+            product.ai_tags = product_data.get("ai_tags", "")
+            product.is_fashion = product_data.get("is_fashion", True)
             product.last_scraped = now
 
             # CORRECTLY determine label:
@@ -136,6 +142,8 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
                 current_position=new_position,
                 previous_position=0,
                 label="normal",
+                ai_tags=product_data.get("ai_tags", ""),
+                is_fashion=product_data.get("is_fashion", True),
                 last_scraped=now,
             )
             db.add(product)

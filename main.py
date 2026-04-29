@@ -205,6 +205,11 @@ def build_search_filters(search_query: str):
             loose_conditions.append(Product.title.ilike(f"%{v}%"))
     return strict_conditions, loose_conditions
 
+def build_ai_tag_filters(search_query: str):
+    """AND-of-words match against ai_tags (CSV of English keywords)."""
+    words = [w for w in search_query.lower().split() if w]
+    return [Product.ai_tags.ilike(f"%{w}%") for w in words]
+
 @app.get("/api/bestsellers/combined")
 async def get_combined_bestsellers(
     sort: str = Query("high-low"),
@@ -213,20 +218,30 @@ async def get_combined_bestsellers(
     limit: int = Query(30, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    query = db.query(Product).join(Store)
+    query = db.query(Product).join(Store).filter(Product.is_fashion == True)
     if label and label != "all":
         query = query.filter(Product.label == label)
 
     if search and search.strip():
-        strict, loose = build_search_filters(search.strip())
-        strict_query = query
-        for cond in strict:
-            strict_query = strict_query.filter(cond)
-        strict_results = strict_query.all()
-        if strict_results:
-            products = strict_results
+        s = search.strip()
+        # Try AI tags first (AND of search words)
+        ai_query = query
+        for cond in build_ai_tag_filters(s):
+            ai_query = ai_query.filter(cond)
+        ai_results = ai_query.all()
+        if ai_results:
+            products = ai_results
         else:
-            products = query.filter(or_(*loose)).all()
+            # Fall back to title-based strict-then-loose
+            strict, loose = build_search_filters(s)
+            strict_query = query
+            for cond in strict:
+                strict_query = strict_query.filter(cond)
+            strict_results = strict_query.all()
+            if strict_results:
+                products = strict_results
+            else:
+                products = query.filter(or_(*loose)).all()
     else:
         products = query.all()
 
@@ -251,19 +266,28 @@ async def get_store_bestsellers(
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
-    query = db.query(Product).filter(Product.store_id == store_id)
+    query = db.query(Product).filter(Product.store_id == store_id, Product.is_fashion == True)
     if label and label != "all":
         query = query.filter(Product.label == label)
     if search and search.strip():
-        strict, loose = build_search_filters(search.strip())
-        strict_query = query
-        for cond in strict:
-            strict_query = strict_query.filter(cond)
-        strict_results = strict_query.order_by(Product.current_position).limit(limit).all()
-        if strict_results:
-            products = strict_results
+        s = search.strip()
+        # Try AI tags first (AND of search words)
+        ai_query = query
+        for cond in build_ai_tag_filters(s):
+            ai_query = ai_query.filter(cond)
+        ai_results = ai_query.order_by(Product.current_position).limit(limit).all()
+        if ai_results:
+            products = ai_results
         else:
-            products = query.filter(or_(*loose)).order_by(Product.current_position).limit(limit).all()
+            strict, loose = build_search_filters(s)
+            strict_query = query
+            for cond in strict:
+                strict_query = strict_query.filter(cond)
+            strict_results = strict_query.order_by(Product.current_position).limit(limit).all()
+            if strict_results:
+                products = strict_results
+            else:
+                products = query.filter(or_(*loose)).order_by(Product.current_position).limit(limit).all()
     else:
         products = query.order_by(Product.current_position).limit(limit).all()
     return [_product_dict(p) for p in products]
@@ -279,6 +303,8 @@ def _product_dict(p):
         "previous_position": p.previous_position,
         "position_change": pos_diff,
         "label": p.label,
+        "ai_tags": p.ai_tags or "",
+        "is_fashion": bool(p.is_fashion),
         "store_name": p.store.name, "store_url": p.store.url,
         "store_visitors": p.store.monthly_visitors,
         "last_scraped": p.last_scraped.isoformat() if p.last_scraped else None,
