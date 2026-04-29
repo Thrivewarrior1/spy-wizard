@@ -1,7 +1,10 @@
+import asyncio
 import httpx
 import json
 import logging
+import re
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 from models import Store, Product, PositionHistory
 from classifier import classify_products_batch
@@ -9,75 +12,170 @@ from classifier import classify_products_batch
 logger = logging.getLogger(__name__)
 
 HISTORY_RETENTION_DAYS = 30
-SHOPIFY_PAGE_SIZE = 250
+MAX_PAGES = 10
+PRODUCT_FETCH_CONCURRENCY = 8
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+PRODUCT_HREF_RE = re.compile(r"^/products/([a-zA-Z0-9][a-zA-Z0-9\-_]*)")
 
 
-async def scrape_store_bestsellers(store_url: str, limit: int = 250) -> list:
-    """Scrape top bestsellers from a Shopify store via paginated JSON API.
-
-    Uses /collections/all/products.json?sort_by=best-selling and walks pages
-    until `limit` is reached or the store returns an empty page. Position is
-    the global bestseller rank (page 1 first item = position 1).
+def _extract_handles_from_html(html: str) -> list:
+    """Parse a Shopify collection HTML page and return product handles in
+    the exact order they first appear in <a href="/products/..."> links.
+    Duplicates are removed while preserving first-seen order.
     """
-    products = []
-    base_url = store_url.rstrip("/")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "application/json",
+    soup = BeautifulSoup(html, "html.parser")
+    handles = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        # Strip query string / fragment so /products/foo?variant=... still matches.
+        path = href.split("?", 1)[0].split("#", 1)[0]
+        match = PRODUCT_HREF_RE.match(path)
+        if not match:
+            continue
+        handle = match.group(1)
+        if handle in seen:
+            continue
+        seen.add(handle)
+        handles.append(handle)
+
+    return handles
+
+
+async def _fetch_product_json(
+    client: httpx.AsyncClient,
+    base_url: str,
+    handle: str,
+    semaphore: asyncio.Semaphore,
+) -> dict | None:
+    """Fetch a single product's full details from /products/{handle}.json."""
+    url = f"{base_url}/products/{handle}.json"
+    async with semaphore:
+        try:
+            response = await client.get(url)
+            if response.status_code != 200:
+                logger.warning(
+                    f"Non-200 fetching product {handle} from {base_url}: {response.status_code}"
+                )
+                return None
+            data = response.json()
+        except (httpx.HTTPError, json.JSONDecodeError) as e:
+            logger.warning(f"Failed to fetch product {handle} from {base_url}: {e}")
+            return None
+
+    product = data.get("product")
+    if not product:
+        return None
+
+    image_url = ""
+    images = product.get("images") or []
+    if images:
+        image_url = images[0].get("src", "") or ""
+    if not image_url and product.get("image"):
+        image_url = product["image"].get("src", "") or ""
+
+    price = ""
+    variants = product.get("variants") or []
+    if variants:
+        price = variants[0].get("price", "") or ""
+
+    return {
+        "shopify_id": str(product.get("id", "")),
+        "title": product.get("title", "Unknown"),
+        "handle": product.get("handle", handle),
+        "image_url": image_url,
+        "price": price,
+        "vendor": product.get("vendor", "") or "",
+        "product_type": product.get("product_type", "") or "",
+        "product_url": f"{base_url}/products/{handle}",
     }
 
+
+async def scrape_store_bestsellers(store_url: str, max_pages: int = MAX_PAGES) -> list:
+    """Scrape bestsellers from a Shopify store by parsing the actual HTML
+    bestseller page (the JSON API ignores `sort_by` and returns alphabetical
+    order — only the rendered HTML reflects true bestseller ranking).
+
+    Walks /collections/all?sort_by=best-selling&page={N} from page 1 until an
+    empty page is hit or `max_pages` is reached. Position is the global order
+    that handles first appear in the HTML across pages (page 1 first link =
+    position 1). Then fetches /products/{handle}.json for each handle to get
+    titles, images, prices, etc.
+    """
+    base_url = store_url.rstrip("/")
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    ordered_handles: list = []
+    seen_handles: set = set()
+
     try:
-        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-            page = 1
-            while len(products) < limit:
-                url = (
-                    f"{base_url}/collections/all/products.json"
-                    f"?sort_by=best-selling&limit={SHOPIFY_PAGE_SIZE}&page={page}"
-                )
-                response = await client.get(url, headers=headers)
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, headers=headers) as client:
+            for page in range(1, max_pages + 1):
+                url = f"{base_url}/collections/all?sort_by=best-selling&page={page}"
+                try:
+                    response = await client.get(url)
+                except httpx.HTTPError as e:
+                    logger.warning(f"HTTP error for {url}: {e}")
+                    break
+
                 if response.status_code != 200:
                     logger.warning(
                         f"Non-200 response for {base_url} page={page}: {response.status_code}"
                     )
                     break
 
-                try:
-                    data = response.json()
-                except json.JSONDecodeError as e:
-                    logger.warning(f"JSON parse error for {base_url} page={page}: {e}")
+                page_handles = _extract_handles_from_html(response.text)
+                if not page_handles:
                     break
 
-                page_products = data.get("products", [])
-                if not page_products:
+                new_count = 0
+                for handle in page_handles:
+                    if handle in seen_handles:
+                        continue
+                    seen_handles.add(handle)
+                    ordered_handles.append(handle)
+                    new_count += 1
+
+                # Shopify returns the same products on overflow pages — stop
+                # if a page contributed nothing new.
+                if new_count == 0:
                     break
 
-                for product in page_products:
-                    if len(products) >= limit:
-                        break
-                    image_url = ""
-                    if product.get("images"):
-                        image_url = product["images"][0].get("src", "")
-                    price = ""
-                    if product.get("variants"):
-                        price = product["variants"][0].get("price", "")
-                    products.append({
-                        "shopify_id": str(product.get("id", "")),
-                        "title": product.get("title", "Unknown"),
-                        "handle": product.get("handle", ""),
-                        "image_url": image_url,
-                        "price": price,
-                        "vendor": product.get("vendor", ""),
-                        "product_type": product.get("product_type", ""),
-                        "product_url": f"{base_url}/products/{product.get('handle', '')}",
-                        "position": len(products) + 1,
-                    })
+            if not ordered_handles:
+                logger.warning(f"No product handles parsed from {base_url}")
+                return []
 
-                if len(page_products) < SHOPIFY_PAGE_SIZE:
-                    break
-                page += 1
+            json_headers = {"Accept": "application/json"}
+            client.headers.update(json_headers)
+
+            semaphore = asyncio.Semaphore(PRODUCT_FETCH_CONCURRENCY)
+            tasks = [
+                _fetch_product_json(client, base_url, handle, semaphore)
+                for handle in ordered_handles
+            ]
+            fetched = await asyncio.gather(*tasks)
 
     except Exception as e:
         logger.error(f"Error scraping {base_url}: {e}")
+        return []
+
+    products = []
+    for handle, details in zip(ordered_handles, fetched):
+        if not details or not details.get("shopify_id"):
+            continue
+        details["position"] = len(products) + 1
+        products.append(details)
 
     return products
 
@@ -101,7 +199,6 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
 
         if shopify_id in existing_products:
             product = existing_products[shopify_id]
-            # Snapshot prior state BEFORE we mutate it.
             prev_position_before = product.previous_position or 0
             old_position = product.current_position or 0
 
