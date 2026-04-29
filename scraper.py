@@ -1,9 +1,8 @@
-import asyncio
 import httpx
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 from models import Store, Product, PositionHistory
@@ -11,196 +10,146 @@ from classifier import classify_products_batch
 
 logger = logging.getLogger(__name__)
 
-HISTORY_RETENTION_DAYS = 30
-MAX_PAGES = 10
-PRODUCT_FETCH_CONCURRENCY = 8
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+async def scrape_store_bestsellers(store_url: str, limit: int = 250) -> list:
+    """Scrape bestsellers by reading the actual HTML page at /collections/all?sort_by=best-selling.
 
-PRODUCT_HREF_RE = re.compile(r"^/products/([a-zA-Z0-9][a-zA-Z0-9\-_]*)")
+    The Shopify JSON API (/products.json) IGNORES sort_by parameter and returns alphabetical order.
+    So we MUST scrape the HTML page to get the TRUE bestseller order.
 
-
-def _extract_handles_from_html(html: str) -> list:
-    """Parse a Shopify collection HTML page and return product handles in
-    the exact order they first appear in <a href="/products/..."> links.
-    Duplicates are removed while preserving first-seen order.
+    Strategy:
+    1. Fetch HTML pages of /collections/all?sort_by=best-selling (paginated)
+    2. Extract product handles in the EXACT order they appear on the page
+    3. Fetch full product details from /products/{handle}.json for each
     """
-    soup = BeautifulSoup(html, "html.parser")
-    handles = []
-    seen = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Strip query string / fragment so /products/foo?variant=... still matches.
-        path = href.split("?", 1)[0].split("#", 1)[0]
-        match = PRODUCT_HREF_RE.match(path)
-        if not match:
-            continue
-        handle = match.group(1)
-        if handle in seen:
-            continue
-        seen.add(handle)
-        handles.append(handle)
-
-    return handles
-
-
-async def _fetch_product_json(
-    client: httpx.AsyncClient,
-    base_url: str,
-    handle: str,
-    semaphore: asyncio.Semaphore,
-) -> dict | None:
-    """Fetch a single product's full details from /products/{handle}.json."""
-    url = f"{base_url}/products/{handle}.json"
-    async with semaphore:
-        try:
-            response = await client.get(url)
-            if response.status_code != 200:
-                logger.warning(
-                    f"Non-200 fetching product {handle} from {base_url}: {response.status_code}"
-                )
-                return None
-            data = response.json()
-        except (httpx.HTTPError, json.JSONDecodeError) as e:
-            logger.warning(f"Failed to fetch product {handle} from {base_url}: {e}")
-            return None
-
-    product = data.get("product")
-    if not product:
-        return None
-
-    image_url = ""
-    images = product.get("images") or []
-    if images:
-        image_url = images[0].get("src", "") or ""
-    if not image_url and product.get("image"):
-        image_url = product["image"].get("src", "") or ""
-
-    price = ""
-    variants = product.get("variants") or []
-    if variants:
-        price = variants[0].get("price", "") or ""
-
-    return {
-        "shopify_id": str(product.get("id", "")),
-        "title": product.get("title", "Unknown"),
-        "handle": product.get("handle", handle),
-        "image_url": image_url,
-        "price": price,
-        "vendor": product.get("vendor", "") or "",
-        "product_type": product.get("product_type", "") or "",
-        "product_url": f"{base_url}/products/{handle}",
-    }
-
-
-async def scrape_store_bestsellers(store_url: str, max_pages: int = MAX_PAGES) -> list:
-    """Scrape bestsellers from a Shopify store by parsing the actual HTML
-    bestseller page (the JSON API ignores `sort_by` and returns alphabetical
-    order — only the rendered HTML reflects true bestseller ranking).
-
-    Walks /collections/all?sort_by=best-selling&page={N} from page 1 until an
-    empty page is hit or `max_pages` is reached. Position is the global order
-    that handles first appear in the HTML across pages (page 1 first link =
-    position 1). Then fetches /products/{handle}.json for each handle to get
-    titles, images, prices, etc.
-    """
+    products = []
     base_url = store_url.rstrip("/")
     headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
     }
 
-    ordered_handles: list = []
-    seen_handles: set = set()
-
     try:
-        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, headers=headers) as client:
-            for page in range(1, max_pages + 1):
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+            page = 1
+            seen_handles = set()
+
+            while len(products) < limit:
+                # Fetch the actual bestseller HTML page
                 url = f"{base_url}/collections/all?sort_by=best-selling&page={page}"
-                try:
-                    response = await client.get(url)
-                except httpx.HTTPError as e:
-                    logger.warning(f"HTTP error for {url}: {e}")
-                    break
+                response = await client.get(url, headers=headers)
 
                 if response.status_code != 200:
-                    logger.warning(
-                        f"Non-200 response for {base_url} page={page}: {response.status_code}"
-                    )
+                    logger.warning(f"HTTP {response.status_code} for {url}")
                     break
 
-                page_handles = _extract_handles_from_html(response.text)
+                html = response.text
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract product handles from links in the order they appear
+                page_handles = []
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    match = re.match(r"^/products/([a-zA-Z0-9\-_]+)", href)
+                    if match:
+                        handle = match.group(1)
+                        if handle not in seen_handles:
+                            seen_handles.add(handle)
+                            page_handles.append(handle)
+
                 if not page_handles:
+                    # No more products on this page
                     break
 
-                new_count = 0
+                # Fetch details for each product via individual JSON endpoint
                 for handle in page_handles:
-                    if handle in seen_handles:
-                        continue
-                    seen_handles.add(handle)
-                    ordered_handles.append(handle)
-                    new_count += 1
+                    if len(products) >= limit:
+                        break
 
-                # Shopify returns the same products on overflow pages — stop
-                # if a page contributed nothing new.
-                if new_count == 0:
+                    position = len(products) + 1  # Position = order on bestseller page
+
+                    try:
+                        # Get product details from JSON
+                        detail_url = f"{base_url}/products/{handle}.json"
+                        detail_resp = await client.get(detail_url, headers={
+                            "User-Agent": headers["User-Agent"],
+                            "Accept": "application/json"
+                        })
+
+                        if detail_resp.status_code == 200:
+                            pdata = detail_resp.json().get("product", {})
+
+                            image_url = ""
+                            if pdata.get("images"):
+                                image_url = pdata["images"][0].get("src", "")
+
+                            price = ""
+                            if pdata.get("variants"):
+                                price = pdata["variants"][0].get("price", "")
+
+                            products.append({
+                                "shopify_id": str(pdata.get("id", "")),
+                                "title": pdata.get("title", handle),
+                                "handle": handle,
+                                "image_url": image_url,
+                                "price": price,
+                                "vendor": pdata.get("vendor", ""),
+                                "product_type": pdata.get("product_type", ""),
+                                "product_url": f"{base_url}/products/{handle}",
+                                "position": position,
+                            })
+                        else:
+                            # If individual JSON fails, still record with handle as title
+                            products.append({
+                                "shopify_id": "",
+                                "title": handle.replace("-", " ").title(),
+                                "handle": handle,
+                                "image_url": "",
+                                "price": "",
+                                "vendor": "",
+                                "product_type": "",
+                                "product_url": f"{base_url}/products/{handle}",
+                                "position": position,
+                            })
+
+                    except Exception as e:
+                        logger.debug(f"Failed to fetch {handle}: {e}")
+                        continue
+
+                page += 1
+
+                # Safety: don't fetch more than 10 pages
+                if page > 10:
                     break
 
-            if not ordered_handles:
-                logger.warning(f"No product handles parsed from {base_url}")
-                return []
-
-            json_headers = {"Accept": "application/json"}
-            client.headers.update(json_headers)
-
-            semaphore = asyncio.Semaphore(PRODUCT_FETCH_CONCURRENCY)
-            tasks = [
-                _fetch_product_json(client, base_url, handle, semaphore)
-                for handle in ordered_handles
-            ]
-            fetched = await asyncio.gather(*tasks)
+            if products:
+                logger.info(f"Scraped {len(products)} bestsellers from {base_url} (HTML method)")
 
     except Exception as e:
         logger.error(f"Error scraping {base_url}: {e}")
-        return []
-
-    products = []
-    for handle, details in zip(ordered_handles, fetched):
-        if not details or not details.get("shopify_id"):
-            continue
-        details["position"] = len(products) + 1
-        products.append(details)
 
     return products
 
 
 def update_products_in_db(db: Session, store: Store, scraped_products: list):
-    """Update products and assign hero/villain/normal based on position movement.
-
-    Label rule: hero/villain only when we have 2+ prior data points
-    (the existing previous_position > 0 AND the existing current_position > 0).
-    First scrape and second scrape always produce "normal".
-    """
-    existing_products = {p.shopify_id: p for p in store.products if p.shopify_id}
+    """Update products in database and track position changes for Hero/Villain/Normal."""
+    existing_products = {}
+    for p in store.products:
+        if p.shopify_id:
+            existing_products[p.shopify_id] = p
 
     now = datetime.utcnow()
-
-    classify_products_batch(scraped_products)
 
     for product_data in scraped_products:
         shopify_id = product_data["shopify_id"]
         new_position = product_data["position"]
 
-        if shopify_id in existing_products:
+        if shopify_id and shopify_id in existing_products:
             product = existing_products[shopify_id]
-            prev_position_before = product.previous_position or 0
-            old_position = product.current_position or 0
+            old_position = product.current_position
+
+            # Save snapshot of previous state BEFORE updating
+            prev_prev = product.previous_position
 
             product.previous_position = old_position
             product.current_position = new_position
@@ -211,11 +160,14 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
             product.product_url = product_data["product_url"]
             product.vendor = product_data.get("vendor", "")
             product.product_type = product_data.get("product_type", "")
-            product.ai_tags = product_data.get("ai_tags", "")
-            product.is_fashion = product_data.get("is_fashion", True)
+            product.ai_tags = product_data.get("ai_tags", product.ai_tags or "")
+            product.is_fashion = product_data.get("is_fashion", product.is_fashion)
             product.last_scraped = now
 
-            if prev_position_before > 0 and old_position > 0:
+            # Hero/Villain ONLY when we have reliable previous data
+            # old_position > 0 means the product had a position from a prior scrape
+            # prev_prev > 0 means there was even a scrape before THAT one
+            if old_position > 0 and prev_prev > 0:
                 if new_position < old_position:
                     product.label = "hero"
                 elif new_position > old_position:
@@ -246,6 +198,7 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
             db.add(product)
             db.flush()
 
+        # Record position history for 30-day tracking
         history = PositionHistory(
             product_id=product.id,
             position=new_position,
@@ -257,57 +210,42 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
     logger.info(f"Updated {len(scraped_products)} products for {store.name}")
 
 
-def cleanup_old_history(db: Session, retention_days: int = HISTORY_RETENTION_DAYS) -> int:
-    """Delete PositionHistory rows older than `retention_days`. Returns rows removed."""
-    cutoff = datetime.utcnow() - timedelta(days=retention_days)
-    deleted = (
-        db.query(PositionHistory)
-        .filter(PositionHistory.date < cutoff)
-        .delete(synchronize_session=False)
-    )
+def cleanup_old_history(db: Session, days: int = 30):
+    """Remove position history older than N days."""
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    deleted = db.query(PositionHistory).filter(PositionHistory.date < cutoff).delete()
     db.commit()
-    logger.info(f"Pruned {deleted} position_history rows older than {retention_days} days")
-    return deleted
+    if deleted:
+        logger.info(f"Cleaned up {deleted} old history records (>{days} days)")
 
 
-def reset_all_labels(db: Session) -> int:
-    """Reset every product's label to 'normal' and clear previous_position tracking.
-
-    After reset, the next two scrapes will produce only 'normal' labels (since
-    the 2+ data point rule needs to rebuild). Returns number of products reset.
-    """
-    count = (
-        db.query(Product)
-        .update(
-            {Product.label: "normal", Product.previous_position: 0},
-            synchronize_session=False,
-        )
-    )
+def reset_all_labels(db: Session):
+    """Reset all product labels to 'normal'."""
+    count = db.query(Product).update({"label": "normal", "previous_position": 0})
     db.commit()
-    logger.info(f"Reset labels and previous_position for {count} products")
-    return count
+    logger.info(f"Reset {count} product labels to 'normal'")
 
 
 async def scrape_all_stores(db: Session):
-    """Scrape all stores, update DB, and prune old history."""
+    """Scrape all stores and update the database."""
     stores = db.query(Store).all()
     logger.info(f"Starting scrape of {len(stores)} stores...")
+
+    cleanup_old_history(db, days=30)
 
     for store in stores:
         logger.info(f"Scraping {store.name} ({store.url})...")
         try:
             products = await scrape_store_bestsellers(store.url)
             if products:
+                products = await classify_products_batch(products)
                 update_products_in_db(db, store, products)
-                logger.info(f"  ✓ {len(products)} products for {store.name}")
+                fashion_count = sum(1 for p in products if p.get("is_fashion", True))
+                logger.info(f"  ✓ {len(products)} products ({fashion_count} fashion) for {store.name}")
             else:
                 logger.warning(f"  ✗ No products found for {store.name}")
         except Exception as e:
             logger.error(f"  ✗ Failed to scrape {store.name}: {e}")
-
-    try:
-        cleanup_old_history(db)
-    except Exception as e:
-        logger.error(f"History cleanup failed: {e}")
 
     logger.info("Scrape complete.")
