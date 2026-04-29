@@ -313,11 +313,8 @@ def _product_dict(p):
 # --- Scrape triggers ---
 @app.post("/api/scrape")
 async def trigger_scrape(db: Session = Depends(get_db)):
-    db.query(PositionHistory).delete()
-    db.query(Product).delete()
-    db.commit()
     await scrape_all_stores(db)
-    return {"success": True, "message": "Fresh scrape completed"}
+    return {"success": True, "message": "Scrape completed"}
 
 @app.post("/api/reset-labels")
 async def trigger_reset_labels(db: Session = Depends(get_db)):

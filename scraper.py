@@ -121,6 +121,7 @@ async def _fetch_product_json(
         except (httpx.HTTPError, json.JSONDecodeError) as e:
             logger.warning(f"Failed to fetch product {handle} from {base_url}: {e}")
             return None
+        await asyncio.sleep(0.3)
 
     product = data.get("product")
     if not product:
@@ -199,6 +200,8 @@ async def scrape_store_bestsellers(store_url: str, max_pages: int = MAX_PAGES) -
                 # if a page contributed nothing new.
                 if new_count == 0:
                     break
+
+                await asyncio.sleep(1)
 
             if not ordered_handles:
                 logger.warning(f"No product handles parsed from {base_url}")
@@ -371,6 +374,8 @@ async def scrape_all_stores(db: Session):
                 logger.warning(f"  ✗ No fashion products found for {store.name}")
         except Exception as e:
             logger.error(f"  ✗ Failed to scrape {store.name}: {e}")
+
+        await asyncio.sleep(3)
 
     try:
         cleanup_old_history(db)
