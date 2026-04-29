@@ -15,7 +15,7 @@ from typing import Optional
 
 from database import get_db, engine, SessionLocal
 from models import Base, Store, Product, PositionHistory
-from scraper import scrape_all_stores, scrape_store_bestsellers, update_products_in_db
+from scraper import scrape_all_stores, scrape_store_bestsellers, update_products_in_db, reset_all_labels
 from seed import seed_stores
 
 logging.basicConfig(level=logging.INFO)
@@ -315,6 +315,11 @@ def _product_dict(p):
 async def trigger_scrape(db: Session = Depends(get_db)):
     await scrape_all_stores(db)
     return {"success": True, "message": "Scrape completed"}
+
+@app.post("/api/reset-labels")
+async def trigger_reset_labels(db: Session = Depends(get_db)):
+    count = reset_all_labels(db)
+    return {"success": True, "products_reset": count}
 
 @app.post("/api/scrape/{store_id}")
 async def trigger_store_scrape(store_id: int, db: Session = Depends(get_db)):
