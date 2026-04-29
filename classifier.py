@@ -1,4 +1,13 @@
-"""Gemini-powered product classifier with batching and keyword fallback."""
+"""Gemini-powered strict fashion classifier.
+
+Each product is tagged is_fashion=True ONLY if it is clothing, shoes, or bags.
+Everything else (jewelry, watches, accessories, shipping protection, gift cards,
+electronics, home decor, candles, beauty, supplements, etc.) is is_fashion=False.
+
+Gemini is the single source of truth — there is no keyword fallback. If Gemini
+is unavailable or fails for a batch, every product in that batch is marked
+is_fashion=False so it never enters the bestseller feed.
+"""
 import os
 import json
 import logging
@@ -8,75 +17,16 @@ logger = logging.getLogger(__name__)
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
-BATCH_SIZE = 25
-
-# Comprehensive fashion / apparel / accessory keywords across EN/DE/FR/ES.
-FASHION_KEYWORDS = {
-    # tops
-    "shirt", "t-shirt", "tshirt", "tee", "blouse", "top", "tank", "camisole",
-    "polo", "sweater", "pullover", "hoodie", "sweatshirt", "cardigan", "vest",
-    "blazer", "jacket", "coat", "parka", "trench", "windbreaker", "puffer",
-    "bomber", "anorak",
-    # bottoms
-    "pants", "trousers", "jeans", "leggings", "shorts", "skirt", "joggers",
-    "sweatpants", "chinos", "slacks", "culottes", "bermudas",
-    # dresses & one-pieces
-    "dress", "gown", "jumpsuit", "romper", "playsuit", "kaftan", "tunic",
-    # underwear / loungewear / swim
-    "lingerie", "bra", "panties", "underwear", "boxer", "briefs", "thong",
-    "pajamas", "pyjama", "loungewear", "robe", "nightgown", "sleepwear",
-    "swimwear", "swimsuit", "bikini", "trunks", "rashguard",
-    # shoes
-    "shoes", "sneakers", "trainers", "boots", "ankle-boots", "heels", "pumps",
-    "sandals", "flats", "loafers", "mules", "espadrilles", "slippers", "clogs",
-    "oxfords", "flip-flops",
-    # bags
-    "bag", "handbag", "purse", "tote", "backpack", "rucksack", "satchel",
-    "clutch", "wallet", "crossbody", "messenger-bag", "duffel",
-    # accessories
-    "hat", "cap", "beanie", "fedora", "scarf", "shawl", "belt", "tie",
-    "bowtie", "gloves", "mittens", "sunglasses", "watch", "jewelry",
-    "necklace", "earrings", "bracelet", "ring", "anklet", "brooch", "cufflinks",
-    "umbrella", "headband",
-    # generic
-    "outfit", "apparel", "clothing", "fashion", "accessories", "tracksuit",
-    "activewear", "sportswear", "athleisure", "kidswear", "menswear",
-    "womenswear", "uniform",
-    # German
-    "kleid", "hemd", "hose", "rock", "schuhe", "tasche", "mantel", "jacke",
-    "stiefel", "stiefelette", "muetze", "mütze", "schal", "guertel", "gürtel",
-    "handschuhe", "sonnenbrille", "unterwäsche", "badeanzug", "anzug",
-    "trikot", "trainingsanzug", "strickjacke",
-    # French
-    "robe", "chemise", "pantalon", "veste", "manteau", "jupe", "chaussures",
-    "sac", "ceinture", "chapeau", "écharpe", "echarpe", "lunettes", "bottes",
-    "sandales", "baskets", "maillot", "sous-vetements", "pyjama",
-    # Spanish
-    "vestido", "camisa", "pantalones", "chaqueta", "abrigo", "falda",
-    "zapatos", "bolso", "botas", "cinturon", "cinturón", "sombrero", "bufanda",
-    "gafas", "traje", "calcetines", "pijama", "bañador", "banador",
-}
-
-
-def _keyword_fallback(products: list) -> list:
-    """Tag each product using FASHION_KEYWORDS as a backup when Gemini is unavailable."""
-    for p in products:
-        title_lower = (p.get("title") or "").lower()
-        ptype_lower = (p.get("product_type") or "").lower()
-        vendor_lower = (p.get("vendor") or "").lower()
-        haystack = f"{title_lower} {ptype_lower} {vendor_lower}"
-        matched = [kw for kw in FASHION_KEYWORDS if kw in haystack]
-        if matched:
-            p["is_fashion"] = True
-            p["ai_tags"] = ",".join(sorted(set(matched))[:6])
-        else:
-            p["is_fashion"] = False
-            p["ai_tags"] = ""
-    return products
+BATCH_SIZE = 20
 
 
 def _classify_batch_with_gemini(batch: list, api_key: str) -> bool:
-    """Classify a single batch in place. Returns True on success, False on failure."""
+    """Classify a single batch in place. Returns True on success, False on failure.
+
+    On success each product gets:
+      - is_fashion: bool (clothing/shoes/bags only)
+      - ai_tags:    str (comma-separated English keywords)
+    """
     items = [
         {
             "index": idx,
@@ -88,11 +38,26 @@ def _classify_batch_with_gemini(batch: list, api_key: str) -> bool:
     ]
 
     prompt = (
-        "You are a product classifier for a fashion bestseller tracker. "
-        "For EACH product below, return:\n"
-        "- is_fashion: true if it's apparel, footwear, bags, or fashion accessories; "
-        "false for things like gift cards, candles, home decor, electronics, food.\n"
-        "- tags: 2-6 concise English keywords describing the product "
+        "You are a STRICT fashion classifier for a clothing bestseller tracker.\n\n"
+        "For EACH product below, decide if it is FASHION.\n\n"
+        "FASHION = clothing, shoes, or bags ONLY. This includes:\n"
+        "  - Clothing: shirts, t-shirts, blouses, tops, sweaters, hoodies, jackets, "
+        "coats, dresses, skirts, pants, jeans, shorts, leggings, jumpsuits, "
+        "swimwear, lingerie, sleepwear, activewear.\n"
+        "  - Shoes: sneakers, boots, heels, sandals, flats, loafers, slippers.\n"
+        "  - Bags: handbags, backpacks, totes, clutches, wallets, crossbody bags.\n\n"
+        "NOT FASHION (is_fashion=false) — be strict, when in doubt say false:\n"
+        "  - Jewelry of any kind (necklaces, earrings, rings, bracelets, watches).\n"
+        "  - Accessories that are not clothing/shoes/bags (hats, scarves, belts, "
+        "sunglasses, gloves, ties, hair accessories).\n"
+        "  - Shipping protection, package protection, route insurance, "
+        "delivery guarantees.\n"
+        "  - Gift cards, donations, tips, samples.\n"
+        "  - Electronics, phone cases, chargers, headphones.\n"
+        "  - Home decor, candles, furniture, kitchenware, bedding, rugs, art.\n"
+        "  - Beauty, skincare, makeup, perfume, supplements, vitamins, food.\n"
+        "  - Toys, books, stationery, pet products.\n\n"
+        "Also produce 2-6 short English keyword tags per product describing it "
         "(e.g. 'summer,floral,maxi,dress'), comma-separated, all lowercase. "
         "Translate non-English titles into English keywords.\n\n"
         f"Products (JSON):\n{json.dumps(items, ensure_ascii=False)}\n\n"
@@ -115,14 +80,14 @@ def _classify_batch_with_gemini(batch: list, api_key: str) -> bool:
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.05,
+            "temperature": 0.0,
             "responseMimeType": "application/json",
             "responseSchema": schema,
         },
     }
 
     try:
-        with httpx.Client(timeout=45.0) as client:
+        with httpx.Client(timeout=60.0) as client:
             resp = client.post(
                 GEMINI_URL,
                 params={"key": api_key},
@@ -138,11 +103,12 @@ def _classify_batch_with_gemini(batch: list, api_key: str) -> bool:
         for r in results:
             i = r.get("index")
             if isinstance(i, int) and 0 <= i < len(batch):
-                batch[i]["is_fashion"] = bool(r.get("is_fashion", True))
+                batch[i]["is_fashion"] = bool(r.get("is_fashion", False))
                 batch[i]["ai_tags"] = (r.get("tags") or "").strip().lower()
 
+        # Anything Gemini didn't return for is treated as non-fashion.
         for p in batch:
-            p.setdefault("is_fashion", True)
+            p.setdefault("is_fashion", False)
             p.setdefault("ai_tags", "")
 
         return True
@@ -152,35 +118,45 @@ def _classify_batch_with_gemini(batch: list, api_key: str) -> bool:
         return False
 
 
+def _mark_all_non_fashion(batch: list):
+    for p in batch:
+        p["is_fashion"] = False
+        p["ai_tags"] = ""
+
+
 def classify_products_batch(products: list) -> list:
     """Classify products in place in chunks of BATCH_SIZE.
 
-    Adds 'ai_tags' (str) and 'is_fashion' (bool) to each product. If Gemini fails
-    for a given batch, that batch falls back to keyword classification while other
-    batches continue with Gemini.
+    Adds 'ai_tags' (str) and 'is_fashion' (bool) to each product. Gemini is the
+    only classifier — if the API key is missing or a batch fails, those products
+    are marked is_fashion=False so they are excluded from the feed.
     """
     if not products:
         return products
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        logger.info("GEMINI_API_KEY not set, using keyword fallback for %d products", len(products))
-        return _keyword_fallback(products)
+        logger.warning(
+            "GEMINI_API_KEY not set — marking all %d products non-fashion", len(products)
+        )
+        _mark_all_non_fashion(products)
+        return products
 
     total = len(products)
     gemini_ok = 0
-    fallback_used = 0
+    failed = 0
 
     for start in range(0, total, BATCH_SIZE):
         batch = products[start:start + BATCH_SIZE]
         if _classify_batch_with_gemini(batch, api_key):
             gemini_ok += len(batch)
         else:
-            _keyword_fallback(batch)
-            fallback_used += len(batch)
+            _mark_all_non_fashion(batch)
+            failed += len(batch)
 
+    fashion_count = sum(1 for p in products if p.get("is_fashion"))
     logger.info(
-        "Classified %d products (gemini=%d, keyword_fallback=%d, batch_size=%d)",
-        total, gemini_ok, fallback_used, BATCH_SIZE,
+        "Classified %d products (gemini_ok=%d, failed=%d, fashion=%d, non_fashion=%d)",
+        total, gemini_ok, failed, fashion_count, total - fashion_count,
     )
     return products

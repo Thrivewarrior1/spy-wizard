@@ -1,3 +1,20 @@
+"""Shopify bestseller scraper.
+
+Strategy:
+  1. Fetch /collections/all?sort_by=best-selling HTML (the JSON API ignores
+     sort_by and returns alphabetical order — only the rendered HTML reflects
+     true bestseller ranking).
+  2. Walk the main product grid in display order, extract handles.
+  3. Fetch /products/{handle}.json for each handle to get title/image/price.
+  4. Send EVERY fetched product to Gemini for fashion classification
+     (clothing, shoes, bags only — see classifier.py).
+  5. Keep only is_fashion=True products. They get sequential positions
+     1..N in their original display order. Non-fashion products are
+     dropped entirely and never enter the database.
+  6. Hero/villain labels are only assigned once a product has >= 2 prior
+     PositionHistory rows (i.e. it has been observed at least twice before
+     this scrape).
+"""
 import asyncio
 import httpx
 import json
@@ -6,6 +23,7 @@ import re
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from models import Store, Product, PositionHistory
 from classifier import classify_products_batch
 
@@ -23,98 +41,16 @@ USER_AGENT = (
 
 PRODUCT_HREF_RE = re.compile(r"^/products/([a-zA-Z0-9][a-zA-Z0-9\-_]*)")
 
-# Handles that appear in product grids but aren't real products — Shopify apps
-# (Route, Navidium, etc.) inject these as cart upsells / footer links.
-BLOCKED_HANDLES = {
-    "shipping-protection",
-    "shipping-insurance",
-    "package-protection",
-    "route-shipping-protection",
-    "route-package-protection",
-    "navidium-shipping-protection",
-    "delivery-guarantee",
-    "gift-card",
-    "gift-cards",
-    "e-gift-card",
-    "digital-gift-card",
-    "tip",
-    "tips",
-    "donation",
-    "sample",
-}
-
-# Product types / title keywords that indicate the item is not fashion/apparel.
-# Matched case-insensitively as substrings against product_type and title.
-NON_FASHION_TYPES = {
-    "jewelry",
-    "jewellery",
-    "necklace",
-    "bracelet",
-    "earring",
-    "earrings",
-    "ring",
-    "rings",
-    "pendant",
-    "candle",
-    "candles",
-    "home decor",
-    "home-decor",
-    "homeware",
-    "furniture",
-    "kitchen",
-    "kitchenware",
-    "bedding",
-    "rug",
-    "rugs",
-    "lamp",
-    "lamps",
-    "vase",
-    "art",
-    "artwork",
-    "poster",
-    "print",
-    "wall art",
-    "electronics",
-    "phone case",
-    "charger",
-    "cable",
-    "headphones",
-    "speaker",
-    "toy",
-    "toys",
-    "book",
-    "books",
-    "stationery",
-    "food",
-    "snack",
-    "supplement",
-    "vitamin",
-    "skincare",
-    "beauty",
-    "cosmetic",
-    "cosmetics",
-    "makeup",
-    "perfume",
-    "fragrance",
-    "pet",
-    "pets",
-}
-
 
 def _find_product_grid_container(soup: BeautifulSoup):
     """Locate the main product grid on a Shopify collection page so we don't
     pick up products from the navigation, footer, sidebar, related-products
     block, or featured-collection upsell.
-
-    Tries the most specific containers first and falls back to <main> or the
-    whole document if nothing more specific matches.
     """
-    # Most Shopify themes (Dawn and derivatives) use id="product-grid".
     grid = soup.find(id="product-grid")
     if grid:
         return grid
 
-    # Class-based fallbacks — first match wins.
     for selector in [
         {"class_": re.compile(r"\bproduct-grid\b", re.I)},
         {"class_": re.compile(r"\bcollection-grid\b", re.I)},
@@ -127,7 +63,6 @@ def _find_product_grid_container(soup: BeautifulSoup):
         if node:
             return node
 
-    # MainContent is the standard Dawn wrapper around the active template.
     main_content = soup.find(id="MainContent")
     if main_content:
         return main_content
@@ -141,9 +76,9 @@ def _find_product_grid_container(soup: BeautifulSoup):
 
 def _extract_product_handles(html: str) -> list:
     """Parse a Shopify collection HTML page and return product handles in
-    the exact order they appear in the *main product grid*. Skips nav,
-    footer, sidebar, and known junk handles (shipping protection, gift
-    cards, etc.). Duplicates are removed while preserving first-seen order.
+    the exact order they appear in the main product grid. Duplicates are
+    removed while preserving first-seen order. No category filtering happens
+    here — Gemini classifies every fetched product downstream.
     """
     soup = BeautifulSoup(html, "html.parser")
     container = _find_product_grid_container(soup)
@@ -160,23 +95,10 @@ def _extract_product_handles(html: str) -> list:
         handle = match.group(1)
         if handle in seen:
             continue
-        if handle.lower() in BLOCKED_HANDLES:
-            continue
         seen.add(handle)
         handles.append(handle)
 
     return handles
-
-
-def _is_non_fashion(product_type: str, title: str) -> bool:
-    """Return True if the product looks like jewelry, home decor, electronics,
-    or any other non-apparel category we want to exclude from the bestseller
-    feed."""
-    haystack = f"{product_type or ''} {title or ''}".lower()
-    for needle in NON_FASHION_TYPES:
-        if needle in haystack:
-            return True
-    return False
 
 
 async def _fetch_product_json(
@@ -229,15 +151,11 @@ async def _fetch_product_json(
 
 
 async def scrape_store_bestsellers(store_url: str, max_pages: int = MAX_PAGES) -> list:
-    """Scrape bestsellers from a Shopify store by parsing the actual HTML
-    bestseller page (the JSON API ignores `sort_by` and returns alphabetical
-    order — only the rendered HTML reflects true bestseller ranking).
+    """Scrape bestsellers from a Shopify store via the HTML bestseller page.
 
-    Walks /collections/all?sort_by=best-selling&page={N} from page 1 until an
-    empty page is hit or `max_pages` is reached. Position is the order that
-    handles first appear in the main product grid across pages, after junk
-    handles and non-fashion items are filtered out — so position 1 is the
-    first real fashion product a shopper sees.
+    Returns a list of fashion-only products (clothing/shoes/bags) in their
+    bestseller display order, each with sequential `position` 1..N.
+    Non-fashion items are dropped before positions are assigned.
     """
     base_url = store_url.rstrip("/")
     headers = {
@@ -300,34 +218,46 @@ async def scrape_store_bestsellers(store_url: str, max_pages: int = MAX_PAGES) -
         logger.error(f"Error scraping {base_url}: {e}")
         return []
 
-    products = []
+    # Keep display order; drop any handle whose JSON fetch failed.
+    raw_products = []
     for handle, details in zip(ordered_handles, fetched):
         if not details or not details.get("shopify_id"):
             continue
-        if _is_non_fashion(details.get("product_type", ""), details.get("title", "")):
-            logger.debug(
-                f"Skipping non-fashion product {handle} "
-                f"(type={details.get('product_type')!r}, title={details.get('title')!r})"
-            )
-            continue
-        details["position"] = len(products) + 1
-        products.append(details)
+        raw_products.append(details)
 
-    return products
+    if not raw_products:
+        return []
+
+    # Gemini classifies every product. Only is_fashion=True items survive.
+    classify_products_batch(raw_products)
+
+    fashion_products = []
+    for details in raw_products:
+        if not details.get("is_fashion"):
+            continue
+        details["position"] = len(fashion_products) + 1
+        fashion_products.append(details)
+
+    logger.info(
+        f"{base_url}: scraped {len(raw_products)} products, "
+        f"{len(fashion_products)} are fashion (positions 1..{len(fashion_products)})"
+    )
+    return fashion_products
 
 
 def update_products_in_db(db: Session, store: Store, scraped_products: list):
-    """Update products and assign hero/villain/normal based on position movement.
+    """Update fashion products and assign hero/villain/normal based on position.
 
-    Label rule: hero/villain only when we have 2+ prior data points
-    (the existing previous_position > 0 AND the existing current_position > 0).
-    First scrape and second scrape always produce "normal".
+    Label rule: hero/villain only when the product already has >= 2 prior
+    PositionHistory rows (i.e. it has been observed in at least two earlier
+    scrapes). The first two scrapes of a product always produce 'normal'.
+
+    Products from `scraped_products` are already filtered to is_fashion=True
+    by the scraper, so non-fashion items never reach the database.
     """
     existing_products = {p.shopify_id: p for p in store.products if p.shopify_id}
 
     now = datetime.utcnow()
-
-    classify_products_batch(scraped_products)
 
     for product_data in scraped_products:
         shopify_id = product_data["shopify_id"]
@@ -335,8 +265,13 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
 
         if shopify_id in existing_products:
             product = existing_products[shopify_id]
-            prev_position_before = product.previous_position or 0
             old_position = product.current_position or 0
+
+            history_count = (
+                db.query(func.count(PositionHistory.id))
+                .filter(PositionHistory.product_id == product.id)
+                .scalar()
+            ) or 0
 
             product.previous_position = old_position
             product.current_position = new_position
@@ -348,10 +283,10 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
             product.vendor = product_data.get("vendor", "")
             product.product_type = product_data.get("product_type", "")
             product.ai_tags = product_data.get("ai_tags", "")
-            product.is_fashion = product_data.get("is_fashion", True)
+            product.is_fashion = True
             product.last_scraped = now
 
-            if prev_position_before > 0 and old_position > 0:
+            if history_count >= 2 and old_position > 0:
                 if new_position < old_position:
                     product.label = "hero"
                 elif new_position > old_position:
@@ -376,7 +311,7 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
                 previous_position=0,
                 label="normal",
                 ai_tags=product_data.get("ai_tags", ""),
-                is_fashion=product_data.get("is_fashion", True),
+                is_fashion=True,
                 last_scraped=now,
             )
             db.add(product)
@@ -390,7 +325,7 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
         db.add(history)
 
     db.commit()
-    logger.info(f"Updated {len(scraped_products)} products for {store.name}")
+    logger.info(f"Updated {len(scraped_products)} fashion products for {store.name}")
 
 
 def cleanup_old_history(db: Session, retention_days: int = HISTORY_RETENTION_DAYS) -> int:
@@ -407,11 +342,7 @@ def cleanup_old_history(db: Session, retention_days: int = HISTORY_RETENTION_DAY
 
 
 def reset_all_labels(db: Session) -> int:
-    """Reset every product's label to 'normal' and clear previous_position tracking.
-
-    After reset, the next two scrapes will produce only 'normal' labels (since
-    the 2+ data point rule needs to rebuild). Returns number of products reset.
-    """
+    """Reset every product's label to 'normal' and clear previous_position tracking."""
     count = (
         db.query(Product)
         .update(
@@ -435,9 +366,9 @@ async def scrape_all_stores(db: Session):
             products = await scrape_store_bestsellers(store.url)
             if products:
                 update_products_in_db(db, store, products)
-                logger.info(f"  ✓ {len(products)} products for {store.name}")
+                logger.info(f"  ✓ {len(products)} fashion products for {store.name}")
             else:
-                logger.warning(f"  ✗ No products found for {store.name}")
+                logger.warning(f"  ✗ No fashion products found for {store.name}")
         except Exception as e:
             logger.error(f"  ✗ Failed to scrape {store.name}: {e}")
 
