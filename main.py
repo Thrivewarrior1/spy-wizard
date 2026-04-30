@@ -15,7 +15,13 @@ from typing import Optional
 
 from database import get_db, engine, SessionLocal
 from models import Base, Store, Product, PositionHistory
-from scraper import scrape_all_stores, scrape_store_bestsellers, update_products_in_db, reset_all_labels
+from scraper import (
+    scrape_all_stores,
+    scrape_store_bestsellers,
+    update_products_in_db,
+    reset_all_labels,
+    debug_fetch,
+)
 from seed import seed_stores
 
 logging.basicConfig(level=logging.INFO)
@@ -341,10 +347,32 @@ async def trigger_store_scrape(store_id: int, db: Session = Depends(get_db)):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
-    products = await scrape_store_bestsellers(store.url)
+    products, errors = await scrape_store_bestsellers(store.url)
     if products:
         update_products_in_db(db, store, products)
-    return {"success": True, "products_found": len(products)}
+    return {"success": len(products) > 0, "products_found": len(products), "errors": errors}
+
+
+@app.get("/api/debug/fetch/{store_id}")
+async def debug_fetch_store(store_id: int, db: Session = Depends(get_db)):
+    """Diagnostic: fetch one collection page and report what we see."""
+    store = db.query(Store).filter(Store.id == store_id).first()
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+    return await debug_fetch(store.url)
+
+
+@app.get("/api/debug/env")
+async def debug_env():
+    """Report which env-derived behavior is active without leaking secrets."""
+    return {
+        "gemini_key_set": bool(os.getenv("GEMINI_API_KEY")),
+        "database_url_kind": (
+            "postgres" if os.getenv("DATABASE_URL", "").startswith(("postgres://", "postgresql://"))
+            else "sqlite" if not os.getenv("DATABASE_URL") or "sqlite" in os.getenv("DATABASE_URL", "")
+            else "other"
+        ),
+    }
 
 @app.get("/api/stats")
 async def get_stats(db: Session = Depends(get_db)):

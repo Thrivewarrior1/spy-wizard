@@ -278,6 +278,10 @@ function loadStores(){
   })
 }
 
+function fmtStoreLine(s){
+  const errs=(s.errors&&s.errors.length)?'\n      ⚠ '+s.errors.join('\n      ⚠ '):'';
+  return `  ${s.name}: ${s.products} fashion${errs}`;
+}
 function triggerScrape(){const b=document.getElementById('scrapeBtn');b.textContent='⏳ Scraping...';b.disabled=true;
   fetch(API+'/scrape',{method:'POST'}).then(r=>r.json()).then(d=>{
     b.textContent='↻ Scrape All Stores';b.disabled=false;
@@ -285,17 +289,19 @@ function triggerScrape(){const b=document.getElementById('scrapeBtn');b.textCont
     const total=d.total_products||0;
     const ok=d.stores_with_products||0;
     const failed=d.stores_failed||0;
-    if(total===0){alert('⚠️ Scrape returned 0 products. Check Railway logs.');return}
-    let msg=`✓ Scraped ${total} products across ${ok} stores`+(failed?` (${failed} failed)`:'');
+    let msg;
+    if(total===0){msg='⚠️ Scrape returned 0 fashion products.\n\n'}
+    else{msg=`✓ Scraped ${total} fashion products across ${ok} stores`+(failed?` (${failed} failed)`:'')+'\n\n'}
     if(d.stores&&d.stores.length){
-      const breakdown=d.stores.map(s=>`  ${s.name}: ${s.products}${s.error?' ('+s.error+')':''}`).join('\n');
-      msg+='\n\n'+breakdown;
+      msg+=d.stores.map(fmtStoreLine).join('\n');
     }
     alert(msg);
   }).catch(()=>{b.textContent='↻ Scrape All Stores';b.disabled=false;alert('Scrape request failed (network error)')})}
 function scrapeOne(id){fetch(`${API}/scrape/${id}`,{method:'POST'}).then(r=>r.json()).then(d=>{
   const n=d.products_found||0;
-  if(n===0){alert('⚠️ Scraped 0 products. Check Railway logs.')}else{alert(`✓ Scraped ${n} products`)}
+  const errs=(d.errors&&d.errors.length)?'\n\n'+d.errors.join('\n'):'';
+  if(n===0){alert('⚠️ Scraped 0 fashion products.'+errs)}
+  else{alert(`✓ Scraped ${n} fashion products`+errs)}
   loadStores();loadCombined();loadStats()
 }).catch(()=>alert('Scrape request failed (network error)'))}
 
