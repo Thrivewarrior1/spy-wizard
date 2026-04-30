@@ -427,7 +427,12 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
             product.is_fashion = True
             product.last_scraped = now
 
-            if history_count >= 2 and old_position > 0:
+            # Hero/villain only meaningful when we have a real prior snapshot
+            # to compare against. history_count counts rows BEFORE this scrape
+            # writes its own row, so >=1 means at least one earlier scrape
+            # exists. With no history at all (first scrape ever for this
+            # product) we always emit 'normal'.
+            if history_count >= 1 and old_position > 0:
                 if new_position < old_position:
                     product.label = "hero"
                 elif new_position > old_position:
