@@ -120,16 +120,8 @@ def _extract_products_from_html(soup: BeautifulSoup, base_url: str, seen: set) -
                 if card.find("img") or card.find(class_=re.compile(r"price|title|name", re.I)):
                     break
 
-        # Title: prefer a labeled element, fall back to the link text.
-        title = ""
-        title_el = card.find(
-            ["h2", "h3", "h4", "h5", "span", "p", "div"],
-            class_=re.compile(r"title|name|product", re.I),
-        )
-        if title_el:
-            title = title_el.get_text(strip=True)
-        if not title:
-            title = a_tag.get_text(strip=True)
+        # Title: use the link text — the product title IS the link text on Shopify themes.
+        title = a_tag.get_text(strip=True)
         if not title:
             title = handle.replace("-", " ").title()
 
