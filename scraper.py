@@ -38,7 +38,12 @@ from classifier import classify_products_batch
 logger = logging.getLogger(__name__)
 
 HISTORY_RETENTION_DAYS = 30
-MAX_PAGES = 12
+# Aggressive page cap so a store with lots of non-fashion mixed near the
+# top of its best-seller list can still surface 100 fashion products.
+# Loop also exits early when a fetched page yields zero new product links
+# (catalog exhausted) so we never burn 50 requests on stores like Lumenrosa
+# that only have 11 best-sellers total.
+MAX_PAGES = 50
 TARGET_FASHION = 100
 
 USER_AGENT = (

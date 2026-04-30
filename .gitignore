@@ -1,0 +1,25 @@
+# Environment / secrets — NEVER commit. Read GEMINI_API_KEY etc. from
+# Railway env vars (or a local .env that stays out of git).
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local DB
+*.db
+*.db-journal
+spy_wizard.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
