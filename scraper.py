@@ -281,7 +281,7 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
                 if has_gemini:
                     # Classify this page's batch with Gemini. Failures bubble
                     # up through `errors` rather than being silently swallowed.
-                    ok, classifier_errors = _classify_or_fail(page_products)
+                    ok, classifier_errors = await _classify_or_fail(page_products)
                     errors.extend(classifier_errors)
                     if not ok:
                         # Hard fail — without classification we cannot meet
@@ -326,7 +326,7 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
     return fashion, errors
 
 
-def _classify_or_fail(batch: list):
+async def _classify_or_fail(batch: list):
     """Run Gemini classification on a batch. Returns (ok, errors).
 
     Errors include the Gemini HTTP body / exception text propagated up from
@@ -341,7 +341,7 @@ def _classify_or_fail(batch: list):
         p.setdefault("is_fashion", None)
         p.setdefault("ai_tags", "")
     try:
-        classifier_errors = classify_products_batch(batch)
+        classifier_errors = await classify_products_batch(batch)
     except Exception as e:
         return False, [f"Gemini exception: {type(e).__name__}: {e}"]
 

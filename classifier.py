@@ -15,7 +15,7 @@ import os
 import json
 import logging
 import random
-import time
+import asyncio
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -34,10 +34,11 @@ RETRY_STATUSES = (429, 500, 502, 503, 504)
 MAX_RETRIES = 5
 
 
-def _classify_batch_with_gemini(batch: list, api_key: str):
+async def _classify_batch_with_gemini(batch: list, api_key: str):
     """Classify a single batch in place.
 
-    Returns (ok, error_message). On success error_message is None. On failure
+    Async so retry sleeps don't block FastAPI's event loop. Returns
+    (ok, error_message). On success error_message is None. On failure
     error_message is a short string describing the underlying cause (HTTP
     status + Gemini error body, JSON parse failure, etc.) so the scraper can
     surface it to the API consumer instead of silently dropping products.
@@ -104,9 +105,9 @@ def _classify_batch_with_gemini(batch: list, api_key: str):
     try:
         last_status = None
         last_body = ""
-        with httpx.Client(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             for attempt in range(MAX_RETRIES):
-                resp = client.post(
+                resp = await client.post(
                     GEMINI_URL,
                     params={"key": api_key},
                     json=payload,
@@ -128,7 +129,7 @@ def _classify_batch_with_gemini(batch: list, api_key: str):
                     "Gemini %s on attempt %d/%d, retrying in %.1fs",
                     resp.status_code, attempt + 1, MAX_RETRIES, wait,
                 )
-                time.sleep(wait)
+                await asyncio.sleep(wait)
             else:
                 msg = f"HTTP {last_status} after {MAX_RETRIES} retries: {last_body}"
                 logger.warning("Gemini batch failed — %s", msg)
@@ -170,13 +171,15 @@ def _classify_batch_with_gemini(batch: list, api_key: str):
         return False, msg
 
 
-def classify_products_batch(products: list):
+async def classify_products_batch(products: list):
     """Enrich products in place with ai_tags and (optionally) is_fashion.
 
-    Returns a list of error strings — empty when every batch succeeded.
-    Errors include the Gemini HTTP body / exception message so the caller
-    can surface the real cause (auth, quota, model-not-found) rather than
-    a generic "did not classify" message.
+    Async so the per-batch network IO and any retry sleeps cooperate with
+    FastAPI's event loop instead of stalling it for tens of seconds at a
+    time. Returns a list of error strings — empty when every batch
+    succeeded. Errors include the Gemini HTTP body / exception message so
+    the caller can surface the real cause (auth, quota, model-not-found)
+    rather than a generic "did not classify" message.
     """
     if not products:
         return []
@@ -196,7 +199,7 @@ def classify_products_batch(products: list):
 
     for start in range(0, total, BATCH_SIZE):
         batch = products[start:start + BATCH_SIZE]
-        success, err = _classify_batch_with_gemini(batch, api_key)
+        success, err = await _classify_batch_with_gemini(batch, api_key)
         if success:
             ok += len(batch)
         else:

@@ -435,7 +435,7 @@ async def debug_gemini():
         {"shopify_id": "x2", "handle": "x2", "title": "Shipping protection",
          "vendor": "Test", "product_type": "", "is_fashion": None, "ai_tags": ""},
     ]
-    errors = classify_products_batch(sample)
+    errors = await classify_products_batch(sample)
     return {
         "gemini_key_set": bool(os.getenv("GEMINI_API_KEY")),
         "errors": errors,
