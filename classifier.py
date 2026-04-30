@@ -23,19 +23,31 @@ logger = logging.getLogger(__name__)
 # gemini-2.0-flash was retired for new API keys ("no longer available to new
 # users"). gemini-2.5-flash is the current-generation drop-in replacement and
 # supports the same responseSchema / responseMimeType structured-output flags.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+# When 2.5-flash is overloaded (frequent 503s in 2026) we fall back to the
+# lite tier, which sees less traffic and is more than adequate for the
+# yes/no fashion classification task we use it for.
+GEMINI_PRIMARY = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_FALLBACKS = ["gemini-2.5-flash-lite", "gemini-flash-latest"]
+
+
+def _gemini_url(model: str) -> str:
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
 
 BATCH_SIZE = 20
 # Transient-error HTTP statuses we should retry. 503 is the common
 # "model overloaded" path; 429 is quota burst; 500/502/504 are upstream
 # blips. 4xx other than 429 means a permanent fault we shouldn't retry.
 RETRY_STATUSES = (429, 500, 502, 503, 504)
-MAX_RETRIES = 5
+MAX_RETRIES = 4
+# Inter-batch throttle: gentle gap between Gemini calls within a single
+# scrape page so we don't burst over the per-minute quota that frequently
+# manifests as 503 "model overloaded" on the free tier.
+INTER_BATCH_DELAY = 1.5
 
 
-async def _classify_batch_with_gemini(batch: list, api_key: str):
-    """Classify a single batch in place.
+async def _classify_batch_with_gemini(batch: list, api_key: str, model: str):
+    """Classify a single batch in place against `model`.
 
     Async so retry sleeps don't block FastAPI's event loop. Returns
     (ok, error_message). On success error_message is None. On failure
@@ -102,13 +114,14 @@ async def _classify_batch_with_gemini(batch: list, api_key: str):
         },
     }
 
+    url = _gemini_url(model)
     try:
         last_status = None
         last_body = ""
         async with httpx.AsyncClient(timeout=60.0) as client:
             for attempt in range(MAX_RETRIES):
                 resp = await client.post(
-                    GEMINI_URL,
+                    url,
                     params={"key": api_key},
                     json=payload,
                     headers={"Content-Type": "application/json"},
@@ -118,20 +131,20 @@ async def _classify_batch_with_gemini(batch: list, api_key: str):
                 last_status = resp.status_code
                 last_body = (resp.text or "")[:400].replace("\n", " ")
                 if resp.status_code not in RETRY_STATUSES or attempt == MAX_RETRIES - 1:
-                    msg = f"HTTP {resp.status_code}: {last_body}"
+                    msg = f"[{model}] HTTP {resp.status_code}: {last_body}"
                     logger.warning("Gemini batch failed — %s", msg)
                     return False, msg
                 # Exponential backoff with jitter — Gemini's 503 spikes are
-                # usually short, so 4s -> 8s -> 16s -> 32s gives ~60s total
-                # which keeps a single page's wall-clock under control.
+                # usually short, so 4s -> 8s -> 16s gives ~30s before we
+                # surrender this model and try a fallback.
                 wait = (2 ** (attempt + 1)) + random.uniform(0, 2)
                 logger.warning(
-                    "Gemini %s on attempt %d/%d, retrying in %.1fs",
-                    resp.status_code, attempt + 1, MAX_RETRIES, wait,
+                    "Gemini[%s] %s on attempt %d/%d, retrying in %.1fs",
+                    model, resp.status_code, attempt + 1, MAX_RETRIES, wait,
                 )
                 await asyncio.sleep(wait)
             else:
-                msg = f"HTTP {last_status} after {MAX_RETRIES} retries: {last_body}"
+                msg = f"[{model}] HTTP {last_status} after {MAX_RETRIES} retries: {last_body}"
                 logger.warning("Gemini batch failed — %s", msg)
                 return False, msg
             data = resp.json()
@@ -140,7 +153,7 @@ async def _classify_batch_with_gemini(batch: list, api_key: str):
             text = data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError, TypeError) as e:
             preview = json.dumps(data)[:400]
-            msg = f"unexpected response shape ({e}): {preview}"
+            msg = f"[{model}] unexpected response shape ({e}): {preview}"
             logger.warning("Gemini batch failed — %s", msg)
             return False, msg
 
@@ -148,7 +161,7 @@ async def _classify_batch_with_gemini(batch: list, api_key: str):
             results = json.loads(text)
         except json.JSONDecodeError as e:
             preview = text[:300].replace("\n", " ")
-            msg = f"response not valid JSON ({e}): {preview}"
+            msg = f"[{model}] response not valid JSON ({e}): {preview}"
             logger.warning("Gemini batch failed — %s", msg)
             return False, msg
 
@@ -166,9 +179,30 @@ async def _classify_batch_with_gemini(batch: list, api_key: str):
         return True, None
 
     except Exception as e:
-        msg = f"{type(e).__name__}: {e}"
+        msg = f"[{model}] {type(e).__name__}: {e}"
         logger.warning("Gemini batch failed — %s", msg)
         return False, msg
+
+
+async def _classify_batch_with_fallback(batch: list, api_key: str):
+    """Try the primary model, fall back through GEMINI_FALLBACKS on
+    persistent failure. Returns (ok, error_message). The error message
+    of the FIRST failed model is preserved for diagnostics; only fully
+    exhausting the chain marks the batch as failed."""
+    models = [GEMINI_PRIMARY] + [m for m in GEMINI_FALLBACKS if m != GEMINI_PRIMARY]
+    first_error = None
+    for i, model in enumerate(models):
+        ok, err = await _classify_batch_with_gemini(batch, api_key, model)
+        if ok:
+            if i > 0:
+                logger.info("Gemini batch succeeded on fallback model %s", model)
+            return True, None
+        if first_error is None:
+            first_error = err
+        # Reset is_fashion=None for items so the next model can try fresh.
+        for p in batch:
+            p["is_fashion"] = None
+    return False, first_error
 
 
 async def classify_products_batch(products: list):
@@ -197,9 +231,14 @@ async def classify_products_batch(products: list):
     failed = 0
     errors: list = []
 
-    for start in range(0, total, BATCH_SIZE):
+    for idx, start in enumerate(range(0, total, BATCH_SIZE)):
         batch = products[start:start + BATCH_SIZE]
-        success, err = await _classify_batch_with_gemini(batch, api_key)
+        if idx > 0:
+            # Gentle inter-batch throttle so we don't burst over the
+            # per-minute quota (RPM) which Gemini reports as 503 on the
+            # free tier when the model is otherwise healthy.
+            await asyncio.sleep(INTER_BATCH_DELAY)
+        success, err = await _classify_batch_with_fallback(batch, api_key)
         if success:
             ok += len(batch)
         else:
