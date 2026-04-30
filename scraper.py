@@ -56,11 +56,16 @@ PRODUCT_HREF_RE = re.compile(
 
 
 def _build_headers() -> dict:
+    # IMPORTANT: do NOT include "br" in Accept-Encoding unless the brotli
+    # Python package is installed. httpx's automatic decompression covers
+    # gzip/deflate by default; if we advertise "br" without brotli, the
+    # server returns Brotli-encoded bytes and resp.text becomes garbage,
+    # which is exactly the silent-fail symptom we hit in production.
     return {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
         "Cache-Control": "no-cache",
     }
@@ -228,13 +233,17 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
     fashion: list = []
     seen: set = set()
     errors: list = []
-
-    if not os.getenv("GEMINI_API_KEY"):
+    has_gemini = bool(os.getenv("GEMINI_API_KEY"))
+    if not has_gemini:
+        # Degraded mode: without Gemini we cannot enforce fashion-only, but
+        # we still scrape so the user sees the feed. Loud warning so they
+        # know to set the key for the strict fashion-filtered behavior.
         errors.append(
             "GEMINI_API_KEY is not set on the server — fashion classification "
-            "is required for the feed but cannot run. Set the env var in Railway."
+            "is DISABLED. Showing all best-selling products with their raw "
+            "ranks. Set GEMINI_API_KEY in Railway env vars to enable "
+            "fashion-only filtering."
         )
-        return fashion, errors
 
     try:
         async with httpx.AsyncClient(
@@ -264,15 +273,22 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
                 if not page_products:
                     break
 
-                # Classify this page's batch with Gemini. Failures bubble up
-                # through `errors` rather than being silently swallowed.
-                ok, classifier_errors = _classify_or_fail(page_products)
-                errors.extend(classifier_errors)
-                if not ok:
-                    # Hard fail — without classification we cannot meet the
-                    # fashion-only requirement, so stop rather than corrupt
-                    # the feed with unclassified items.
-                    break
+                if has_gemini:
+                    # Classify this page's batch with Gemini. Failures bubble
+                    # up through `errors` rather than being silently swallowed.
+                    ok, classifier_errors = _classify_or_fail(page_products)
+                    errors.extend(classifier_errors)
+                    if not ok:
+                        # Hard fail — without classification we cannot meet
+                        # the fashion-only requirement, so stop rather than
+                        # corrupt the feed with unclassified items.
+                        break
+                else:
+                    # Degraded path: every product is treated as fashion so
+                    # the feed populates. Logged as a per-store error already.
+                    for p in page_products:
+                        p["is_fashion"] = True
+                        p["ai_tags"] = ""
 
                 for p in page_products:
                     if not p.get("is_fashion"):
