@@ -23,12 +23,13 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0
 BATCH_SIZE = 20
 
 
-def _classify_batch_with_gemini(batch: list, api_key: str) -> bool:
-    """Classify a single batch in place. Returns True on success, False on failure.
+def _classify_batch_with_gemini(batch: list, api_key: str):
+    """Classify a single batch in place.
 
-    On success each product gets:
-      - is_fashion: bool (clothing/shoes/bags only)
-      - ai_tags:    str (comma-separated English keywords)
+    Returns (ok, error_message). On success error_message is None. On failure
+    error_message is a short string describing the underlying cause (HTTP
+    status + Gemini error body, JSON parse failure, etc.) so the scraper can
+    surface it to the API consumer instead of silently dropping products.
     """
     items = [
         {
@@ -97,11 +98,30 @@ def _classify_batch_with_gemini(batch: list, api_key: str) -> bool:
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                # Capture Gemini's own error body so we know whether it's
+                # auth, quota, model-not-found, or schema rejection.
+                body = (resp.text or "")[:400].replace("\n", " ")
+                msg = f"HTTP {resp.status_code}: {body}"
+                logger.warning("Gemini batch failed — %s", msg)
+                return False, msg
             data = resp.json()
 
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        results = json.loads(text)
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError) as e:
+            preview = json.dumps(data)[:400]
+            msg = f"unexpected response shape ({e}): {preview}"
+            logger.warning("Gemini batch failed — %s", msg)
+            return False, msg
+
+        try:
+            results = json.loads(text)
+        except json.JSONDecodeError as e:
+            preview = text[:300].replace("\n", " ")
+            msg = f"response not valid JSON ({e}): {preview}"
+            logger.warning("Gemini batch failed — %s", msg)
+            return False, msg
 
         for r in results:
             i = r.get("index")
@@ -114,22 +134,24 @@ def _classify_batch_with_gemini(batch: list, api_key: str) -> bool:
             if tags:
                 batch[i]["ai_tags"] = tags
 
-        return True
+        return True, None
 
     except Exception as e:
-        logger.warning("Gemini batch failed (%s) — leaving products as-is", e)
-        return False
+        msg = f"{type(e).__name__}: {e}"
+        logger.warning("Gemini batch failed — %s", msg)
+        return False, msg
 
 
-def classify_products_batch(products: list) -> list:
+def classify_products_batch(products: list):
     """Enrich products in place with ai_tags and (optionally) is_fashion.
 
-    BEST-EFFORT: missing API key, batch failure, or missing items in the
-    response leave the input fields untouched. Callers should pre-set
-    is_fashion=True so a Gemini outage doesn't empty the feed.
+    Returns a list of error strings — empty when every batch succeeded.
+    Errors include the Gemini HTTP body / exception message so the caller
+    can surface the real cause (auth, quota, model-not-found) rather than
+    a generic "did not classify" message.
     """
     if not products:
-        return products
+        return []
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -137,22 +159,26 @@ def classify_products_batch(products: list) -> list:
             "GEMINI_API_KEY not set — skipping classification for %d products",
             len(products),
         )
-        return products
+        return ["GEMINI_API_KEY not set on server"]
 
     total = len(products)
     ok = 0
     failed = 0
+    errors: list = []
 
     for start in range(0, total, BATCH_SIZE):
         batch = products[start:start + BATCH_SIZE]
-        if _classify_batch_with_gemini(batch, api_key):
+        success, err = _classify_batch_with_gemini(batch, api_key)
+        if success:
             ok += len(batch)
         else:
             failed += len(batch)
+            if err:
+                errors.append(err)
 
     fashion_count = sum(1 for p in products if p.get("is_fashion"))
     logger.info(
         "Classified %d products (ok=%d, failed=%d, fashion=%d)",
         total, ok, failed, fashion_count,
     )
-    return products
+    return errors

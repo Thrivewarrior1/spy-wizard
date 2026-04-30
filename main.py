@@ -419,6 +419,33 @@ async def debug_env():
         ),
     }
 
+
+@app.get("/api/debug/gemini")
+async def debug_gemini():
+    """One-shot Gemini call against a synthetic 2-item batch.
+
+    Returns the actual outcome so we can diagnose auth / model / schema
+    issues without waiting for a multi-minute full scrape. Never echoes
+    the API key.
+    """
+    from classifier import classify_products_batch
+    sample = [
+        {"shopify_id": "x1", "handle": "x1", "title": "Floral summer maxi dress",
+         "vendor": "Test", "product_type": "", "is_fashion": None, "ai_tags": ""},
+        {"shopify_id": "x2", "handle": "x2", "title": "Shipping protection",
+         "vendor": "Test", "product_type": "", "is_fashion": None, "ai_tags": ""},
+    ]
+    errors = classify_products_batch(sample)
+    return {
+        "gemini_key_set": bool(os.getenv("GEMINI_API_KEY")),
+        "errors": errors,
+        "results": [
+            {"handle": p["handle"], "is_fashion": p.get("is_fashion"),
+             "ai_tags": p.get("ai_tags", "")}
+            for p in sample
+        ],
+    }
+
 @app.get("/api/stats")
 async def get_stats(db: Session = Depends(get_db)):
     total_stores = db.query(Store).count()

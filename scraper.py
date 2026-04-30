@@ -327,27 +327,44 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
 
 
 def _classify_or_fail(batch: list):
-    """Run Gemini classification on a batch. Returns (ok, errors)."""
+    """Run Gemini classification on a batch. Returns (ok, errors).
+
+    Errors include the Gemini HTTP body / exception text propagated up from
+    classifier.py so we can see the real cause (auth, quota, model-not-
+    found, schema rejection) instead of a generic "did not classify"
+    summary that hides the root failure.
+    """
     if not batch:
         return True, []
+    # Pre-set defaults so we can detect items Gemini didn't return for.
+    for p in batch:
+        p.setdefault("is_fashion", None)
+        p.setdefault("ai_tags", "")
     try:
-        before_fashion = sum(1 for p in batch if p.get("is_fashion"))
-        # Pre-set defaults so we can detect items Gemini didn't return for.
-        for p in batch:
-            p.setdefault("is_fashion", None)
-            p.setdefault("ai_tags", "")
-        classify_products_batch(batch)
+        classifier_errors = classify_products_batch(batch)
     except Exception as e:
-        return False, [f"Gemini exception: {e}"]
+        return False, [f"Gemini exception: {type(e).__name__}: {e}"]
+
+    errors: list = []
+    if classifier_errors:
+        # Cap to first 3 unique messages so the API response stays readable.
+        seen = set()
+        for msg in classifier_errors:
+            if msg in seen:
+                continue
+            seen.add(msg)
+            errors.append(f"Gemini error: {msg}")
+            if len(errors) >= 3:
+                break
 
     missing = [p["handle"] for p in batch if p.get("is_fashion") is None]
     if missing:
-        # Surface what Gemini didn't classify rather than silently dropping.
         sample = ", ".join(missing[:5])
         more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
-        return False, [f"Gemini did not classify {len(missing)} items: {sample}{more}"]
-    _ = before_fashion
-    return True, []
+        errors.append(f"Gemini did not classify {len(missing)} items: {sample}{more}")
+        return False, errors
+
+    return True, errors
 
 
 async def debug_fetch(store_url: str) -> dict:
