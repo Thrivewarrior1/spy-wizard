@@ -26,15 +26,22 @@ logger = logging.getLogger(__name__)
 # When 2.5-flash is overloaded (frequent 503s in 2026) we fall back to the
 # lite tier, which sees less traffic and is more than adequate for the
 # yes/no fashion classification task we use it for.
-GEMINI_PRIMARY = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_FALLBACKS = ["gemini-2.5-flash-lite", "gemini-flash-latest"]
+# gemini-2.5-flash-lite is the lite tier — higher RPM quota, far less
+# 503-overload contention than gemini-2.5-flash, and more than capable of
+# the yes/no fashion classification task we use it for. Make it the
+# primary so a typical scrape completes in minutes, not 30+ minutes.
+GEMINI_PRIMARY = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_FALLBACKS = ["gemini-2.5-flash", "gemini-flash-latest"]
 
 
 def _gemini_url(model: str) -> str:
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
-BATCH_SIZE = 20
+# 50 products per Gemini call — well under the model's input-token limit
+# for short product titles, and roughly 5x fewer requests than BATCH_SIZE=20
+# so a full 12-store scrape stays under per-minute RPM quotas.
+BATCH_SIZE = 50
 # Transient-error HTTP statuses we should retry. 503 is the common
 # "model overloaded" path; 429 is quota burst; 500/502/504 are upstream
 # blips. 4xx other than 429 means a permanent fault we shouldn't retry.
