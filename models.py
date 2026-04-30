@@ -28,9 +28,13 @@ class Product(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     store_id = Column(Integer, ForeignKey("stores.id"), nullable=False)
-    shopify_id = Column(String(100))
-    title = Column(String(500), nullable=False)
-    handle = Column(String(500))
+    # Shopify product handles can be 200+ chars on stores with long German /
+    # Dutch / French SEO-friendly product names. Use Text (unlimited) for
+    # any field that holds a handle or a derived value to avoid silent
+    # transaction rollbacks on long values.
+    shopify_id = Column(Text)
+    title = Column(Text, nullable=False)
+    handle = Column(Text)
     image_url = Column(Text)
     price = Column(String(50))
     vendor = Column(String(255))

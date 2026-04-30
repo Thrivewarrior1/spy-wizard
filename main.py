@@ -13,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel
 from typing import Optional
 
-from database import get_db, engine, SessionLocal
+from database import get_db, engine, SessionLocal, widen_text_columns
 from models import Base, Store, Product, PositionHistory
 from scraper import (
     scrape_all_stores,
@@ -73,6 +73,7 @@ async def _background_scrape_all():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    widen_text_columns()
     seed_stores()
     # Schedule daily scrape at 6 AM UTC
     scheduler.add_job(daily_scrape, "cron", hour=6, minute=0, id="daily_scrape")
