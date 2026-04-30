@@ -14,6 +14,8 @@ bestseller feed.
 import os
 import json
 import logging
+import random
+import time
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,11 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 BATCH_SIZE = 20
+# Transient-error HTTP statuses we should retry. 503 is the common
+# "model overloaded" path; 429 is quota burst; 500/502/504 are upstream
+# blips. 4xx other than 429 means a permanent fault we shouldn't retry.
+RETRY_STATUSES = (429, 500, 502, 503, 504)
+MAX_RETRIES = 5
 
 
 def _classify_batch_with_gemini(batch: list, api_key: str):
@@ -95,18 +102,35 @@ def _classify_batch_with_gemini(batch: list, api_key: str):
     }
 
     try:
+        last_status = None
+        last_body = ""
         with httpx.Client(timeout=60.0) as client:
-            resp = client.post(
-                GEMINI_URL,
-                params={"key": api_key},
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            if resp.status_code != 200:
-                # Capture Gemini's own error body so we know whether it's
-                # auth, quota, model-not-found, or schema rejection.
-                body = (resp.text or "")[:400].replace("\n", " ")
-                msg = f"HTTP {resp.status_code}: {body}"
+            for attempt in range(MAX_RETRIES):
+                resp = client.post(
+                    GEMINI_URL,
+                    params={"key": api_key},
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code == 200:
+                    break
+                last_status = resp.status_code
+                last_body = (resp.text or "")[:400].replace("\n", " ")
+                if resp.status_code not in RETRY_STATUSES or attempt == MAX_RETRIES - 1:
+                    msg = f"HTTP {resp.status_code}: {last_body}"
+                    logger.warning("Gemini batch failed — %s", msg)
+                    return False, msg
+                # Exponential backoff with jitter — Gemini's 503 spikes are
+                # usually short, so 4s -> 8s -> 16s -> 32s gives ~60s total
+                # which keeps a single page's wall-clock under control.
+                wait = (2 ** (attempt + 1)) + random.uniform(0, 2)
+                logger.warning(
+                    "Gemini %s on attempt %d/%d, retrying in %.1fs",
+                    resp.status_code, attempt + 1, MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+            else:
+                msg = f"HTTP {last_status} after {MAX_RETRIES} retries: {last_body}"
                 logger.warning("Gemini batch failed — %s", msg)
                 return False, msg
             data = resp.json()
