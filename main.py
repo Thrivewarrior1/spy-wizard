@@ -32,14 +32,43 @@ PORT = int(os.getenv("PORT", "8000"))
 
 scheduler = AsyncIOScheduler()
 
+# Track an in-flight all-stores scrape so the API can report progress and
+# avoid stacking parallel scrapes. Stored in module state because each
+# scrape needs its own DB session and runs longer than any HTTP request
+# Railway will tolerate.
+_scrape_state = {"running": False, "started_at": None, "result": None}
+
+
 async def daily_scrape():
     """Run the daily scrape job."""
+    if _scrape_state["running"]:
+        logger.info("Skipping daily scrape — another scrape is already in flight")
+        return
     logger.info("Running daily scrape job...")
+    _scrape_state["running"] = True
+    _scrape_state["started_at"] = datetime.utcnow().isoformat()
     db = SessionLocal()
     try:
-        await scrape_all_stores(db)
+        _scrape_state["result"] = await scrape_all_stores(db)
     finally:
         db.close()
+        _scrape_state["running"] = False
+
+
+async def _background_scrape_all():
+    db = SessionLocal()
+    try:
+        _scrape_state["result"] = await scrape_all_stores(db)
+    except Exception as e:
+        _scrape_state["result"] = {
+            "stores": [], "total_products": 0,
+            "stores_with_products": 0, "stores_failed": 0,
+            "error": str(e),
+        }
+        logger.exception("Background scrape failed")
+    finally:
+        db.close()
+        _scrape_state["running"] = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -318,23 +347,38 @@ def _product_dict(p):
 
 # --- Scrape triggers ---
 @app.post("/api/scrape")
-async def trigger_scrape(db: Session = Depends(get_db)):
-    results = await scrape_all_stores(db)
-    total = results.get("total_products", 0)
-    ok_stores = results.get("stores_with_products", 0)
-    failed = results.get("stores_failed", 0)
+async def trigger_scrape():
+    """Kick off a full scrape in the background and return immediately.
+
+    A full scrape across 12 stores takes longer than the Railway HTTP
+    timeout, so we cannot await it inline. The frontend should poll
+    /api/scrape/status to learn when the run finishes.
+    """
+    if _scrape_state["running"]:
+        return {
+            "started": False,
+            "running": True,
+            "started_at": _scrape_state["started_at"],
+            "message": "Scrape already in progress",
+        }
+    _scrape_state["running"] = True
+    _scrape_state["started_at"] = datetime.utcnow().isoformat()
+    _scrape_state["result"] = None
+    asyncio.create_task(_background_scrape_all())
     return {
-        "success": total > 0,
-        "total_products": total,
-        "stores_with_products": ok_stores,
-        "stores_failed": failed,
-        "stores": results.get("stores", []),
-        "message": (
-            f"Scraped {total} products across {ok_stores} stores"
-            + (f" ({failed} failed)" if failed else "")
-            if total > 0
-            else "Scrape returned 0 products. Check server logs."
-        ),
+        "started": True,
+        "running": True,
+        "started_at": _scrape_state["started_at"],
+        "message": "Scrape started in background. Poll /api/scrape/status for progress.",
+    }
+
+
+@app.get("/api/scrape/status")
+async def scrape_status():
+    return {
+        "running": _scrape_state["running"],
+        "started_at": _scrape_state["started_at"],
+        "result": _scrape_state["result"],
     }
 
 @app.post("/api/reset-labels")

@@ -282,20 +282,38 @@ function fmtStoreLine(s){
   const errs=(s.errors&&s.errors.length)?'\n      ⚠ '+s.errors.join('\n      ⚠ '):'';
   return `  ${s.name}: ${s.products} fashion${errs}`;
 }
-function triggerScrape(){const b=document.getElementById('scrapeBtn');b.textContent='⏳ Scraping...';b.disabled=true;
-  fetch(API+'/scrape',{method:'POST'}).then(r=>r.json()).then(d=>{
+let scrapePollTimer=null;
+function pollScrape(b){
+  fetch(API+'/scrape/status').then(r=>r.json()).then(s=>{
+    if(s.running){
+      loadStats();loadStores();
+      scrapePollTimer=setTimeout(()=>pollScrape(b),5000);
+      return;
+    }
+    clearTimeout(scrapePollTimer);
     b.textContent='↻ Scrape All Stores';b.disabled=false;
     loadCombined();loadStores();loadStats();
+    const d=s.result||{};
     const total=d.total_products||0;
     const ok=d.stores_with_products||0;
     const failed=d.stores_failed||0;
     let msg;
     if(total===0){msg='⚠️ Scrape returned 0 fashion products.\n\n'}
     else{msg=`✓ Scraped ${total} fashion products across ${ok} stores`+(failed?` (${failed} failed)`:'')+'\n\n'}
-    if(d.stores&&d.stores.length){
-      msg+=d.stores.map(fmtStoreLine).join('\n');
-    }
+    if(d.stores&&d.stores.length){msg+=d.stores.map(fmtStoreLine).join('\n')}
     alert(msg);
+  }).catch(()=>{
+    b.textContent='↻ Scrape All Stores';b.disabled=false;
+    alert('Lost connection to scrape status endpoint');
+  });
+}
+function triggerScrape(){const b=document.getElementById('scrapeBtn');b.textContent='⏳ Scraping...';b.disabled=true;
+  fetch(API+'/scrape',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(!d.started&&!d.running){
+      b.textContent='↻ Scrape All Stores';b.disabled=false;
+      alert('Scrape did not start: '+(d.message||'unknown error'));return;
+    }
+    pollScrape(b);
   }).catch(()=>{b.textContent='↻ Scrape All Stores';b.disabled=false;alert('Scrape request failed (network error)')})}
 function scrapeOne(id){fetch(`${API}/scrape/${id}`,{method:'POST'}).then(r=>r.json()).then(d=>{
   const n=d.products_found||0;
