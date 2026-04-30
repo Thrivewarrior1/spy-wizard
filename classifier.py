@@ -18,7 +18,11 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+# gemini-2.0-flash was retired for new API keys ("no longer available to new
+# users"). gemini-2.5-flash is the current-generation drop-in replacement and
+# supports the same responseSchema / responseMimeType structured-output flags.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 BATCH_SIZE = 20
 
