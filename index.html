@@ -279,8 +279,25 @@ function loadStores(){
 }
 
 function triggerScrape(){const b=document.getElementById('scrapeBtn');b.textContent='⏳ Scraping...';b.disabled=true;
-  fetch(API+'/scrape',{method:'POST'}).then(r=>r.json()).then(()=>{b.textContent='↻ Scrape All Stores';b.disabled=false;loadCombined();loadStores();loadStats();alert('Scrape complete!')}).catch(()=>{b.textContent='↻ Scrape All Stores';b.disabled=false;alert('Scrape failed')})}
-function scrapeOne(id){fetch(`${API}/scrape/${id}`,{method:'POST'}).then(r=>r.json()).then(d=>{alert(`Scraped ${d.products_found} products`);loadStores();loadCombined();loadStats()})}
+  fetch(API+'/scrape',{method:'POST'}).then(r=>r.json()).then(d=>{
+    b.textContent='↻ Scrape All Stores';b.disabled=false;
+    loadCombined();loadStores();loadStats();
+    const total=d.total_products||0;
+    const ok=d.stores_with_products||0;
+    const failed=d.stores_failed||0;
+    if(total===0){alert('⚠️ Scrape returned 0 products. Check Railway logs.');return}
+    let msg=`✓ Scraped ${total} products across ${ok} stores`+(failed?` (${failed} failed)`:'');
+    if(d.stores&&d.stores.length){
+      const breakdown=d.stores.map(s=>`  ${s.name}: ${s.products}${s.error?' ('+s.error+')':''}`).join('\n');
+      msg+='\n\n'+breakdown;
+    }
+    alert(msg);
+  }).catch(()=>{b.textContent='↻ Scrape All Stores';b.disabled=false;alert('Scrape request failed (network error)')})}
+function scrapeOne(id){fetch(`${API}/scrape/${id}`,{method:'POST'}).then(r=>r.json()).then(d=>{
+  const n=d.products_found||0;
+  if(n===0){alert('⚠️ Scraped 0 products. Check Railway logs.')}else{alert(`✓ Scraped ${n} products`)}
+  loadStores();loadCombined();loadStats()
+}).catch(()=>alert('Scrape request failed (network error)'))}
 
 function openAdd(){editId=null;document.getElementById('modalTitle').textContent='Add Store';document.getElementById('mSubmit').textContent='Add Store';['mName','mUrl','mVisitors','mCountry'].forEach(x=>document.getElementById(x).value='');document.getElementById('mNiche').value='Fashion';document.getElementById('modal').classList.add('open')}
 function editStore(id,n,u,v,ni,co){editId=id;document.getElementById('modalTitle').textContent='Edit Store';document.getElementById('mSubmit').textContent='Save';document.getElementById('mName').value=n;document.getElementById('mUrl').value=u;document.getElementById('mVisitors').value=v;document.getElementById('mNiche').value=ni;document.getElementById('mCountry').value=co;document.getElementById('modal').classList.add('open')}

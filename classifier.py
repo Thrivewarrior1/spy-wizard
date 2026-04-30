@@ -1,12 +1,15 @@
-"""Gemini-powered strict fashion classifier.
+"""Gemini-powered fashion classifier (BEST-EFFORT enrichment, NOT a feed gate).
 
-Each product is tagged is_fashion=True ONLY if it is clothing, shoes, or bags.
-Everything else (jewelry, watches, accessories, shipping protection, gift cards,
-electronics, home decor, candles, beauty, supplements, etc.) is is_fashion=False.
+Gemini reads a product title/vendor and returns:
+  - is_fashion: bool (clothing/shoes/bags vs. obvious junk like gift cards
+                 and shipping protection)
+  - ai_tags: short English keyword list for multi-language search
 
-Gemini is the single source of truth — there is no keyword fallback. If Gemini
-is unavailable or fails for a batch, every product in that batch is marked
-is_fashion=False so it never enters the bestseller feed.
+This module is purely additive. Products arrive with is_fashion=True already
+set by the scraper. We only FLIP to False on items Gemini explicitly marks
+non-fashion. Missing API key, batch failure, missing item in the response —
+all of those leave is_fashion alone, so a Gemini outage never empties the
+bestseller feed.
 """
 import os
 import json
@@ -102,61 +105,54 @@ def _classify_batch_with_gemini(batch: list, api_key: str) -> bool:
 
         for r in results:
             i = r.get("index")
-            if isinstance(i, int) and 0 <= i < len(batch):
-                batch[i]["is_fashion"] = bool(r.get("is_fashion", False))
-                batch[i]["ai_tags"] = (r.get("tags") or "").strip().lower()
-
-        # Anything Gemini didn't return for is treated as non-fashion.
-        for p in batch:
-            p.setdefault("is_fashion", False)
-            p.setdefault("ai_tags", "")
+            if not (isinstance(i, int) and 0 <= i < len(batch)):
+                continue
+            # Only flip is_fashion when Gemini gives us a real boolean.
+            if "is_fashion" in r:
+                batch[i]["is_fashion"] = bool(r.get("is_fashion"))
+            tags = (r.get("tags") or "").strip().lower()
+            if tags:
+                batch[i]["ai_tags"] = tags
 
         return True
 
     except Exception as e:
-        logger.warning("Gemini batch failed (%s)", e)
+        logger.warning("Gemini batch failed (%s) — leaving products as-is", e)
         return False
 
 
-def _mark_all_non_fashion(batch: list):
-    for p in batch:
-        p["is_fashion"] = False
-        p["ai_tags"] = ""
-
-
 def classify_products_batch(products: list) -> list:
-    """Classify products in place in chunks of BATCH_SIZE.
+    """Enrich products in place with ai_tags and (optionally) is_fashion.
 
-    Adds 'ai_tags' (str) and 'is_fashion' (bool) to each product. Gemini is the
-    only classifier — if the API key is missing or a batch fails, those products
-    are marked is_fashion=False so they are excluded from the feed.
+    BEST-EFFORT: missing API key, batch failure, or missing items in the
+    response leave the input fields untouched. Callers should pre-set
+    is_fashion=True so a Gemini outage doesn't empty the feed.
     """
     if not products:
         return products
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        logger.warning(
-            "GEMINI_API_KEY not set — marking all %d products non-fashion", len(products)
+        logger.info(
+            "GEMINI_API_KEY not set — skipping classification for %d products",
+            len(products),
         )
-        _mark_all_non_fashion(products)
         return products
 
     total = len(products)
-    gemini_ok = 0
+    ok = 0
     failed = 0
 
     for start in range(0, total, BATCH_SIZE):
         batch = products[start:start + BATCH_SIZE]
         if _classify_batch_with_gemini(batch, api_key):
-            gemini_ok += len(batch)
+            ok += len(batch)
         else:
-            _mark_all_non_fashion(batch)
             failed += len(batch)
 
     fashion_count = sum(1 for p in products if p.get("is_fashion"))
     logger.info(
-        "Classified %d products (gemini_ok=%d, failed=%d, fashion=%d, non_fashion=%d)",
-        total, gemini_ok, failed, fashion_count, total - fashion_count,
+        "Classified %d products (ok=%d, failed=%d, fashion=%d)",
+        total, ok, failed, fashion_count,
     )
     return products
