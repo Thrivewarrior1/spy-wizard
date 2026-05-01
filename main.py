@@ -248,21 +248,47 @@ def expand_single_term(term: str) -> list:
     return list(variants)
 
 
+import re as _re
+
+
+def _is_postgres_db() -> bool:
+    """True when the live DB is Postgres so we can use regex matching
+    with word boundaries; otherwise fall back to plain ILIKE."""
+    return os.getenv("DATABASE_URL", "").startswith(("postgres://", "postgresql://"))
+
+
+def _match_clauses(column, variant: str):
+    """Return one or more SQLAlchemy clauses that match `variant`
+    against `column`. On Postgres we use case-insensitive regex with
+    a trailing word boundary (\\y) so "bag" matches "bag" / "handbag"
+    but NOT "baggy" / "bagstrap". On other dialects we degrade to
+    ILIKE — overmatch is tolerable in dev.
+    """
+    if _is_postgres_db():
+        # \y is the Postgres word boundary. \mvariant\M would force a
+        # full-word match (rejecting "handbag"); we want trailing
+        # boundary only so suffixed compounds still hit.
+        pat = _re.escape(variant) + r"\y"
+        return [column.op("~*")(pat)]
+    return [column.ilike(f"%{variant}%")]
+
+
 def _word_match_condition(word: str):
     """One OR-clause that matches `word` (any of its variants) against
     title, ai_tags, OR product_type. The product_type field carries
     Shopify's own categorisation (e.g. 'Women Handbags', 'Men Winter
     Coats') which is why a search for 'Women Bags' should hit it even
     when the user-facing title doesn't say 'women'.
+
+    Variants under 3 characters are dropped — too short to match
+    meaningfully and they cause runaway false positives.
     """
-    variants = expand_single_term(word)
+    variants = [v for v in expand_single_term(word) if len(v) >= 3]
     pieces = []
     for v in variants:
-        pat = f"%{v}%"
-        pieces.append(Product.title.ilike(pat))
-        pieces.append(Product.ai_tags.ilike(pat))
-        pieces.append(Product.product_type.ilike(pat))
-    return or_(*pieces)
+        for col in (Product.title, Product.ai_tags, Product.product_type):
+            pieces.extend(_match_clauses(col, v))
+    return or_(*pieces) if pieces else None
 
 
 def build_search_filters(search_query: str):
@@ -272,15 +298,18 @@ def build_search_filters(search_query: str):
     product_type). Loose: any variant of any word matches anywhere.
     """
     words = [w for w in search_query.lower().split() if w]
-    strict_conditions = [_word_match_condition(w) for w in words]
+    strict_conditions = []
+    for w in words:
+        cond = _word_match_condition(w)
+        if cond is not None:
+            strict_conditions.append(cond)
+
     loose_conditions = []
     for word in words:
-        variants = expand_single_term(word)
+        variants = [v for v in expand_single_term(word) if len(v) >= 3]
         for v in variants:
-            pat = f"%{v}%"
-            loose_conditions.append(Product.title.ilike(pat))
-            loose_conditions.append(Product.ai_tags.ilike(pat))
-            loose_conditions.append(Product.product_type.ilike(pat))
+            for col in (Product.title, Product.ai_tags, Product.product_type):
+                loose_conditions.extend(_match_clauses(col, v))
     return strict_conditions, loose_conditions
 
 
@@ -293,10 +322,12 @@ def build_ai_tag_filters(search_query: str):
     for w in words:
         word_or = []
         for variant in _singularize(w):
-            pat = f"%{variant}%"
-            word_or.append(Product.ai_tags.ilike(pat))
-            word_or.append(Product.product_type.ilike(pat))
-        conds.append(or_(*word_or))
+            if len(variant) < 3:
+                continue
+            for col in (Product.ai_tags, Product.product_type):
+                word_or.extend(_match_clauses(col, variant))
+        if word_or:
+            conds.append(or_(*word_or))
     return conds
 
 @app.get("/api/bestsellers/combined")
