@@ -176,6 +176,19 @@ def _walk_to_card(a_tag, max_steps=6):
 
 _VARIANT_JSON_RE = re.compile(r'^\s*[\[{].*"id"\s*:\s*\d', re.S)
 
+# Sale-badge / category-label text that some Shopify themes render as
+# the *only* text inside the image-wrapping anchor. If we accept it as
+# the title we end up with a card titled "Reduziert" or "Sale" with a
+# bogus discount-percent price. Title extraction skips these and tries
+# other sources within the card.
+_BADGE_TEXT_RE = re.compile(
+    r"^\s*(reduziert|reduced|sale|im\s*sale|on\s*sale|discount|clearance|"
+    r"neu(?:heit)?|new|nouveau|nouveauté|featured|bestseller|best[\s\-]*seller|"
+    r"top|hot|trending|out\s*of\s*stock|sold\s*out|"
+    r"-?\d+\s*%|save\s*-?\d+\s*%?|spare\s*-?\d+\s*%?)\s*$",
+    re.I,
+)
+
 
 def _clean_title(text: str) -> str:
     if not text:
@@ -184,6 +197,8 @@ def _clean_title(text: str) -> str:
     if _VARIANT_JSON_RE.match(text):
         return ""
     if text.startswith("[{") or text.startswith("{") or '"id":' in text:
+        return ""
+    if _BADGE_TEXT_RE.match(text):
         return ""
     text = re.sub(r"\s+", " ", text)
     if len(text) > 300:
@@ -215,9 +230,22 @@ def _extract_title(card, a_tag, handle: str) -> str:
 
 
 def _extract_price(card) -> str:
+    """Pull the displayed price from the card. Skips elements whose
+    class hints they hold a discount percentage or sale badge — those
+    show up as "-30%" or "Save 49%" and would otherwise be picked up
+    as a 30 or 49 price (which the frontend then renders as €0.30 /
+    €0.49).
+    """
     for el in card.find_all(class_=re.compile(r"price|money|amount", re.I)):
+        cls = " ".join(el.get("class") or [])
+        if re.search(r"badge|label|percent|saving|save|discount|sale-", cls, re.I):
+            continue
         text = el.get_text(" ", strip=True)
-        match = re.search(r"\d+(?:[.,]\d+)?", text)
+        if "%" in text:
+            continue
+        # Match a plausible currency-style number. Reject standalone
+        # one- or two-digit ints that look like discount counters.
+        match = re.search(r"\d{1,3}(?:[.,]\d{2})", text) or re.search(r"\d{2,}", text)
         if match:
             return match.group()
     return ""
