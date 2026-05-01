@@ -21,6 +21,7 @@ from scraper import (
     update_products_in_db,
     reset_all_labels,
     debug_fetch,
+    cleanup_non_product_rows,
 )
 from seed import seed_stores
 
@@ -75,6 +76,17 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     widen_text_columns()
     seed_stores()
+    # One-shot DB-wide junk sweep on every redeploy. Idempotent —
+    # purges any product whose title/product_type matches the
+    # hard-exclude regex, fixing legacy "services" rows that slipped
+    # in before the regex was tightened.
+    db = SessionLocal()
+    try:
+        cleanup_non_product_rows(db)
+    except Exception as e:
+        logger.warning(f"startup junk cleanup failed: {e}")
+    finally:
+        db.close()
     # Schedule daily scrape at 6 AM UTC
     scheduler.add_job(daily_scrape, "cron", hour=6, minute=0, id="daily_scrape")
     # Also scrape every 12 hours as backup

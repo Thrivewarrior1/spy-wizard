@@ -822,6 +822,21 @@ def update_products_in_db(
             is_fashion=False, subniche=sub, now=now,
         )
 
+    # Unconditional junk sweep — any existing product whose title NOW
+    # matches the hard-exclude regex is purged from BOTH feeds, even
+    # if the rest of the per-feed retirement is skipped because the
+    # current scrape is partial. This catches legacy "services"
+    # entries left over from before the regex was tightened.
+    junk_purged = 0
+    for shopify_id, product in existing_products.items():
+        title = product.title or ""
+        ptype = product.product_type or ""
+        if NON_PRODUCT_TITLE_RE.search(title) or (ptype and NON_PRODUCT_TYPE_RE.search(ptype)):
+            if product.is_fashion or product.subniche:
+                product.is_fashion = False
+                product.subniche = ""
+                junk_purged += 1
+
     # Per-feed retirement. We never look at the OTHER feed's IDs when
     # deciding whether to retire — a product that moved feeds is already
     # represented in its new feed's list.
@@ -853,7 +868,32 @@ def update_products_in_db(
         f"Updated {store.name}: {len(fashion_products)} fashion + "
         f"{len(general_products)} general"
         + (f" (retired f={fashion_retired} g={general_retired})" if fashion_retired or general_retired else "")
+        + (f" (purged {junk_purged} junk)" if junk_purged else "")
     )
+
+
+def cleanup_non_product_rows(db: Session) -> int:
+    """One-shot DB-wide sweep: any product whose title or product_type
+    matches the hard-exclude regex gets is_fashion=False and
+    subniche="". Idempotent — safe to call on every startup. Catches
+    legacy junk that existed before the regex was tightened so it
+    can't leak into either tab on the next read.
+    """
+    rows = db.query(Product).filter(
+        (Product.is_fashion == True) | (Product.subniche != "")
+    ).all()
+    purged = 0
+    for product in rows:
+        title = product.title or ""
+        ptype = product.product_type or ""
+        if NON_PRODUCT_TITLE_RE.search(title) or (ptype and NON_PRODUCT_TYPE_RE.search(ptype)):
+            product.is_fashion = False
+            product.subniche = ""
+            purged += 1
+    if purged:
+        db.commit()
+        logger.info(f"cleanup_non_product_rows: purged {purged} legacy junk rows")
+    return purged
 
 
 def cleanup_old_history(db: Session, retention_days: int = HISTORY_RETENTION_DAYS) -> int:
