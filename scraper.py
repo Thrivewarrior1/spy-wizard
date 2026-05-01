@@ -41,10 +41,19 @@ HISTORY_RETENTION_DAYS = 30
 # Aggressive page cap so a store with lots of non-fashion mixed near the
 # top of its best-seller list can still surface 100 fashion products.
 # Loop also exits early when a fetched page yields zero new product links
-# (catalog exhausted) so we never burn 50 requests on stores like Lumenrosa
-# that only have 11 best-sellers total.
+# (catalog exhausted).
 MAX_PAGES = 50
 TARGET_FASHION = 100
+
+# Per-store override for the collection path used to find best-sellers.
+# Some Shopify shops have a misconfigured /collections/all (e.g. Lumenrosa
+# returns only ~11 products there even though they have 2000+ in damen +
+# herren). Keyed by host (lowercase, no scheme/trailing-slash); each value
+# is the collection slug to use in /collections/<slug>?sort_by=best-selling.
+COLLECTION_OVERRIDES = {
+    "www.lumenrosa.de": "damen",
+    "lumenrosa.de": "damen",
+}
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -235,6 +244,13 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
         Empty list if everything was clean.
     """
     base_url = store_url.rstrip("/")
+    # Pick the collection slug to scrape. Defaults to the universal
+    # /collections/all, but stores with a broken /collections/all (e.g.
+    # Lumenrosa returns only 11 even though the catalog has 2000+) have
+    # a per-host override so we land on a collection that actually
+    # holds their full assortment ranked by best-selling.
+    host = re.sub(r"^https?://", "", base_url, flags=re.I).split("/", 1)[0].lower()
+    collection_slug = COLLECTION_OVERRIDES.get(host, "all")
     fashion: list = []
     seen: set = set()
     errors: list = []
@@ -256,7 +272,7 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
         ) as client:
             page = 1
             while len(fashion) < target_fashion and page <= MAX_PAGES:
-                url = f"{base_url}/collections/all?sort_by=best-selling&page={page}"
+                url = f"{base_url}/collections/{collection_slug}?sort_by=best-selling&page={page}"
                 try:
                     resp = await _fetch_with_retry(client, url)
                 except httpx.HTTPError as e:
@@ -373,7 +389,9 @@ async def debug_fetch(store_url: str) -> dict:
     'no products parsed' but local testing succeeds — usually means the
     upstream is serving a different page (Cloudflare challenge, etc.)."""
     base_url = store_url.rstrip("/")
-    url = f"{base_url}/collections/all?sort_by=best-selling&page=1"
+    host = re.sub(r"^https?://", "", base_url, flags=re.I).split("/", 1)[0].lower()
+    collection_slug = COLLECTION_OVERRIDES.get(host, "all")
+    url = f"{base_url}/collections/{collection_slug}?sort_by=best-selling&page=1"
     try:
         async with httpx.AsyncClient(
             timeout=30.0, follow_redirects=True, headers=_build_headers()
