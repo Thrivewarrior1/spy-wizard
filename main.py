@@ -218,44 +218,93 @@ TRANSLATIONS = {
     "striped": ["gestreift", "rayé", "rayado"],
 }
 
+def _singularize(term: str) -> set:
+    """Return {term, naive-singular(term)} so a search for 'bags' also
+    matches 'bag', 'shoes' also matches 'shoe', etc. Naive on purpose —
+    we'd rather over-match than miss obvious plurals."""
+    out = {term}
+    if len(term) > 3 and term.endswith("s") and not term.endswith("ss"):
+        out.add(term[:-1])
+    if len(term) > 4 and term.endswith("es"):
+        out.add(term[:-2])
+    return out
+
+
 def expand_single_term(term: str) -> list:
-    """Expand a single search term to include its translations."""
-    term = term.lower()
-    variants = {term}
-    if term in TRANSLATIONS:
-        variants.update(TRANSLATIONS[term])
-    for eng, trans in TRANSLATIONS.items():
-        if term in trans:
-            variants.add(eng)
-            variants.update(trans)
+    """Expand a single search term to include its translations and a
+    naive singular form. 'bags' -> {bags, bag, tasche, sac, ...},
+    'women' -> {women, woman, damen, femme, ...}.
+    """
+    term = term.lower().strip()
+    variants = set()
+    for base in _singularize(term):
+        variants.add(base)
+        if base in TRANSLATIONS:
+            variants.update(TRANSLATIONS[base])
+        for eng, trans in TRANSLATIONS.items():
+            if base in trans:
+                variants.add(eng)
+                variants.update(trans)
     return list(variants)
 
+
+def _word_match_condition(word: str):
+    """One OR-clause that matches `word` (any of its variants) against
+    title, ai_tags, OR product_type. The product_type field carries
+    Shopify's own categorisation (e.g. 'Women Handbags', 'Men Winter
+    Coats') which is why a search for 'Women Bags' should hit it even
+    when the user-facing title doesn't say 'women'.
+    """
+    variants = expand_single_term(word)
+    pieces = []
+    for v in variants:
+        pat = f"%{v}%"
+        pieces.append(Product.title.ilike(pat))
+        pieces.append(Product.ai_tags.ilike(pat))
+        pieces.append(Product.product_type.ilike(pat))
+    return or_(*pieces)
+
+
 def build_search_filters(search_query: str):
-    """Smart search: returns (strict_AND_filters, loose_OR_filters)."""
-    words = search_query.lower().split()
-    strict_conditions = []
-    for word in words:
-        variants = expand_single_term(word)
-        word_or = [Product.title.ilike(f"%{v}%") for v in variants]
-        strict_conditions.append(or_(*word_or))
+    """Smart search: returns (strict_AND_filters, loose_OR_filters).
+
+    Strict: every word must match somewhere (title / ai_tags /
+    product_type). Loose: any variant of any word matches anywhere.
+    """
+    words = [w for w in search_query.lower().split() if w]
+    strict_conditions = [_word_match_condition(w) for w in words]
     loose_conditions = []
     for word in words:
         variants = expand_single_term(word)
         for v in variants:
-            loose_conditions.append(Product.title.ilike(f"%{v}%"))
+            pat = f"%{v}%"
+            loose_conditions.append(Product.title.ilike(pat))
+            loose_conditions.append(Product.ai_tags.ilike(pat))
+            loose_conditions.append(Product.product_type.ilike(pat))
     return strict_conditions, loose_conditions
 
+
 def build_ai_tag_filters(search_query: str):
-    """AND-of-words match against ai_tags (CSV of English keywords)."""
+    """AND-of-words match across ai_tags + product_type, with naive
+    singularisation so 'bags' matches both 'bag' and 'bags' tags.
+    """
     words = [w for w in search_query.lower().split() if w]
-    return [Product.ai_tags.ilike(f"%{w}%") for w in words]
+    conds = []
+    for w in words:
+        word_or = []
+        for variant in _singularize(w):
+            pat = f"%{variant}%"
+            word_or.append(Product.ai_tags.ilike(pat))
+            word_or.append(Product.product_type.ilike(pat))
+        conds.append(or_(*word_or))
+    return conds
 
 @app.get("/api/bestsellers/combined")
 async def get_combined_bestsellers(
     sort: str = Query("high-low"),
     label: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
-    limit: int = Query(30, ge=1, le=100),
+    limit: int = Query(30, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
     query = db.query(Product).join(Store).filter(Product.is_fashion == True)
@@ -300,7 +349,7 @@ async def get_store_bestsellers(
     sort: str = Query("high-low"),
     label: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
-    limit: int = Query(30, ge=1, le=100),
+    limit: int = Query(30, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
     store = db.query(Store).filter(Store.id == store_id).first()

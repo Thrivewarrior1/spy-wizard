@@ -46,11 +46,12 @@ logger = logging.getLogger(__name__)
 
 HISTORY_RETENTION_DAYS = 30
 # Aggressive page cap so a store with lots of non-fashion mixed near the
-# top of its best-seller list can still surface 100 fashion products.
+# top of its best-seller list can still surface our fashion target.
 # Loop also exits early when a fetched page yields zero new product links
-# (catalog exhausted).
-MAX_PAGES = 50
-TARGET_FASHION = 100
+# (catalog exhausted). 100 pages × ~16-50 products each is more than
+# enough to find 300 fashion products on every store we track.
+MAX_PAGES = 100
+TARGET_FASHION = 300
 
 # Per-store override for the collection path used to find best-sellers.
 # Some Shopify shops have a misconfigured /collections/all (e.g. Lumenrosa

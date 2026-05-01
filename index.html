@@ -221,7 +221,7 @@ function loadStats(){fetch(API+'/stats').then(r=>r.json()).then(d=>{document.get
 function loadCombined(){
   const sort=document.getElementById('sortAll').value;
   const search=document.getElementById('searchAll').value;
-  let url=`${API}/bestsellers/combined?sort=${sort}&limit=100&label=${cFilter}`;
+  let url=`${API}/bestsellers/combined?sort=${sort}&limit=300&label=${cFilter}`;
   if(search)url+=`&search=${encodeURIComponent(search)}`;
   document.getElementById('gridAll').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
   fetch(url).then(r=>r.json()).then(products=>{
@@ -234,7 +234,7 @@ function loadStore(){
   const id=document.getElementById('storeSelect').value;if(!id)return;
   const sort=document.getElementById('sortStore').value;
   const search=document.getElementById('searchStore').value;
-  let url=`${API}/bestsellers/store/${id}?sort=${sort}&limit=100&label=${sFilter}`;
+  let url=`${API}/bestsellers/store/${id}?sort=${sort}&limit=300&label=${sFilter}`;
   if(search)url+=`&search=${encodeURIComponent(search)}`;
   document.getElementById('gridStore').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
   fetch(url).then(r=>r.json()).then(products=>{
