@@ -31,6 +31,54 @@ logger = logging.getLogger(__name__)
 APP_PASSWORD = os.getenv("APP_PASSWORD", "mats2310")
 PORT = int(os.getenv("PORT", "8000"))
 
+
+# =====================================================================
+# Trust epoch — heroes / villains baseline guard
+# =====================================================================
+# Snapshots in PositionHistory dated BEFORE TRUST_EPOCH_UTC are not
+# trustworthy comparators because the underlying product set differed
+# (different cap, different hard-drop regex, different fashion-only
+# filter, different schema). Bump this every time we ship a change
+# that meaningfully reshapes the catalog so day-over-day deltas don't
+# get polluted by structural reshuffles.
+#
+# Override at deploy time with the TRUST_EPOCH_UTC env var (ISO 8601).
+# Default is the most recent significant change — bump it when shipping
+# a cap change, hard-drop tightening, schema migration, etc.
+_DEFAULT_TRUST_EPOCH = datetime(2026, 5, 1, 0, 0, 0)
+
+
+def _parse_trust_epoch(raw: Optional[str]) -> datetime:
+    if not raw:
+        return _DEFAULT_TRUST_EPOCH
+    raw = raw.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1]
+    try:
+        parsed = datetime.fromisoformat(raw)
+        # Strip tzinfo so comparisons against naive PositionHistory.date
+        # (also UTC, also naive) behave consistently.
+        return parsed.replace(tzinfo=None)
+    except ValueError:
+        logger.warning(
+            "TRUST_EPOCH_UTC=%r is not parseable ISO 8601; falling back to %s",
+            raw, _DEFAULT_TRUST_EPOCH.isoformat(),
+        )
+        return _DEFAULT_TRUST_EPOCH
+
+
+TRUST_EPOCH_UTC = _parse_trust_epoch(os.getenv("TRUST_EPOCH_UTC"))
+
+
+# Hard cap on plausible day-over-day rank movement. Anything larger
+# is almost certainly a structural reshuffle (catalog grew/shrank,
+# cap changed, scrape source changed) rather than organic movement,
+# so we suppress the hero/villain label and call it 'normal' instead.
+# The per-store catalog-size sanity check (30% of catalog, applied in
+# _compute_label_map) further tightens this for smaller stores.
+HERO_VILLAIN_DELTA_CAP = 30
+HERO_VILLAIN_CATALOG_FRACTION = 0.30
+
 scheduler = AsyncIOScheduler()
 
 # Track an in-flight all-stores scrape so the API can report progress and
@@ -244,10 +292,75 @@ def _singularize(term: str) -> set:
     return out
 
 
+# Reverse-lookup map: typing a colloquial keyword should expand the
+# search to also match the canonical Gemini subniche label stored on
+# Product.subniche. The user explicitly does NOT want subniche to be a
+# user-facing filter — it's purely backend search metadata. So when
+# someone types "earring" we add "jewelry" to the variant set, which
+# then matches Product.subniche='jewelry' even when the title is
+# "Stud Studded Loops" with no obvious keyword. Keys are the canonical
+# subniche labels Gemini emits in classifier.py.
+SUBNICHE_SYNONYMS = {
+    "jewelry": [
+        "jewellery", "jewel", "jewels", "earring", "earrings", "necklace",
+        "necklaces", "ring", "rings", "bracelet", "bracelets", "pendant",
+        "pendants", "watch", "watches", "anklet", "anklets", "brooch",
+        "brooches", "choker", "chokers",
+    ],
+    "accessories": [
+        "hat", "hats", "scarf", "scarfs", "scarves", "belt", "belts",
+        "sunglasses", "glasses", "glove", "gloves", "tie", "ties",
+        "wallet", "wallets", "cap", "caps", "beanie", "umbrella",
+    ],
+    "electronics": [
+        "phone", "phones", "smartphone", "tablet", "tablets", "laptop",
+        "laptops", "headphone", "headphones", "earbud", "earbuds",
+        "speaker", "speakers", "charger", "chargers", "cable", "cables",
+        "gadget", "gadgets", "tech", "device", "devices", "camera",
+        "cameras", "drone", "drones", "console", "consoles", "monitor",
+        "keyboard", "mouse", "powerbank", "smartwatch",
+    ],
+    "home": [
+        "lamp", "lamps", "candle", "candles", "furniture", "decor",
+        "decoration", "kitchenware", "kitchen", "bedding", "pillow",
+        "pillows", "blanket", "blankets", "rug", "rugs", "vase", "vases",
+        "mug", "mugs", "plate", "plates", "cup", "cups", "bowl",
+        "bowls", "curtain", "curtains", "frame", "frames", "clock",
+        "clocks", "diffuser",
+    ],
+    "beauty": [
+        "skincare", "makeup", "perfume", "perfumes", "fragrance",
+        "fragrances", "lipstick", "mascara", "foundation", "cream",
+        "creams", "lotion", "lotions", "serum", "serums", "shampoo",
+        "conditioner", "cosmetic", "cosmetics", "nail", "nails",
+    ],
+    "health": [
+        "supplement", "supplements", "vitamin", "vitamins", "wellness",
+        "fitness", "protein", "collagen", "probiotic", "probiotics",
+        "massager", "thermometer",
+    ],
+    "food": [
+        "snack", "snacks", "drink", "drinks", "candy", "candies",
+        "chocolate", "chocolates", "tea", "teas", "coffee", "coffees",
+        "biscuit", "biscuits", "cookie", "cookies",
+    ],
+    "toys-books": [
+        "toy", "toys", "book", "books", "game", "games", "puzzle",
+        "puzzles", "stationery", "pet", "pets", "plush", "plushie",
+        "doll", "dolls", "lego", "boardgame",
+    ],
+    "other": [],
+}
+
+
 def expand_single_term(term: str) -> list:
     """Expand a single search term to include its translations and a
     naive singular form. 'bags' -> {bags, bag, tasche, sac, ...},
     'women' -> {women, woman, damen, femme, ...}.
+
+    Also reverse-lookups subniche synonyms so 'earring' adds 'jewelry'
+    as a variant, letting the search hit Product.subniche when the
+    title doesn't contain the keyword directly.
     """
     term = term.lower().strip()
     variants = set()
@@ -259,6 +372,14 @@ def expand_single_term(term: str) -> list:
             if base in trans:
                 variants.add(eng)
                 variants.update(trans)
+        # Subniche reverse-lookup: typing 'earring' should add 'jewelry'
+        # so we hit Product.subniche='jewelry' even when nothing else
+        # mentions earrings. Symmetric: typing 'jewelry' itself adds
+        # all known synonyms, broadening the match into title/ai_tags.
+        for subniche_label, synonyms in SUBNICHE_SYNONYMS.items():
+            if base == subniche_label or base in synonyms:
+                variants.add(subniche_label)
+                variants.update(synonyms)
     return list(variants)
 
 
@@ -287,12 +408,26 @@ def _match_clauses(column, variant: str):
     return [column.ilike(f"%{variant}%")]
 
 
+# Columns the search hits. subniche is included here as BACKEND-ONLY
+# search metadata: a search for 'earring' must match a product whose
+# title is opaque ('Stud Studded Loops') but whose Gemini-assigned
+# subniche is 'jewelry'. The user explicitly does NOT want subniche
+# surfaced as a filter UI — see SUBNICHE_SYNONYMS above and the
+# General-tab UI in index.html.
+SEARCH_COLUMNS = (
+    Product.title, Product.ai_tags, Product.product_type, Product.subniche,
+)
+AI_TAG_SEARCH_COLUMNS = (
+    Product.ai_tags, Product.product_type, Product.subniche,
+)
+
+
 def _word_match_condition(word: str):
     """One OR-clause that matches `word` (any of its variants) against
-    title, ai_tags, OR product_type. The product_type field carries
-    Shopify's own categorisation (e.g. 'Women Handbags', 'Men Winter
-    Coats') which is why a search for 'Women Bags' should hit it even
-    when the user-facing title doesn't say 'women'.
+    title, ai_tags, product_type, OR subniche. The product_type field
+    carries Shopify's own categorisation (e.g. 'Women Handbags', 'Men
+    Winter Coats'); subniche carries Gemini's high-level category
+    label so that 'earring' can hit subniche='jewelry'.
 
     Variants under 3 characters are dropped — too short to match
     meaningfully and they cause runaway false positives.
@@ -300,7 +435,7 @@ def _word_match_condition(word: str):
     variants = [v for v in expand_single_term(word) if len(v) >= 3]
     pieces = []
     for v in variants:
-        for col in (Product.title, Product.ai_tags, Product.product_type):
+        for col in SEARCH_COLUMNS:
             pieces.extend(_match_clauses(col, v))
     return or_(*pieces) if pieces else None
 
@@ -309,7 +444,8 @@ def build_search_filters(search_query: str):
     """Smart search: returns (strict_AND_filters, loose_OR_filters).
 
     Strict: every word must match somewhere (title / ai_tags /
-    product_type). Loose: any variant of any word matches anywhere.
+    product_type / subniche). Loose: any variant of any word matches
+    anywhere.
     """
     words = [w for w in search_query.lower().split() if w]
     strict_conditions = []
@@ -322,14 +458,17 @@ def build_search_filters(search_query: str):
     for word in words:
         variants = [v for v in expand_single_term(word) if len(v) >= 3]
         for v in variants:
-            for col in (Product.title, Product.ai_tags, Product.product_type):
+            for col in SEARCH_COLUMNS:
                 loose_conditions.extend(_match_clauses(col, v))
     return strict_conditions, loose_conditions
 
 
 def build_ai_tag_filters(search_query: str):
-    """AND-of-words match across ai_tags + product_type, with naive
-    singularisation so 'bags' matches both 'bag' and 'bags' tags.
+    """AND-of-words match across ai_tags + product_type + subniche,
+    with naive singularisation so 'bags' matches both 'bag' and 'bags'
+    tags. subniche is included here for the same reason as in
+    _word_match_condition — it's the canonical Gemini category label
+    that lets opaque titles still match a topical search.
     """
     words = [w for w in search_query.lower().split() if w]
     conds = []
@@ -338,7 +477,7 @@ def build_ai_tag_filters(search_query: str):
         for variant in _singularize(w):
             if len(variant) < 3:
                 continue
-            for col in (Product.ai_tags, Product.product_type):
+            for col in AI_TAG_SEARCH_COLUMNS:
                 word_or.extend(_match_clauses(col, variant))
         if word_or:
             conds.append(or_(*word_or))
@@ -383,8 +522,9 @@ async def get_combined_bestsellers(
     else:
         products.sort(key=lambda p: p.current_position)
 
-    products = products[:limit]
     label_map = _compute_label_map(db, products)
+    products = _filter_products_by_computed_label(products, label_map, label)
+    products = products[:limit]
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
 
@@ -407,7 +547,7 @@ async def get_store_bestsellers(
         ai_query = query
         for cond in build_ai_tag_filters(s):
             ai_query = ai_query.filter(cond)
-        ai_results = ai_query.order_by(Product.current_position).limit(limit).all()
+        ai_results = ai_query.order_by(Product.current_position).all()
         if ai_results:
             products = ai_results
         else:
@@ -415,16 +555,18 @@ async def get_store_bestsellers(
             strict_query = query
             for cond in strict:
                 strict_query = strict_query.filter(cond)
-            strict_results = strict_query.order_by(Product.current_position).limit(limit).all()
+            strict_results = strict_query.order_by(Product.current_position).all()
             if strict_results:
                 products = strict_results
             elif loose:
-                products = query.filter(or_(*loose)).order_by(Product.current_position).limit(limit).all()
+                products = query.filter(or_(*loose)).order_by(Product.current_position).all()
             else:
                 products = []
     else:
-        products = query.order_by(Product.current_position).limit(limit).all()
+        products = query.order_by(Product.current_position).all()
     label_map = _compute_label_map(db, products)
+    products = _filter_products_by_computed_label(products, label_map, label)
+    products = products[:limit]
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
 # =====================================================================
@@ -434,20 +576,44 @@ async def get_store_bestsellers(
 # the deprecated Product.label / Product.previous_position columns. The
 # scraper writes a new history row every run; for any product the
 # "today" snapshot is its latest history row and the "prior" snapshot
-# is the most recent row dated before today's UTC midnight. Day-over-
-# day delta = current_position vs prior position. Brand-new products
-# (no row dated < today_start) get the explicit label "new".
+# is the most recent row dated:
+#   - on a DIFFERENT UTC calendar day from today (excludes 12-h backup
+#     scrapes and same-day manual scrapes), AND
+#   - on or after TRUST_EPOCH_UTC (snapshots from before the most
+#     recent breaking change are not trustworthy comparators).
+# Day-over-day delta = current_position vs prior position. Brand-new
+# products (no qualifying prior row) get the explicit label "new".
+# A delta exceeding HERO_VILLAIN_DELTA_CAP — or 30% of the store's
+# catalog size, whichever is smaller — is treated as a reshuffle, not
+# organic movement, and labelled "normal" instead of hero/villain.
 
 def _today_start_utc():
     """UTC midnight of today. Boundary between 'today's snapshot' and
-    'prior snapshot' for the day-over-day delta."""
+    'prior snapshot' for the day-over-day delta. Same-UTC-day priors
+    do NOT count, so the boundary excludes everything from 00:00 of
+    today onward."""
     return datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _trustworthy_prior_filters(today_start: datetime):
+    """Two filter clauses every prior-position lookup must apply:
+    (1) prior must come from a DIFFERENT UTC calendar day (i.e. before
+        today's UTC midnight), AND
+    (2) prior must be from on or after TRUST_EPOCH_UTC, since older
+        snapshots reflect a different catalog and aren't comparable.
+    """
+    return (
+        PositionHistory.date < today_start,
+        PositionHistory.date >= TRUST_EPOCH_UTC,
+    )
 
 
 def _prior_position_subquery(db: Session, today_start: Optional[datetime] = None):
     """Subquery returning (product_id, prior_position): the most recent
-    PositionHistory.position dated < today_start, per product. Uses
-    ROW_NUMBER() so it works on both Postgres and SQLite (3.25+).
+    PositionHistory.position dated < today_start AND >= TRUST_EPOCH_UTC,
+    per product. Uses ROW_NUMBER() so it works on both Postgres and
+    SQLite (3.25+). The trust-epoch filter ensures pre-epoch snapshots
+    are invisible to every caller.
     """
     today_start = today_start or _today_start_utc()
     inner = (
@@ -459,7 +625,7 @@ def _prior_position_subquery(db: Session, today_start: Optional[datetime] = None
                 order_by=PositionHistory.date.desc(),
             ).label("rn"),
         )
-        .filter(PositionHistory.date < today_start)
+        .filter(*_trustworthy_prior_filters(today_start))
         .subquery()
     )
     return (
@@ -472,14 +638,51 @@ def _prior_position_subquery(db: Session, today_start: Optional[datetime] = None
     )
 
 
+def _delta_threshold(catalog_size: int) -> int:
+    """Maximum plausible day-over-day rank delta for a store with
+    `catalog_size` tracked products. The smaller of:
+      - HERO_VILLAIN_DELTA_CAP (absolute, currently 30), and
+      - 30% of catalog_size (rounded down, floored at 1).
+    A delta exceeding this is almost certainly a structural reshuffle
+    (catalog change, cap change, scrape-source change) and gets
+    suppressed in _compute_label_map.
+    """
+    if catalog_size <= 0:
+        return HERO_VILLAIN_DELTA_CAP
+    pct = max(1, int(catalog_size * HERO_VILLAIN_CATALOG_FRACTION))
+    return min(HERO_VILLAIN_DELTA_CAP, pct)
+
+
+def _store_catalog_sizes(db: Session, store_ids: set, *, is_fashion: bool) -> dict:
+    """Return {store_id: count of tracked products in that store on the
+    relevant feed}. Used by _compute_label_map to size the per-store
+    delta-magnitude threshold. Empty input returns {}.
+    """
+    if not store_ids:
+        return {}
+    q = db.query(Product.store_id, func.count(Product.id)).filter(
+        Product.store_id.in_(store_ids)
+    )
+    if is_fashion:
+        q = q.filter(Product.is_fashion == True)
+    else:
+        q = q.filter(Product.is_fashion == False, Product.subniche != "")
+    rows = q.group_by(Product.store_id).all()
+    return {sid: cnt for sid, cnt in rows}
+
+
 def _compute_label_map(db: Session, products: list) -> dict:
     """For each product, compute (label, position_change, prior_position).
 
     label is one of:
-      - "hero"    : moved up vs prior snapshot (lower rank number = better)
-      - "villain" : moved down vs prior snapshot
-      - "normal"  : same rank as prior snapshot
-      - "new"     : no prior snapshot dated < today (debut, no compare)
+      - "hero"    : moved up vs trustworthy prior snapshot (lower rank
+                    number = better) AND delta within the per-store
+                    threshold
+      - "villain" : moved down vs trustworthy prior, delta in threshold
+      - "normal"  : same rank as prior, OR delta exceeded the threshold
+                    (treated as a reshuffle, not organic movement)
+      - "new"     : no trustworthy prior snapshot exists yet for this
+                    product (debut, or only same-day / pre-epoch priors)
 
     Returns {product_id: (label, position_change, prior_position)}.
     Matched by Product.id internally; tracked at the shopify_id level
@@ -492,7 +695,7 @@ def _compute_label_map(db: Session, products: list) -> dict:
     rows = (
         db.query(PositionHistory.product_id, PositionHistory.position)
         .filter(PositionHistory.product_id.in_(pids))
-        .filter(PositionHistory.date < today_start)
+        .filter(*_trustworthy_prior_filters(today_start))
         .order_by(
             PositionHistory.product_id,
             PositionHistory.date.desc(),
@@ -506,25 +709,47 @@ def _compute_label_map(db: Session, products: list) -> dict:
         if pid not in prior_map:
             prior_map[pid] = pos
 
+    fashion_store_ids = {p.store_id for p in products if p.is_fashion}
+    general_store_ids = {p.store_id for p in products if not p.is_fashion}
+    fashion_sizes = _store_catalog_sizes(db, fashion_store_ids, is_fashion=True)
+    general_sizes = _store_catalog_sizes(db, general_store_ids, is_fashion=False)
+
     out: dict = {}
     for p in products:
         prior = prior_map.get(p.id, 0)
         cur = p.current_position or 0
         if not prior:
             out[p.id] = ("new", 0, 0)
-        elif cur < prior:
-            out[p.id] = ("hero", prior - cur, prior)
-        elif cur > prior:
-            out[p.id] = ("villain", prior - cur, prior)  # negative magnitude
-        else:
+            continue
+        if cur == prior:
             out[p.id] = ("normal", 0, prior)
+            continue
+        sizes = fashion_sizes if p.is_fashion else general_sizes
+        threshold = _delta_threshold(sizes.get(p.store_id, 0))
+        delta = abs(cur - prior)
+        if delta > threshold:
+            # Implausible jump — almost certainly a structural reshuffle
+            # rather than organic movement. Demote to 'normal' so the
+            # impossible 55→5 cases stop showing up as heroes.
+            out[p.id] = ("normal", 0, prior)
+            continue
+        if cur < prior:
+            out[p.id] = ("hero", prior - cur, prior)
+        else:
+            out[p.id] = ("villain", prior - cur, prior)  # negative magnitude
     return out
 
 
 def _apply_label_filter(query, db: Session, label: str):
     """Restrict `query` to products whose dynamic label matches `label`.
-    Pushes the filter into SQL via a JOIN on the prior-position
-    subquery so we don't have to fetch and scan in Python.
+    Pushes the trust-epoch + same-day-prior + absolute-delta-cap filters
+    into SQL via a JOIN on the prior-position subquery so we don't have
+    to fetch and scan in Python.
+
+    NOTE: the per-store 30%-of-catalog tightening lives in
+    _compute_label_map only; SQL applies the absolute 30-rank cap. The
+    endpoints additionally post-filter by computed label so the per-
+    store fraction is honoured for display correctness.
     """
     if not label or label == "all":
         return query
@@ -535,12 +760,35 @@ def _apply_label_filter(query, db: Session, label: str):
         )
     query = query.join(sub, sub.c.product_id == Product.id)
     if label == "hero":
-        return query.filter(Product.current_position < sub.c.prior_position)
+        return query.filter(
+            Product.current_position < sub.c.prior_position,
+            sub.c.prior_position - Product.current_position <= HERO_VILLAIN_DELTA_CAP,
+        )
     if label == "villain":
-        return query.filter(Product.current_position > sub.c.prior_position)
+        return query.filter(
+            Product.current_position > sub.c.prior_position,
+            Product.current_position - sub.c.prior_position <= HERO_VILLAIN_DELTA_CAP,
+        )
     if label == "normal":
+        # Display 'normal' covers both genuine no-movement AND demoted
+        # large-delta items. Match unchanged-position rows here; the
+        # endpoints' computed-label post-filter folds the demoted rows
+        # in for an exact match.
         return query.filter(Product.current_position == sub.c.prior_position)
     return query
+
+
+def _filter_products_by_computed_label(
+    products: list, label_map: dict, label: Optional[str]
+) -> list:
+    """Drop products whose computed label disagrees with the requested
+    label filter. This is the second pass — _apply_label_filter has
+    already done the SQL-level coarse filter; this catches the per-
+    store 30%-of-catalog tightening that SQL doesn't express.
+    """
+    if not label or label == "all":
+        return products
+    return [p for p in products if label_map.get(p.id, ("new", 0, 0))[0] == label]
 
 
 def _product_dict(p, label_info=None):
@@ -561,14 +809,6 @@ def _product_dict(p, label_info=None):
     }
 
 
-# Allowed subniche labels for the General feed filter pills. Mirrors the
-# enum in classifier.py so the UI surfaces the same vocabulary.
-GENERAL_SUBNICHES = (
-    "jewelry", "accessories", "electronics", "home", "beauty",
-    "health", "food", "toys-books", "services", "other",
-)
-
-
 def _general_base_query(db: Session, store_id: Optional[int] = None):
     q = db.query(Product).join(Store).filter(
         Product.is_fashion == False,
@@ -583,7 +823,6 @@ def _general_base_query(db: Session, store_id: Optional[int] = None):
 async def get_combined_general(
     sort: str = Query("high-low"),
     label: Optional[str] = Query(None),
-    subniche: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     limit: int = Query(30, ge=1, le=500),
     db: Session = Depends(get_db),
@@ -591,11 +830,11 @@ async def get_combined_general(
     """Cross-store General feed. Same shape as /api/bestsellers/combined
     but filtered to is_fashion=False with a non-empty subniche so we
     only surface products Gemini actually labelled for this tab.
+    `subniche` is BACKEND-only metadata used by the search box; it is
+    never exposed as a user-facing filter parameter (see SUBNICHE_SYNONYMS).
     """
     query = _general_base_query(db)
     query = _apply_label_filter(query, db, label)
-    if subniche and subniche != "all":
-        query = query.filter(Product.subniche == subniche)
 
     if search and search.strip():
         s = search.strip()
@@ -625,8 +864,9 @@ async def get_combined_general(
     else:
         products.sort(key=lambda p: p.current_position)
 
-    products = products[:limit]
     label_map = _compute_label_map(db, products)
+    products = _filter_products_by_computed_label(products, label_map, label)
+    products = products[:limit]
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
 
@@ -635,7 +875,6 @@ async def get_store_general(
     store_id: int,
     sort: str = Query("high-low"),
     label: Optional[str] = Query(None),
-    subniche: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     limit: int = Query(30, ge=1, le=500),
     db: Session = Depends(get_db),
@@ -645,14 +884,12 @@ async def get_store_general(
         raise HTTPException(status_code=404, detail="Store not found")
     query = _general_base_query(db, store_id=store_id)
     query = _apply_label_filter(query, db, label)
-    if subniche and subniche != "all":
-        query = query.filter(Product.subniche == subniche)
     if search and search.strip():
         s = search.strip()
         ai_query = query
         for cond in build_ai_tag_filters(s):
             ai_query = ai_query.filter(cond)
-        ai_results = ai_query.order_by(Product.current_position).limit(limit).all()
+        ai_results = ai_query.order_by(Product.current_position).all()
         if ai_results:
             products = ai_results
         else:
@@ -660,31 +897,20 @@ async def get_store_general(
             strict_query = query
             for cond in strict:
                 strict_query = strict_query.filter(cond)
-            strict_results = strict_query.order_by(Product.current_position).limit(limit).all()
+            strict_results = strict_query.order_by(Product.current_position).all()
             if strict_results:
                 products = strict_results
             elif loose:
-                products = query.filter(or_(*loose)).order_by(Product.current_position).limit(limit).all()
+                products = query.filter(or_(*loose)).order_by(Product.current_position).all()
             else:
                 products = []
     else:
-        products = query.order_by(Product.current_position).limit(limit).all()
+        products = query.order_by(Product.current_position).all()
     label_map = _compute_label_map(db, products)
+    products = _filter_products_by_computed_label(products, label_map, label)
+    products = products[:limit]
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
-
-@app.get("/api/general/subniches")
-async def get_general_subniches(db: Session = Depends(get_db)):
-    """Return the set of subniches that actually have at least one
-    product in the DB right now, with counts. Powers the filter pills.
-    """
-    rows = (
-        db.query(Product.subniche, func.count(Product.id))
-        .filter(Product.is_fashion == False, Product.subniche != "")
-        .group_by(Product.subniche)
-        .all()
-    )
-    return [{"subniche": s, "count": c} for s, c in rows if s in GENERAL_SUBNICHES]
 
 # --- Scrape triggers ---
 @app.post("/api/scrape")
@@ -796,7 +1022,10 @@ async def get_stats(db: Session = Depends(get_db)):
     """Heroes/villains counted dynamically from the prior-position
     subquery — no reliance on the deprecated Product.label column.
     Both totals scope to the Fashion feed (is_fashion=True). Products
-    with no prior snapshot before today contribute to neither.
+    with no TRUSTWORTHY prior snapshot (i.e. dated before today UTC and
+    on/after TRUST_EPOCH_UTC) contribute to neither, and products
+    whose delta exceeds HERO_VILLAIN_DELTA_CAP are filtered out as
+    suspect (almost certainly a structural reshuffle, not movement).
     """
     total_stores = db.query(Store).count()
     total_products = db.query(Product).filter(Product.is_fashion == True).count()
@@ -807,6 +1036,7 @@ async def get_stats(db: Session = Depends(get_db)):
         .filter(
             Product.is_fashion == True,
             Product.current_position < sub.c.prior_position,
+            sub.c.prior_position - Product.current_position <= HERO_VILLAIN_DELTA_CAP,
         )
         .count()
     )
@@ -816,6 +1046,7 @@ async def get_stats(db: Session = Depends(get_db)):
         .filter(
             Product.is_fashion == True,
             Product.current_position > sub.c.prior_position,
+            Product.current_position - sub.c.prior_position <= HERO_VILLAIN_DELTA_CAP,
         )
         .count()
     )

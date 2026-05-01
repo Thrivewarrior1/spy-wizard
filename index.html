@@ -187,9 +187,6 @@ select:focus,.search-box:focus{border-color:var(--accent)}
         <div class="pill villain" onclick="setGFilter('villain',this)" data-f="villain">📉 Villains</div>
         <div class="pill normal" onclick="setGFilter('normal',this)" data-f="normal">— Normal</div>
       </div>
-      <div class="pills" id="subnicheAllG">
-        <div class="pill active" onclick="setSubniche('all',this)" data-s="all">All Niches</div>
-      </div>
     </div>
     <div class="grid" id="gridAllG"><div class="loading"><div class="spinner"></div>Loading general bestsellers...</div></div>
 
@@ -245,7 +242,7 @@ const API=location.origin+'/api';
 let cFilter='all',sFilter='all',editId=null,searchTimer=null;
 // General-tab state mirrors the Fashion variables above so each tab
 // has its own filters/search without cross-talk.
-let gFilter='all',sgFilter='all',subnicheFilter='all';
+let gFilter='all',sgFilter='all';
 
 function doLogin(){
   fetch(API+'/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})})
@@ -263,13 +260,12 @@ function switchTab(t){
   document.getElementById('generalTab').style.display=t==='general'?'block':'none';
   document.getElementById('storesTab').style.display=t==='stores'?'block':'none';
   if(t==='stores')loadStores();
-  if(t==='general'){loadCombinedGeneral();loadSubniches();loadStoresG();}
+  if(t==='general'){loadCombinedGeneral();loadStoresG();}
 }
 function setFilter(f,el){cFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadCombined()}
 function setStoreFilter(f,el){sFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadStore()}
 function setGFilter(f,el){gFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadCombinedGeneral()}
 function setSGFilter(f,el){sgFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadStoreGeneral()}
-function setSubniche(s,el){subnicheFilter=s;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadCombinedGeneral()}
 function debounceSearch(fn){clearTimeout(searchTimer);searchTimer=setTimeout(fn,400)}
 
 function loadStats(){fetch(API+'/stats').then(r=>r.json()).then(d=>{document.getElementById('statStores').textContent=d.stores;document.getElementById('statHeroes').textContent=d.heroes;document.getElementById('statVillains').textContent=d.villains})}
@@ -304,7 +300,6 @@ function loadCombinedGeneral(){
   const sort=document.getElementById('sortAllG').value;
   const search=document.getElementById('searchAllG').value;
   let url=`${API}/general/combined?sort=${sort}&limit=100&label=${gFilter}`;
-  if(subnicheFilter && subnicheFilter!=='all') url+=`&subniche=${encodeURIComponent(subnicheFilter)}`;
   if(search) url+=`&search=${encodeURIComponent(search)}`;
   document.getElementById('gridAllG').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
   fetch(url).then(r=>r.json()).then(products=>{
@@ -323,19 +318,6 @@ function loadStoreGeneral(){
   fetch(url).then(r=>r.json()).then(products=>{
     if(!products.length){document.getElementById('gridStoreG').innerHTML='<div class="empty">No general products for this store.</div>';return}
     document.getElementById('gridStoreG').innerHTML=products.map((p,i)=>card(p,i+1)).join('')
-  })
-}
-
-function loadSubniches(){
-  fetch(API+'/general/subniches').then(r=>r.json()).then(rows=>{
-    const wrap=document.getElementById('subnicheAllG');
-    const pretty={jewelry:'💍 Jewelry',accessories:'🧣 Accessories',electronics:'📱 Electronics',home:'🛋 Home',beauty:'💄 Beauty',health:'💊 Health',food:'🍪 Food','toys-books':'🧸 Toys & Books',services:'📦 Services',other:'• Other'};
-    let html='<div class="pill '+(subnicheFilter==='all'?'active':'')+'" onclick="setSubniche(\'all\',this)" data-s="all">All Niches</div>';
-    rows.forEach(r=>{
-      const label=pretty[r.subniche]||r.subniche;
-      html+=`<div class="pill ${subnicheFilter===r.subniche?'active':''}" onclick="setSubniche('${r.subniche}',this)" data-s="${r.subniche}">${label} (${r.count})</div>`;
-    });
-    wrap.innerHTML=html;
   })
 }
 
