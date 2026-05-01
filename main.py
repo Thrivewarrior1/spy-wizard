@@ -115,11 +115,15 @@ class StoreUpdate(BaseModel):
 @app.get("/api/stores")
 async def get_stores(db: Session = Depends(get_db)):
     stores = db.query(Store).order_by(Store.name).all()
+    # Count only fashion-flagged products. Non-fashion rows (shipping
+    # protection, gift cards, retired stale entries) stay in the table
+    # for history but must not inflate the per-store count the user sees.
     return [{
         "id": s.id, "name": s.name, "url": s.url,
         "monthly_visitors": s.monthly_visitors, "niche": s.niche,
-        "country": s.country, "product_count": len(s.products),
-        "last_scraped": max((p.last_scraped for p in s.products), default=None),
+        "country": s.country,
+        "product_count": sum(1 for p in s.products if p.is_fashion),
+        "last_scraped": max((p.last_scraped for p in s.products if p.is_fashion), default=None),
     } for s in stores]
 
 @app.post("/api/stores")
@@ -449,9 +453,13 @@ async def debug_gemini():
 @app.get("/api/stats")
 async def get_stats(db: Session = Depends(get_db)):
     total_stores = db.query(Store).count()
-    total_products = db.query(Product).count()
-    heroes = db.query(Product).filter(Product.label == "hero").count()
-    villains = db.query(Product).filter(Product.label == "villain").count()
+    total_products = db.query(Product).filter(Product.is_fashion == True).count()
+    heroes = db.query(Product).filter(
+        Product.label == "hero", Product.is_fashion == True
+    ).count()
+    villains = db.query(Product).filter(
+        Product.label == "villain", Product.is_fashion == True
+    ).count()
     return {"stores": total_stores, "products": total_products, "heroes": heroes, "villains": villains}
 
 # --- Serve Frontend ---
