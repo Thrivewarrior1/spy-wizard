@@ -1,28 +1,35 @@
 """Shopify bestseller scraper — fashion-only feed.
 
 Strategy:
-  1. Fetch /collections/all?sort_by=best-selling HTML pages page by page.
-     The Shopify JSON endpoint ignores sort_by; only rendered HTML reflects
-     true bestseller ranking.
-  2. Group product links inside <main> by handle. The DOM-order index of
-     the FIRST link to a handle is its raw bestseller rank on that page.
-  3. Classify each newly-seen product with Gemini in batches:
-       - is_fashion=True  → keep, append to the fashion feed
-       - is_fashion=False → skip (gift cards, shipping protection, jewelry,
-         home decor, supplements, etc. — never enters the feed)
-  4. Keep paginating until we have 100 confirmed fashion products or we run
-     out of pages. The 100 cap is POST-filter, so junk near the top of a
-     bestseller list does not reduce the feed below 100.
+  1. Fetch /collections/<slug>?sort_by=best-selling HTML pages page by
+     page. The Shopify JSON endpoint ignores sort_by; only the rendered
+     HTML reflects true bestseller ranking. Default slug is 'all', but
+     COLLECTION_OVERRIDES lets us point individual stores at a different
+     collection when their /collections/all is misconfigured upstream.
+  2. Extract products from the page. Primary source is the
+     `web-pixels-manager` `collection_viewed` event JSON embedded in the
+     HTML — it gives us real titles, real image URLs, and (critically)
+     each product's Shopify `type` (e.g. "Slidecart - Shipping
+     Protection", "Women Blouse Seasonal"). When that block is missing
+     we fall back to walking <main> for product anchor tags.
+  3. Pre-filter obvious non-fashion items by title/type regex (shipping
+     protection, gift cards, route insurance, etc.) so Gemini's quota
+     isn't burned on dead-certain rejects.
+  4. Classify the rest with Gemini in batches. is_fashion=False items
+     never enter the fashion feed; the 100-cap is POST-filter so junk
+     near the top of the bestseller list does not reduce the feed below
+     100 fashion products.
   5. Position assignment: rank 1 = first fashion product encountered in
      the HTML, rank 2 = second, etc. Non-fashion items are excluded
-     entirely (NOT ranked-then-hidden), so the displayed rank equals the
-     fashion-only ordering of that store.
-  6. Classifier failures are surfaced — they do NOT silently drop products.
-     The scrape returns a list of error strings the API can show.
-  7. Hero/villain labels only assigned once a product has >= 2 prior
-     PositionHistory rows, so the first two scrapes always produce 'normal'.
+     entirely (NOT ranked-then-hidden).
+  6. Classifier failures are surfaced — they do NOT silently drop
+     products. The scrape returns a list of error strings the API can
+     show.
+  7. Hero/villain labels only assigned once a product has >= 1 prior
+     PositionHistory row.
 """
 import asyncio
+import json
 import httpx
 import logging
 import os
@@ -66,6 +73,25 @@ USER_AGENT = (
 # when the link sits on a collection page, which is exactly where we scrape).
 PRODUCT_HREF_RE = re.compile(
     r"(?:^|/)products/([a-zA-Z0-9][a-zA-Z0-9\-_]*?)(?:\?|#|/|$)"
+)
+
+# Hard-coded non-fashion patterns — items where title/type leave no doubt
+# they are not clothing/shoes/bags. Caught BEFORE Gemini so the model
+# can't misclassify them and so we don't burn quota on dead-certain
+# rejects. Matching is case-insensitive against title + product_type.
+NON_FASHION_TITLE_RE = re.compile(
+    r"shipping[\s\-]*protection|package[\s\-]*protection|"
+    r"route[\s\-]*(?:insurance|protect)|delivery[\s\-]*(?:guarantee|protect)|"
+    r"gift[\s\-]*card|e[\s\-]*gift|store[\s\-]*credit|"
+    r"\b100%\s*coverage\b|coverage[\s\-]*plan|"
+    r"slidecart|order[\s\-]*protection|carbon[\s\-]*offset|"
+    r"plant[\s\-]*a[\s\-]*tree|donation\b",
+    re.I,
+)
+NON_FASHION_TYPE_RE = re.compile(
+    r"shipping|protection|insurance|gift\s*card|slidecart|donation|"
+    r"e[\s\-]*gift|service|warranty",
+    re.I,
 )
 
 
@@ -197,9 +223,132 @@ def _extract_price(card) -> str:
     return ""
 
 
-def _extract_products_from_html(soup: BeautifulSoup, base_url: str, seen: set) -> list:
-    """Parse a Shopify collection HTML page. Yields products in DOM order,
-    deduped by handle (across pages too — `seen` is shared)."""
+def _find_events_string(html_text: str) -> str | None:
+    """Locate the JSON-string-encoded `events` payload that Shopify's
+    web-pixels-manager script embeds in every collection page. Returns
+    the decoded events JSON text (still a JSON string of the events
+    array), or None when the page doesn't ship the block.
+    """
+    needle = '"events":"'
+    idx = html_text.find(needle)
+    if idx == -1:
+        return None
+    start = idx + len(needle)
+    # Walk forward, respecting backslash escapes, until the matching
+    # unescaped closing quote of the events string.
+    i = start
+    n = len(html_text)
+    while i < n:
+        c = html_text[i]
+        if c == "\\":
+            i += 2  # skip escaped char (covers \", \\, \/, \uXXXX, etc.)
+            continue
+        if c == '"':
+            try:
+                # Wrapping back in quotes lets json.loads handle the
+                # escape sequences cleanly.
+                return json.loads('"' + html_text[start:i] + '"')
+            except json.JSONDecodeError:
+                return None
+        i += 1
+    return None
+
+
+def _extract_products_from_events(html_text: str, base_url: str, seen: set) -> list:
+    """Parse the `collection_viewed` event embedded in the page to recover
+    title, image, type, vendor and price for each product on this page.
+
+    This is the preferred extraction path because Shopify's own script
+    serialises the data we need (image.src is always the real CDN URL,
+    product.type tells us when something is shipping protection, etc.).
+    Returns an empty list when the event block isn't present so the
+    caller can fall back to the anchor-walk parser.
+    """
+    events_text = _find_events_string(html_text)
+    if not events_text:
+        return []
+    try:
+        events = json.loads(events_text)
+    except json.JSONDecodeError:
+        return []
+
+    variants = []
+    for ev in events or []:
+        # Each event is [name, payload]; we want the collection_viewed one.
+        if not isinstance(ev, list) or len(ev) < 2:
+            continue
+        if ev[0] != "collection_viewed":
+            continue
+        payload = ev[1] or {}
+        coll = payload.get("collection") or {}
+        v = coll.get("productVariants") or []
+        if isinstance(v, list):
+            variants.extend(v)
+
+    if not variants:
+        return []
+
+    products = []
+    seen_pid = set()
+    for variant in variants:
+        prod = (variant or {}).get("product") or {}
+        pid = prod.get("id")
+        if not pid or pid in seen_pid:
+            continue
+        seen_pid.add(pid)
+
+        url_path = (prod.get("url") or "").split("?", 1)[0]
+        m = PRODUCT_HREF_RE.search(url_path)
+        if not m:
+            continue
+        handle = m.group(1).lower()
+        if handle in seen:
+            continue
+        seen.add(handle)
+
+        title = (prod.get("untranslatedTitle") or prod.get("title") or "").strip()
+        if not title:
+            title = handle.replace("-", " ").title()
+
+        img = (variant.get("image") or {}).get("src") or ""
+        if img.startswith("//"):
+            img = "https:" + img
+        elif img.startswith("/"):
+            img = base_url + img
+
+        price = ""
+        p = variant.get("price") or {}
+        amt = p.get("amount")
+        if isinstance(amt, (int, float)):
+            price = f"{amt:.2f}"
+
+        products.append({
+            "shopify_id": handle,
+            "title": title,
+            "handle": handle,
+            "image_url": img,
+            "price": price,
+            "vendor": (prod.get("vendor") or "").strip(),
+            "product_type": (prod.get("type") or "").strip(),
+            "product_url": f"{base_url}/products/{handle}",
+        })
+
+    return products
+
+
+def _extract_products_from_html(soup: BeautifulSoup, base_url: str, seen: set, html_text: str = "") -> list:
+    """Parse a Shopify collection HTML page. Prefers the embedded
+    web-pixels-manager events JSON for accuracy; falls back to anchor-
+    tag walking when the events block isn't present.
+
+    Both paths share the cross-page `seen` set so a product is never
+    emitted twice.
+    """
+    if html_text:
+        products = _extract_products_from_events(html_text, base_url, seen)
+        if products:
+            return products
+
     main = soup.find("main") or soup.find(id="MainContent") or soup.body or soup
     products = []
 
@@ -216,6 +365,18 @@ def _extract_products_from_html(soup: BeautifulSoup, base_url: str, seen: set) -
         card = _walk_to_card(a_tag)
         title = _extract_title(card, a_tag, handle)
         image_url = _extract_image_url(card.find("img"))
+        if not image_url:
+            # Some Shopify themes lazy-load via <picture><source srcset>
+            # or wider data-* attrs that aren't on the immediate <img>.
+            for img in card.find_all("img"):
+                image_url = _extract_image_url(img)
+                if image_url:
+                    break
+            if not image_url:
+                for src in card.find_all("source"):
+                    image_url = _extract_image_url(src)
+                    if image_url:
+                        break
         price = _extract_price(card)
 
         products.append({
@@ -285,7 +446,9 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
                     break
 
                 soup = BeautifulSoup(resp.text, "html.parser")
-                page_products = _extract_products_from_html(soup, base_url, seen)
+                page_products = _extract_products_from_html(
+                    soup, base_url, seen, html_text=resp.text
+                )
                 logger.info(
                     f"{base_url} page {page}: parsed {len(page_products)} new products "
                     f"(running fashion total {len(fashion)})"
@@ -294,20 +457,36 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
                 if not page_products:
                     break
 
-                if has_gemini:
-                    # Classify this page's batch with Gemini. Failures bubble
-                    # up through `errors` rather than being silently swallowed.
-                    ok, classifier_errors = await _classify_or_fail(page_products)
+                # Hard pre-filter: drop obvious non-fashion (shipping
+                # protection, gift cards, route insurance, etc.) BEFORE
+                # Gemini ever sees them. This catches cases where the
+                # title alone is ambiguous to a small model but the
+                # Shopify-provided product_type leaves no doubt.
+                gemini_input = []
+                for p in page_products:
+                    title = p.get("title", "")
+                    ptype = p.get("product_type", "")
+                    if (
+                        NON_FASHION_TITLE_RE.search(title)
+                        or (ptype and NON_FASHION_TYPE_RE.search(ptype))
+                    ):
+                        p["is_fashion"] = False
+                        p["ai_tags"] = ""
+                    else:
+                        gemini_input.append(p)
+
+                if has_gemini and gemini_input:
+                    ok, classifier_errors = await _classify_or_fail(gemini_input)
                     errors.extend(classifier_errors)
                     if not ok:
                         # Hard fail — without classification we cannot meet
                         # the fashion-only requirement, so stop rather than
                         # corrupt the feed with unclassified items.
                         break
-                else:
-                    # Degraded path: every product is treated as fashion so
-                    # the feed populates. Logged as a per-store error already.
-                    for p in page_products:
+                elif not has_gemini:
+                    # Degraded path: anything not caught by the blacklist
+                    # is treated as fashion so the feed populates.
+                    for p in gemini_input:
                         p["is_fashion"] = True
                         p["ai_tags"] = ""
 
