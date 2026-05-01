@@ -644,9 +644,22 @@ async def debug_fetch(store_url: str) -> dict:
 def update_products_in_db(db: Session, store: Store, scraped_products: list):
     """Persist scraped fashion products. All inputs are already is_fashion=True
     (the scraper filters before this). Hero/villain assignment requires a
-    product to have >= 2 prior PositionHistory rows."""
+    product to have >= 2 prior PositionHistory rows.
+
+    Also retires (sets is_fashion=False on) any existing product that
+    wasn't in this scrape's fashion list, so:
+      - shipping-protection / 100%-coverage rows from older scrapes that
+        beat the current blacklist now drop out of the feed,
+      - stale entries from a prior collection_slug (e.g. Lumenrosa rows
+        scraped from /collections/all before we switched the host to
+        /collections/damen) stop appearing alongside fresh data with
+        duplicate position numbers.
+    Skipped on partial scrapes (< 50% of target) to avoid wiping a
+    store's catalog when one run hiccups.
+    """
     existing_products = {p.shopify_id: p for p in store.products if p.shopify_id}
     now = datetime.utcnow()
+    scraped_ids = {p["shopify_id"] for p in scraped_products}
 
     for product_data in scraped_products:
         shopify_id = product_data["shopify_id"]
@@ -716,8 +729,20 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
         )
         db.add(history)
 
+    # Retire stale entries — only when this scrape is reasonably complete
+    # so a partial run doesn't wipe legitimate data.
+    retired = 0
+    if len(scraped_products) >= max(30, TARGET_FASHION // 2):
+        for shopify_id, product in existing_products.items():
+            if shopify_id not in scraped_ids and product.is_fashion:
+                product.is_fashion = False
+                retired += 1
+
     db.commit()
-    logger.info(f"Updated {len(scraped_products)} fashion products for {store.name}")
+    logger.info(
+        f"Updated {len(scraped_products)} fashion products for {store.name}"
+        + (f" (retired {retired} stale)" if retired else "")
+    )
 
 
 def cleanup_old_history(db: Session, retention_days: int = HISTORY_RETENTION_DAYS) -> int:
