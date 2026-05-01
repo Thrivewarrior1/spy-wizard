@@ -5,7 +5,12 @@ Multi-language because our 12 stores ship across DE/FR/ES/IT/NL.
 """
 import pytest
 
-from scraper import NON_PRODUCT_TITLE_RE, NON_PRODUCT_TYPE_RE
+from scraper import (
+    NON_PRODUCT_TITLE_RE,
+    NON_PRODUCT_TYPE_RE,
+    NON_PRODUCT_URL_RE,
+    _is_non_product,
+)
 
 
 @pytest.mark.parametrize("title", [
@@ -137,4 +142,85 @@ def test_type_exclusion(ptype, should_block):
     actual = bool(NON_PRODUCT_TYPE_RE.search(ptype))
     assert actual == should_block, (
         f"NON_PRODUCT_TYPE_RE on {ptype!r}: expected {should_block}, got {actual}"
+    )
+
+
+@pytest.mark.parametrize("url", [
+    # Real handles spotted leaking into General → "services" on prod
+    "shipping-protection",
+    "100-coverage",
+    "https://gentsofbritain.com/products/100-coverage",
+    "https://novigood.com/products/shipping-protection",
+    "https://anciennemonde.fr/products/shipping-protection",
+    "https://gentsofbritain.com/cdn/shop/files/shipping-protection.png?v=1749453624",
+    "https://bondimode.com/cdn/shop/files/ymq-cart-shipping-protection.png",
+    # Other disguise patterns
+    "/products/route-protection",
+    "/products/package-protection",
+    "/products/gift-card-50",
+    "/products/e-gift-card",
+    "/products/extended-warranty",
+    "/products/coverage-plan",
+    "/products/protection-plan",
+    "/products/versicherter-versand",
+    "/products/versandschutz",
+    "/products/geschenkkarte",
+    "/products/carte-cadeau",
+    "/products/tarjeta-regalo",
+    "/products/carta-regalo",
+    "/products/cadeaubon",
+])
+def test_non_product_urls_are_blocked(url):
+    assert NON_PRODUCT_URL_RE.search(url), (
+        f"NON_PRODUCT_URL_RE failed to match {url!r}. Disguise listings "
+        "(cute title, telltale handle/image) will leak into General again."
+    )
+
+
+@pytest.mark.parametrize("url", [
+    # Real product handles must NOT match the URL exclusion
+    "/products/cotton-t-shirt",
+    "/products/sun-protection-hat",
+    "/products/uv400-sunglasses",
+    "/products/leather-card-holder",
+    "/products/mens-handmade-panama-hat",
+    "https://store.com/cdn/shop/files/floral-summer-dress.jpg",
+    "https://store.com/cdn/shop/files/UV-protection-sunglasses-front.jpg",
+    "/products/giftbox-perfume-set",     # "giftbox" != "gift-card"
+    "/products/protection-juridique-handbook",  # legal-protection, but not shipping-protection
+])
+def test_real_product_urls_not_blocked(url):
+    assert not NON_PRODUCT_URL_RE.search(url), (
+        f"NON_PRODUCT_URL_RE incorrectly matched {url!r}. The pattern is "
+        "too broad and would drop legitimate product handles."
+    )
+
+
+def test_100_percent_coverage_disguise_is_blocked():
+    """The Gents of Britain "100% Coverage" listing has a benign-looking
+    title but its handle (/products/100-coverage) and image filename
+    (shipping-protection.png) make it obvious. _is_non_product must catch
+    it via the URL/image fields even though the title regex is borderline.
+    """
+    assert _is_non_product(
+        title="100% Coverage",
+        handle="100-coverage",
+        product_url="https://gentsofbritain.com/products/100-coverage",
+        image_url="https://gentsofbritain.com/cdn/shop/files/shipping-protection.png?v=1749453624",
+    )
+    # Even with a fully disguised generic title, the handle alone catches it
+    assert _is_non_product(
+        title="Premium Add-On",
+        handle="shipping-protection",
+        product_url="https://novigood.com/products/shipping-protection",
+        image_url="https://bondimode.com/cdn/shop/files/ymq-cart-shipping-protection.png",
+    )
+
+
+def test_is_non_product_does_not_flag_real_product():
+    assert not _is_non_product(
+        title="Men's Handmade Panama Hat",
+        handle="mens-handmade-panama-hat",
+        product_url="https://hudsonclaye.com/products/mens-handmade-panama-hat",
+        image_url="https://hudsonclaye.com/cdn/shop/files/Mens-Handmade-Panama-Hat.png",
     )

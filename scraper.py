@@ -139,11 +139,68 @@ NON_PRODUCT_TYPE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Some stores disguise checkout add-ons with cute marketing titles like
+# "100% Coverage" or even leave the title generic so the title regex
+# can't catch them — but the Shopify handle and image filename almost
+# always reveal what it really is. Match the slug/path or the image
+# basename (anywhere in the URL) so we drop these regardless of title.
+NON_PRODUCT_URL_RE = re.compile(
+    r"(?:^|[/\-_])(?:"
+    r"shipping[\-_]protection|package[\-_]protection|order[\-_]protection|"
+    r"delivery[\-_](?:protection|insurance)|route[\-_](?:protection|insurance)|"
+    r"shipping[\-_]insurance|package[\-_]insurance|"
+    r"100[\-_]?coverage|coverage[\-_]plan|protection[\-_]plan|"
+    r"extended[\-_]warranty|warranty[\-_]plan|service[\-_]plan|product[\-_]warranty|"
+    r"gift[\-_]card|e[\-_]?gift(?:[\-_]card)?|gift[\-_]voucher|store[\-_]credit|"
+    r"carbon[\-_]offset|plant[\-_]a[\-_]tree|round[\-_]?up[\-_]donation|"
+    r"slidecart|"
+    r"versicherter[\-_]versand|versandschutz|versandversicherung|paketversicherung|"
+    r"geschenkkarte|geschenkgutschein|"
+    r"erweiterte[\-_]garantie|verlaengerte[\-_]garantie|garantieverlaengerung|"
+    r"assurance[\-_](?:expedition|livraison|colis|envoi)|"
+    r"protection[\-_](?:expedition|livraison|colis)|"
+    r"carte[\-_]cadeau|cheque[\-_]cadeau|"
+    r"garantie[\-_](?:etendue|prolongee)|"
+    r"proteccion[\-_](?:de[\-_])?(?:envio|paquete)|"
+    r"seguro[\-_](?:de[\-_])?envio|"
+    r"tarjeta[\-_]regalo|cheque[\-_]regalo|"
+    r"garantia[\-_](?:extendida|ampliada)|"
+    r"protezione[\-_](?:spedizione|consegna)|"
+    r"assicurazione[\-_](?:spedizione|consegna|trasporto)|"
+    r"carta[\-_]regalo|buono[\-_]regalo|garanzia[\-_]estesa|"
+    r"verzendverzekering|bezorgverzekering|pakketverzekering|"
+    r"cadeaubon|cadeaukaart|uitgebreide[\-_]garantie"
+    r")(?=$|[/\-_.?#])",
+    re.IGNORECASE,
+)
+
 # Backward-compat aliases — older imports/tests may still reference the
 # legacy names; keep them pointing at the new patterns until call sites
 # are migrated.
 NON_FASHION_TITLE_RE = NON_PRODUCT_TITLE_RE
 NON_FASHION_TYPE_RE = NON_PRODUCT_TYPE_RE
+
+
+def _is_non_product(
+    title: str = "",
+    product_type: str = "",
+    handle: str = "",
+    product_url: str = "",
+    image_url: str = "",
+) -> bool:
+    """Return True iff any of the supplied product fields look like a
+    checkout add-on (shipping insurance, gift card, warranty, slidecart
+    upsell, etc.). Centralised so scrape-time filtering, the per-scrape
+    sweep, and the startup DB cleanup all apply identical rules.
+    """
+    if title and NON_PRODUCT_TITLE_RE.search(title):
+        return True
+    if product_type and NON_PRODUCT_TYPE_RE.search(product_type):
+        return True
+    for field in (handle, product_url, image_url):
+        if field and NON_PRODUCT_URL_RE.search(field):
+            return True
+    return False
 
 
 def _build_headers() -> dict:
@@ -555,11 +612,12 @@ async def scrape_store_bestsellers(
                 # backfill real products in their place.
                 gemini_input = []
                 for p in page_products:
-                    title = p.get("title", "")
-                    ptype = p.get("product_type", "")
-                    if (
-                        NON_PRODUCT_TITLE_RE.search(title)
-                        or (ptype and NON_PRODUCT_TYPE_RE.search(ptype))
+                    if _is_non_product(
+                        title=p.get("title", ""),
+                        product_type=p.get("product_type", ""),
+                        handle=p.get("handle", ""),
+                        product_url=p.get("product_url", ""),
+                        image_url=p.get("image_url", ""),
                     ):
                         p["_excluded"] = True
                         continue
@@ -822,20 +880,28 @@ def update_products_in_db(
             is_fashion=False, subniche=sub, now=now,
         )
 
-    # Unconditional junk sweep — any existing product whose title NOW
-    # matches the hard-exclude regex is purged from BOTH feeds, even
-    # if the rest of the per-feed retirement is skipped because the
-    # current scrape is partial. This catches legacy "services"
-    # entries left over from before the regex was tightened.
+    # Unconditional junk sweep — any existing product whose title,
+    # product_type, handle, product_url, or image_url NOW looks like
+    # a checkout add-on is purged from BOTH feeds, even if the rest
+    # of the per-feed retirement is skipped because the current
+    # scrape is partial. This catches legacy "services" entries left
+    # over from before the regex was tightened, plus disguised
+    # listings like "100% Coverage" whose title alone looks innocent
+    # but whose handle/image clearly say shipping-protection.
     junk_purged = 0
     for shopify_id, product in existing_products.items():
-        title = product.title or ""
-        ptype = product.product_type or ""
-        if NON_PRODUCT_TITLE_RE.search(title) or (ptype and NON_PRODUCT_TYPE_RE.search(ptype)):
-            if product.is_fashion or product.subniche:
-                product.is_fashion = False
-                product.subniche = ""
-                junk_purged += 1
+        if not (product.is_fashion or product.subniche):
+            continue
+        if _is_non_product(
+            title=product.title or "",
+            product_type=product.product_type or "",
+            handle=product.handle or "",
+            product_url=product.product_url or "",
+            image_url=product.image_url or "",
+        ):
+            product.is_fashion = False
+            product.subniche = ""
+            junk_purged += 1
 
     # Per-feed retirement. We never look at the OTHER feed's IDs when
     # deciding whether to retire — a product that moved feeds is already
@@ -873,20 +939,26 @@ def update_products_in_db(
 
 
 def cleanup_non_product_rows(db: Session) -> int:
-    """One-shot DB-wide sweep: any product whose title or product_type
-    matches the hard-exclude regex gets is_fashion=False and
-    subniche="". Idempotent — safe to call on every startup. Catches
-    legacy junk that existed before the regex was tightened so it
-    can't leak into either tab on the next read.
+    """One-shot DB-wide sweep: any product whose title, product_type,
+    handle, product_url, or image_url indicates a checkout add-on
+    gets is_fashion=False and subniche="". Idempotent — safe to call
+    on every startup. Catches legacy junk that existed before the
+    regex was tightened, including disguised titles like "100% Coverage"
+    whose handle (/products/100-coverage) and image (shipping-protection.png)
+    give them away.
     """
     rows = db.query(Product).filter(
         (Product.is_fashion == True) | (Product.subniche != "")
     ).all()
     purged = 0
     for product in rows:
-        title = product.title or ""
-        ptype = product.product_type or ""
-        if NON_PRODUCT_TITLE_RE.search(title) or (ptype and NON_PRODUCT_TYPE_RE.search(ptype)):
+        if _is_non_product(
+            title=product.title or "",
+            product_type=product.product_type or "",
+            handle=product.handle or "",
+            product_url=product.product_url or "",
+            image_url=product.image_url or "",
+        ):
             product.is_fashion = False
             product.subniche = ""
             purged += 1
