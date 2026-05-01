@@ -341,12 +341,10 @@ async def get_combined_bestsellers(
     db: Session = Depends(get_db),
 ):
     query = db.query(Product).join(Store).filter(Product.is_fashion == True)
-    if label and label != "all":
-        query = query.filter(Product.label == label)
+    query = _apply_label_filter(query, db, label)
 
     if search and search.strip():
         s = search.strip()
-        # Try AI tags first (AND of search words)
         ai_query = query
         for cond in build_ai_tag_filters(s):
             ai_query = ai_query.filter(cond)
@@ -354,7 +352,6 @@ async def get_combined_bestsellers(
         if ai_results:
             products = ai_results
         else:
-            # Fall back to title-based strict-then-loose
             strict, loose = build_search_filters(s)
             strict_query = query
             for cond in strict:
@@ -363,7 +360,7 @@ async def get_combined_bestsellers(
             if strict_results:
                 products = strict_results
             else:
-                products = query.filter(or_(*loose)).all()
+                products = query.filter(or_(*loose)).all() if loose else []
     else:
         products = query.all()
 
@@ -374,7 +371,10 @@ async def get_combined_bestsellers(
     else:
         products.sort(key=lambda p: p.current_position)
 
-    return [_product_dict(p) for p in products[:limit]]
+    products = products[:limit]
+    label_map = _compute_label_map(db, products)
+    return [_product_dict(p, label_map.get(p.id)) for p in products]
+
 
 @app.get("/api/bestsellers/store/{store_id}")
 async def get_store_bestsellers(
@@ -389,11 +389,9 @@ async def get_store_bestsellers(
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
     query = db.query(Product).filter(Product.store_id == store_id, Product.is_fashion == True)
-    if label and label != "all":
-        query = query.filter(Product.label == label)
+    query = _apply_label_filter(query, db, label)
     if search and search.strip():
         s = search.strip()
-        # Try AI tags first (AND of search words)
         ai_query = query
         for cond in build_ai_tag_filters(s):
             ai_query = ai_query.filter(cond)
@@ -408,23 +406,140 @@ async def get_store_bestsellers(
             strict_results = strict_query.order_by(Product.current_position).limit(limit).all()
             if strict_results:
                 products = strict_results
-            else:
+            elif loose:
                 products = query.filter(or_(*loose)).order_by(Product.current_position).limit(limit).all()
+            else:
+                products = []
     else:
         products = query.order_by(Product.current_position).limit(limit).all()
-    return [_product_dict(p) for p in products]
+    label_map = _compute_label_map(db, products)
+    return [_product_dict(p, label_map.get(p.id)) for p in products]
 
-def _product_dict(p):
-    pos_diff = 0
-    if p.previous_position > 0:
-        pos_diff = p.previous_position - p.current_position
+# =====================================================================
+# Heroes / Villains — computed at READ time from PositionHistory.
+# =====================================================================
+# Source of truth for movement labels is the PositionHistory table, not
+# the deprecated Product.label / Product.previous_position columns. The
+# scraper writes a new history row every run; for any product the
+# "today" snapshot is its latest history row and the "prior" snapshot
+# is the most recent row dated before today's UTC midnight. Day-over-
+# day delta = current_position vs prior position. Brand-new products
+# (no row dated < today_start) get the explicit label "new".
+
+def _today_start_utc():
+    """UTC midnight of today. Boundary between 'today's snapshot' and
+    'prior snapshot' for the day-over-day delta."""
+    return datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _prior_position_subquery(db: Session, today_start: Optional[datetime] = None):
+    """Subquery returning (product_id, prior_position): the most recent
+    PositionHistory.position dated < today_start, per product. Uses
+    ROW_NUMBER() so it works on both Postgres and SQLite (3.25+).
+    """
+    today_start = today_start or _today_start_utc()
+    inner = (
+        db.query(
+            PositionHistory.product_id.label("product_id"),
+            PositionHistory.position.label("position"),
+            func.row_number().over(
+                partition_by=PositionHistory.product_id,
+                order_by=PositionHistory.date.desc(),
+            ).label("rn"),
+        )
+        .filter(PositionHistory.date < today_start)
+        .subquery()
+    )
+    return (
+        db.query(
+            inner.c.product_id.label("product_id"),
+            inner.c.position.label("prior_position"),
+        )
+        .filter(inner.c.rn == 1)
+        .subquery()
+    )
+
+
+def _compute_label_map(db: Session, products: list) -> dict:
+    """For each product, compute (label, position_change, prior_position).
+
+    label is one of:
+      - "hero"    : moved up vs prior snapshot (lower rank number = better)
+      - "villain" : moved down vs prior snapshot
+      - "normal"  : same rank as prior snapshot
+      - "new"     : no prior snapshot dated < today (debut, no compare)
+
+    Returns {product_id: (label, position_change, prior_position)}.
+    Matched by Product.id internally; tracked at the shopify_id level
+    via the Product row's stable identity.
+    """
+    if not products:
+        return {}
+    pids = [p.id for p in products]
+    today_start = _today_start_utc()
+    rows = (
+        db.query(PositionHistory.product_id, PositionHistory.position)
+        .filter(PositionHistory.product_id.in_(pids))
+        .filter(PositionHistory.date < today_start)
+        .order_by(
+            PositionHistory.product_id,
+            PositionHistory.date.desc(),
+        )
+        .all()
+    )
+    prior_map: dict = {}
+    for pid, pos in rows:
+        # First row per product_id is the most recent; subsequent rows
+        # for the same product are older — ignore.
+        if pid not in prior_map:
+            prior_map[pid] = pos
+
+    out: dict = {}
+    for p in products:
+        prior = prior_map.get(p.id, 0)
+        cur = p.current_position or 0
+        if not prior:
+            out[p.id] = ("new", 0, 0)
+        elif cur < prior:
+            out[p.id] = ("hero", prior - cur, prior)
+        elif cur > prior:
+            out[p.id] = ("villain", prior - cur, prior)  # negative magnitude
+        else:
+            out[p.id] = ("normal", 0, prior)
+    return out
+
+
+def _apply_label_filter(query, db: Session, label: str):
+    """Restrict `query` to products whose dynamic label matches `label`.
+    Pushes the filter into SQL via a JOIN on the prior-position
+    subquery so we don't have to fetch and scan in Python.
+    """
+    if not label or label == "all":
+        return query
+    sub = _prior_position_subquery(db)
+    if label == "new":
+        return query.outerjoin(sub, sub.c.product_id == Product.id).filter(
+            sub.c.prior_position.is_(None)
+        )
+    query = query.join(sub, sub.c.product_id == Product.id)
+    if label == "hero":
+        return query.filter(Product.current_position < sub.c.prior_position)
+    if label == "villain":
+        return query.filter(Product.current_position > sub.c.prior_position)
+    if label == "normal":
+        return query.filter(Product.current_position == sub.c.prior_position)
+    return query
+
+
+def _product_dict(p, label_info=None):
+    label, pos_diff, prior = label_info or ("new", 0, 0)
     return {
         "id": p.id, "title": p.title, "image_url": p.image_url,
         "price": p.price, "vendor": p.vendor, "product_url": p.product_url,
         "current_position": p.current_position,
-        "previous_position": p.previous_position,
+        "previous_position": prior,
         "position_change": pos_diff,
-        "label": p.label,
+        "label": label,
         "ai_tags": p.ai_tags or "",
         "is_fashion": bool(p.is_fashion),
         "subniche": p.subniche or "",
@@ -466,8 +581,7 @@ async def get_combined_general(
     only surface products Gemini actually labelled for this tab.
     """
     query = _general_base_query(db)
-    if label and label != "all":
-        query = query.filter(Product.label == label)
+    query = _apply_label_filter(query, db, label)
     if subniche and subniche != "all":
         query = query.filter(Product.subniche == subniche)
 
@@ -499,7 +613,9 @@ async def get_combined_general(
     else:
         products.sort(key=lambda p: p.current_position)
 
-    return [_product_dict(p) for p in products[:limit]]
+    products = products[:limit]
+    label_map = _compute_label_map(db, products)
+    return [_product_dict(p, label_map.get(p.id)) for p in products]
 
 
 @app.get("/api/general/store/{store_id}")
@@ -516,8 +632,7 @@ async def get_store_general(
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
     query = _general_base_query(db, store_id=store_id)
-    if label and label != "all":
-        query = query.filter(Product.label == label)
+    query = _apply_label_filter(query, db, label)
     if subniche and subniche != "all":
         query = query.filter(Product.subniche == subniche)
     if search and search.strip():
@@ -542,7 +657,8 @@ async def get_store_general(
                 products = []
     else:
         products = query.order_by(Product.current_position).limit(limit).all()
-    return [_product_dict(p) for p in products]
+    label_map = _compute_label_map(db, products)
+    return [_product_dict(p, label_map.get(p.id)) for p in products]
 
 
 @app.get("/api/general/subniches")
@@ -665,14 +781,32 @@ async def debug_gemini():
 
 @app.get("/api/stats")
 async def get_stats(db: Session = Depends(get_db)):
+    """Heroes/villains counted dynamically from the prior-position
+    subquery — no reliance on the deprecated Product.label column.
+    Both totals scope to the Fashion feed (is_fashion=True). Products
+    with no prior snapshot before today contribute to neither.
+    """
     total_stores = db.query(Store).count()
     total_products = db.query(Product).filter(Product.is_fashion == True).count()
-    heroes = db.query(Product).filter(
-        Product.label == "hero", Product.is_fashion == True
-    ).count()
-    villains = db.query(Product).filter(
-        Product.label == "villain", Product.is_fashion == True
-    ).count()
+    sub = _prior_position_subquery(db)
+    heroes = (
+        db.query(Product)
+        .join(sub, sub.c.product_id == Product.id)
+        .filter(
+            Product.is_fashion == True,
+            Product.current_position < sub.c.prior_position,
+        )
+        .count()
+    )
+    villains = (
+        db.query(Product)
+        .join(sub, sub.c.product_id == Product.id)
+        .filter(
+            Product.is_fashion == True,
+            Product.current_position > sub.c.prior_position,
+        )
+        .count()
+    )
     return {"stores": total_stores, "products": total_products, "heroes": heroes, "villains": villains}
 
 # --- Serve Frontend ---

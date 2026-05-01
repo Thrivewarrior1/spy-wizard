@@ -80,24 +80,70 @@ PRODUCT_HREF_RE = re.compile(
     r"(?:^|/)products/([a-zA-Z0-9][a-zA-Z0-9\-_]*?)(?:\?|#|/|$)"
 )
 
-# Hard-coded non-fashion patterns — items where title/type leave no doubt
-# they are not clothing/shoes/bags. Caught BEFORE Gemini so the model
-# can't misclassify them and so we don't burn quota on dead-certain
-# rejects. Matching is case-insensitive against title + product_type.
-NON_FASHION_TITLE_RE = re.compile(
+# Hard-coded patterns for items that are NOT physical products at all —
+# checkout add-ons like shipping insurance, warranties, gift cards.
+# Matched items are DROPPED ENTIRELY: they never enter the Fashion feed
+# OR the General feed, never get classified by Gemini, never count
+# toward any cap. Multi-language because our stores ship across DE/FR/
+# ES/IT/NL markets. Patterns are deliberately narrow (require the
+# exact compound phrase, not just a single word) to avoid false
+# positives like "Garantie Card Holder" or "Tip-Top Hat".
+NON_PRODUCT_TITLE_RE = re.compile(
+    r"(?:^|\b)(?:"
+    # === English ===
+    r"(?:shipping|package|order|delivery|route)\s*"
+    r"(?:protection|insurance|insured|guarantee)"
+    r"|(?:100\s*%\s*coverage|coverage\s*plan|protection\s*plan)"
+    r"|(?:extended\s*warranty|service\s*plan|warranty\s*plan|product\s*warranty)"
+    r"|(?:gift\s*card|e[\s\-]*gift(?:\s*card)?|gift\s*voucher|store\s*credit)"
+    r"|(?:carbon\s*offset|plant\s*a\s*tree|round[\s\-]?up\s*donation)"
+    r"|slidecart"
+    # === German ===
+    r"|(?:versicherter\s*versand|versandschutz|versandversicherung|paketversicherung)"
+    r"|(?:geschenkkarte|geschenkgutschein|geschenkkarten)"
+    r"|(?:erweiterte\s*garantie|verl[äa]ngerte\s*garantie|garantieverl[äa]ngerung)"
+    # === French ===
+    r"|(?:assurance\s*(?:exp[ée]dition|livraison|colis|envoi))"
+    r"|(?:protection\s*(?:exp[ée]dition|livraison|colis))"
+    r"|(?:carte\s*cadeau|ch[èe]que\s*cadeau)"
+    r"|(?:garantie\s*(?:[ée]tendue|prolong[ée]e))"
+    # === Spanish ===
+    r"|(?:protecci[óo]n\s*(?:de\s*)?(?:env[íi]o|paquete))"
+    r"|(?:seguro\s*(?:de\s*)?env[íi]o)"
+    r"|(?:tarjeta\s*regalo|cheque\s*regalo)"
+    r"|(?:garant[íi]a\s*(?:extendida|ampliada))"
+    # === Italian ===
+    r"|(?:protezione\s*(?:spedizione|consegna))"
+    r"|(?:assicurazione\s*(?:spedizione|consegna|trasporto))"
+    r"|(?:carta\s*regalo|buono\s*regalo)"
+    r"|(?:garanzia\s*estesa)"
+    # === Dutch ===
+    r"|(?:verzendverzekering|bezorgverzekering|pakketverzekering)"
+    r"|(?:cadeaubon|cadeaukaart)"
+    r"|(?:uitgebreide\s*garantie)"
+    r")(?=\b|$)",
+    re.IGNORECASE,
+)
+NON_PRODUCT_TYPE_RE = re.compile(
+    r"\b(?:"
+    r"slidecart|"
     r"shipping[\s\-]*protection|package[\s\-]*protection|"
-    r"route[\s\-]*(?:insurance|protect)|delivery[\s\-]*(?:guarantee|protect)|"
-    r"gift[\s\-]*card|e[\s\-]*gift|store[\s\-]*credit|"
-    r"\b100%\s*coverage\b|coverage[\s\-]*plan|"
-    r"slidecart|order[\s\-]*protection|carbon[\s\-]*offset|"
-    r"plant[\s\-]*a[\s\-]*tree|donation\b",
-    re.I,
+    r"route[\s\-]*(?:protection|insurance)|"
+    r"gift[\s\-]*card|extended\s*warranty|service\s*plan|"
+    r"versandschutz|versicherter\s*versand|geschenkkarte|"
+    r"protection[\s\-]*exp[ée]dition|carte\s*cadeau|"
+    r"protecci[óo]n[\s\-]*env[íi]o|tarjeta[\s\-]*regalo|"
+    r"protezione[\s\-]*spedizione|carta[\s\-]*regalo|"
+    r"verzendverzekering|cadeaubon"
+    r")\b",
+    re.IGNORECASE,
 )
-NON_FASHION_TYPE_RE = re.compile(
-    r"shipping|protection|insurance|gift\s*card|slidecart|donation|"
-    r"e[\s\-]*gift|service|warranty",
-    re.I,
-)
+
+# Backward-compat aliases — older imports/tests may still reference the
+# legacy names; keep them pointing at the new patterns until call sites
+# are migrated.
+NON_FASHION_TITLE_RE = NON_PRODUCT_TITLE_RE
+NON_FASHION_TYPE_RE = NON_PRODUCT_TYPE_RE
 
 
 def _build_headers() -> dict:
@@ -500,23 +546,24 @@ async def scrape_store_bestsellers(
                 if not page_products:
                     break
 
-                # Pre-classify obvious services (shipping protection, gift
-                # cards, slidecart upsells) so Gemini doesn't waste a slot
-                # on them. They go straight to the General feed under the
-                # 'services' subniche.
+                # Hard exclusion pass — items matching NON_PRODUCT_*_RE
+                # are checkout add-ons (shipping insurance, warranties,
+                # gift cards, slidecart upsells, donations, etc.). Drop
+                # them ENTIRELY before they hit Gemini: they never enter
+                # the Fashion feed OR the General feed and don't count
+                # toward either cap, so the loop keeps paginating to
+                # backfill real products in their place.
                 gemini_input = []
                 for p in page_products:
                     title = p.get("title", "")
                     ptype = p.get("product_type", "")
                     if (
-                        NON_FASHION_TITLE_RE.search(title)
-                        or (ptype and NON_FASHION_TYPE_RE.search(ptype))
+                        NON_PRODUCT_TITLE_RE.search(title)
+                        or (ptype and NON_PRODUCT_TYPE_RE.search(ptype))
                     ):
-                        p["is_fashion"] = False
-                        p["subniche"] = "services"
-                        p["ai_tags"] = ""
-                    else:
-                        gemini_input.append(p)
+                        p["_excluded"] = True
+                        continue
+                    gemini_input.append(p)
 
                 if has_gemini and gemini_input:
                     ok, classifier_errors = await _classify_or_fail(gemini_input)
@@ -527,8 +574,9 @@ async def scrape_store_bestsellers(
                         # rather than corrupt the feeds.
                         break
                 elif not has_gemini:
-                    # Degraded path: route everything not blacklisted into
-                    # fashion so the main feed populates.
+                    # Degraded path: route everything that survived the
+                    # hard-exclude pass into fashion so the main feed
+                    # populates.
                     for p in gemini_input:
                         p["is_fashion"] = True
                         p["subniche"] = "fashion"
@@ -538,7 +586,13 @@ async def scrape_store_bestsellers(
                 # lists. Each list is independently positioned 1..N in
                 # the order it encounters its members on the bestseller
                 # pages, so per-feed hero/villain math stays meaningful.
+                # Anything Gemini flagged as 'exclude' (a non-product
+                # the regex missed) is dropped here too.
                 for p in page_products:
+                    if p.get("_excluded"):
+                        continue
+                    if p.get("subniche") == "exclude":
+                        continue
                     if p.get("is_fashion"):
                         if len(fashion) < target_fashion:
                             p["position"] = len(fashion) + 1
@@ -672,42 +726,21 @@ def _upsert_one(
     now: datetime,
 ):
     """Upsert one product row and write a PositionHistory snapshot.
-    Hero/villain is computed against the previous current_position only
-    when the product is staying in the SAME feed (fashion↔fashion or
-    general↔general); a feed flip resets the label to 'normal' so a
-    product hopping between tabs doesn't get a misleading direction.
+
+    Note: hero/villain `label` and `previous_position` are NO LONGER
+    written here. Both are computed at READ time from PositionHistory
+    in main.py's _compute_label_map / _prior_position_subquery, so they
+    always reflect a real day-over-day delta against the most recent
+    snapshot dated < today (UTC). Storing them at scrape time made
+    labels go stale during structural changes (e.g. the 100→300 target
+    bump generated 73 spurious 'villain' rows even though no product
+    had actually moved).
     """
     shopify_id = product_data["shopify_id"]
     new_position = product_data["position"]
 
     if shopify_id in existing_products:
         product = existing_products[shopify_id]
-        old_position = product.current_position or 0
-        was_fashion = bool(product.is_fashion)
-        feed_changed = was_fashion != is_fashion
-
-        history_count = (
-            db.query(func.count(PositionHistory.id))
-            .filter(PositionHistory.product_id == product.id)
-            .scalar()
-        ) or 0
-
-        if feed_changed:
-            # Switching feeds — old position isn't comparable anymore.
-            product.previous_position = 0
-            product.label = "normal"
-        else:
-            product.previous_position = old_position
-            if history_count >= 1 and old_position > 0:
-                if new_position < old_position:
-                    product.label = "hero"
-                elif new_position > old_position:
-                    product.label = "villain"
-                else:
-                    product.label = "normal"
-            else:
-                product.label = "normal"
-
         product.current_position = new_position
         product.title = product_data["title"]
         product.image_url = product_data["image_url"]
@@ -732,7 +765,7 @@ def _upsert_one(
             product_url=product_data["product_url"],
             current_position=new_position,
             previous_position=0,
-            label="normal",
+            label="",
             ai_tags=product_data.get("ai_tags", ""),
             is_fashion=is_fashion,
             subniche=subniche,
