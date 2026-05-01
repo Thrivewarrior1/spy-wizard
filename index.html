@@ -65,7 +65,7 @@ select:focus,.search-box:focus{border-color:var(--accent)}
 .card-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem}
 .rank{font-size:1.3rem;font-weight:800;color:var(--accent2)}
 .lbl{padding:.15rem .5rem;border-radius:20px;font-size:.6rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
-.lbl-hero{background:rgba(34,197,94,.12);color:var(--green)}.lbl-villain{background:rgba(239,68,68,.12);color:var(--red)}.lbl-normal{background:rgba(245,158,11,.12);color:var(--amber)}
+.lbl-hero{background:rgba(34,197,94,.12);color:var(--green)}.lbl-villain{background:rgba(239,68,68,.12);color:var(--red)}.lbl-normal{background:rgba(245,158,11,.12);color:var(--amber)}.lbl-sub{background:rgba(167,139,250,.15);color:var(--accent2);margin-left:.4rem;text-transform:capitalize}
 .card-title{font-size:.8rem;font-weight:500;margin-bottom:.3rem;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .card-meta{display:flex;justify-content:space-between;align-items:center;font-size:.7rem;color:var(--text3)}
 .card-price{font-weight:600;color:var(--text)}
@@ -123,13 +123,13 @@ select:focus,.search-box:focus{border-color:var(--accent)}
 
   <div class="stats-bar" id="statsBar">
     <div class="stat-card"><div class="num" id="statStores">-</div><div class="label">Stores</div></div>
-    <div class="stat-card"><div class="num" id="statProducts">-</div><div class="label">Products</div></div>
     <div class="stat-card"><div class="num" id="statHeroes" style="color:var(--green)">-</div><div class="label">🚀 Heroes</div></div>
     <div class="stat-card"><div class="num" id="statVillains" style="color:var(--red)">-</div><div class="label">📉 Villains</div></div>
   </div>
 
   <div class="tabs">
     <div class="tab active" data-tab="fashion" onclick="switchTab('fashion')">Fashion</div>
+    <div class="tab" data-tab="general" onclick="switchTab('general')">General</div>
     <div class="tab" data-tab="stores" onclick="switchTab('stores')">Stores</div>
   </div>
 
@@ -172,12 +172,54 @@ select:focus,.search-box:focus{border-color:var(--accent)}
     <div class="grid" id="gridStore"><div class="empty">Select a store above to view its bestsellers</div></div>
   </div>
 
+  <div class="content" id="generalTab" style="display:none">
+    <div class="sec-title">🛒 Top 100 — General Bestsellers <span class="badge">Cross-competitor, non-fashion only</span></div>
+    <div class="controls">
+      <input class="search-box" type="text" id="searchAllG" placeholder="🔍 Search general products (e.g. lamp, gadget, candle...)" oninput="debounceSearch(loadCombinedGeneral)">
+      <select id="sortAllG" onchange="loadCombinedGeneral()">
+        <option value="high-low">Best Sellers First</option>
+        <option value="low-high">Lowest Rank First</option>
+        <option value="volume">Volume Ranked</option>
+      </select>
+      <div class="pills" id="filterAllG">
+        <div class="pill active" onclick="setGFilter('all',this)" data-f="all">All</div>
+        <div class="pill hero" onclick="setGFilter('hero',this)" data-f="hero">🚀 Heroes</div>
+        <div class="pill villain" onclick="setGFilter('villain',this)" data-f="villain">📉 Villains</div>
+        <div class="pill normal" onclick="setGFilter('normal',this)" data-f="normal">— Normal</div>
+      </div>
+      <div class="pills" id="subnicheAllG">
+        <div class="pill active" onclick="setSubniche('all',this)" data-s="all">All Niches</div>
+      </div>
+    </div>
+    <div class="grid" id="gridAllG"><div class="loading"><div class="spinner"></div>Loading general bestsellers...</div></div>
+
+    <div class="divider"></div>
+
+    <div class="sec-title">🏪 Per-Store General Bestsellers</div>
+    <div class="controls">
+      <select id="storeSelectG" onchange="loadStoreGeneral()"><option value="">Select a store...</option></select>
+      <input class="search-box" type="text" id="searchStoreG" placeholder="🔍 Search this store..." oninput="debounceSearch(loadStoreGeneral)">
+      <select id="sortStoreG" onchange="loadStoreGeneral()">
+        <option value="high-low">Best Sellers First</option>
+        <option value="low-high">Lowest Rank First</option>
+        <option value="volume">Volume Ranked</option>
+      </select>
+      <div class="pills" id="filterStoreG">
+        <div class="pill active" onclick="setSGFilter('all',this)" data-f="all">All</div>
+        <div class="pill hero" onclick="setSGFilter('hero',this)" data-f="hero">🚀 Heroes</div>
+        <div class="pill villain" onclick="setSGFilter('villain',this)" data-f="villain">📉 Villains</div>
+        <div class="pill normal" onclick="setSGFilter('normal',this)" data-f="normal">— Normal</div>
+      </div>
+    </div>
+    <div class="grid" id="gridStoreG"><div class="empty">Select a store above to view its general bestsellers</div></div>
+  </div>
+
   <div class="content" id="storesTab" style="display:none">
     <div class="sec-title" style="justify-content:space-between">📊 Competitor Stores <button class="btn btn-p" onclick="openAdd()">+ Add Store</button></div>
     <div style="overflow-x:auto">
       <table class="store-table" id="storeTable">
-        <thead><tr><th>#</th><th>Store</th><th>URL</th><th>Monthly Visitors</th><th>Niche</th><th>Country</th><th>Products</th><th>Actions</th></tr></thead>
-        <tbody id="storeRows"><tr><td colspan="8" class="loading"><div class="spinner"></div>Loading...</td></tr></tbody>
+        <thead><tr><th>#</th><th>Store</th><th>URL</th><th>Monthly Visitors</th><th>Niche</th><th>Country</th><th>Actions</th></tr></thead>
+        <tbody id="storeRows"><tr><td colspan="7" class="loading"><div class="spinner"></div>Loading...</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -201,6 +243,9 @@ select:focus,.search-box:focus{border-color:var(--accent)}
 <script>
 const API=location.origin+'/api';
 let cFilter='all',sFilter='all',editId=null,searchTimer=null;
+// General-tab state mirrors the Fashion variables above so each tab
+// has its own filters/search without cross-talk.
+let gFilter='all',sgFilter='all',subnicheFilter='all';
 
 function doLogin(){
   fetch(API+'/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})})
@@ -211,12 +256,23 @@ function logout(){localStorage.removeItem('sw');location.reload()}
 function showApp(){document.getElementById('loginScreen').style.display='none';document.getElementById('app').style.display='block';loadCombined();loadStores();loadStats()}
 if(localStorage.getItem('sw')==='1')showApp();
 
-function switchTab(t){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelector(`[data-tab="${t}"]`).classList.add('active');document.getElementById('fashionTab').style.display=t==='fashion'?'block':'none';document.getElementById('storesTab').style.display=t==='stores'?'block':'none';if(t==='stores')loadStores()}
+function switchTab(t){
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelector(`[data-tab="${t}"]`).classList.add('active');
+  document.getElementById('fashionTab').style.display=t==='fashion'?'block':'none';
+  document.getElementById('generalTab').style.display=t==='general'?'block':'none';
+  document.getElementById('storesTab').style.display=t==='stores'?'block':'none';
+  if(t==='stores')loadStores();
+  if(t==='general'){loadCombinedGeneral();loadSubniches();loadStoresG();}
+}
 function setFilter(f,el){cFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadCombined()}
 function setStoreFilter(f,el){sFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadStore()}
+function setGFilter(f,el){gFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadCombinedGeneral()}
+function setSGFilter(f,el){sgFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadStoreGeneral()}
+function setSubniche(s,el){subnicheFilter=s;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadCombinedGeneral()}
 function debounceSearch(fn){clearTimeout(searchTimer);searchTimer=setTimeout(fn,400)}
 
-function loadStats(){fetch(API+'/stats').then(r=>r.json()).then(d=>{document.getElementById('statStores').textContent=d.stores;document.getElementById('statProducts').textContent=d.products;document.getElementById('statHeroes').textContent=d.heroes;document.getElementById('statVillains').textContent=d.villains})}
+function loadStats(){fetch(API+'/stats').then(r=>r.json()).then(d=>{document.getElementById('statStores').textContent=d.stores;document.getElementById('statHeroes').textContent=d.heroes;document.getElementById('statVillains').textContent=d.villains})}
 
 function loadCombined(){
   const sort=document.getElementById('sortAll').value;
@@ -243,6 +299,54 @@ function loadStore(){
   })
 }
 
+// === General tab ===
+function loadCombinedGeneral(){
+  const sort=document.getElementById('sortAllG').value;
+  const search=document.getElementById('searchAllG').value;
+  let url=`${API}/general/combined?sort=${sort}&limit=100&label=${gFilter}`;
+  if(subnicheFilter && subnicheFilter!=='all') url+=`&subniche=${encodeURIComponent(subnicheFilter)}`;
+  if(search) url+=`&search=${encodeURIComponent(search)}`;
+  document.getElementById('gridAllG').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
+  fetch(url).then(r=>r.json()).then(products=>{
+    if(!products.length){document.getElementById('gridAllG').innerHTML='<div class="empty">No general products found yet. Run a scrape to populate this tab.</div>';return}
+    document.getElementById('gridAllG').innerHTML=products.map((p,i)=>card(p,i+1)).join('')
+  }).catch(()=>document.getElementById('gridAllG').innerHTML='<div class="empty">Failed to load.</div>')
+}
+
+function loadStoreGeneral(){
+  const id=document.getElementById('storeSelectG').value;if(!id)return;
+  const sort=document.getElementById('sortStoreG').value;
+  const search=document.getElementById('searchStoreG').value;
+  let url=`${API}/general/store/${id}?sort=${sort}&limit=100&label=${sgFilter}`;
+  if(search)url+=`&search=${encodeURIComponent(search)}`;
+  document.getElementById('gridStoreG').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
+  fetch(url).then(r=>r.json()).then(products=>{
+    if(!products.length){document.getElementById('gridStoreG').innerHTML='<div class="empty">No general products for this store.</div>';return}
+    document.getElementById('gridStoreG').innerHTML=products.map((p,i)=>card(p,i+1)).join('')
+  })
+}
+
+function loadSubniches(){
+  fetch(API+'/general/subniches').then(r=>r.json()).then(rows=>{
+    const wrap=document.getElementById('subnicheAllG');
+    const pretty={jewelry:'💍 Jewelry',accessories:'🧣 Accessories',electronics:'📱 Electronics',home:'🛋 Home',beauty:'💄 Beauty',health:'💊 Health',food:'🍪 Food','toys-books':'🧸 Toys & Books',services:'📦 Services',other:'• Other'};
+    let html='<div class="pill '+(subnicheFilter==='all'?'active':'')+'" onclick="setSubniche(\'all\',this)" data-s="all">All Niches</div>';
+    rows.forEach(r=>{
+      const label=pretty[r.subniche]||r.subniche;
+      html+=`<div class="pill ${subnicheFilter===r.subniche?'active':''}" onclick="setSubniche('${r.subniche}',this)" data-s="${r.subniche}">${label} (${r.count})</div>`;
+    });
+    wrap.innerHTML=html;
+  })
+}
+
+function loadStoresG(){
+  fetch(API+'/stores').then(r=>r.json()).then(stores=>{
+    const sel=document.getElementById('storeSelectG');const cv=sel.value;
+    sel.innerHTML='<option value="">Select a store...</option>'+stores.map(s=>`<option value="${s.id}">${s.name} (${s.monthly_visitors})</option>`).join('');
+    if(cv)sel.value=cv;
+  })
+}
+
 function card(p,rank){
   const visitors = p.store_visitors || '';
   const lc=p.label==='hero'?'lbl-hero':p.label==='villain'?'lbl-villain':'lbl-normal';
@@ -252,11 +356,14 @@ function card(p,rank){
   else if(p.position_change<0)pc=`<span class="pos-change down">▼${Math.abs(p.position_change)}</span>`;
   else pc='<span class="pos-change same">—</span>';
   const price=p.price?(p.price.includes('.')?`€${p.price}`:`€${(parseInt(p.price)/100).toFixed(2)}`):'';
+  // Subniche badge only renders for non-fashion cards on the General tab
+  // (fashion cards already share an implicit niche).
+  const sub = p.subniche && p.subniche!=='fashion' ? `<span class="lbl lbl-sub">${p.subniche}</span>` : '';
   return`<div class="card" onclick="window.open('${p.product_url}','_blank')">
     <div class="card-img-wrap"><img src="${p.image_url||''}" onerror="this.style.background='var(--s2)';this.style.height='80px'" loading="lazy">${visitors?`<span class="visitor-badge">${visitors} /mo</span>`:''}</div>
     <div class="card-body"><div class="card-top"><span class="rank">#${rank}</span><span class="lbl ${lc}">${lt}</span></div>
     <div class="card-title">${p.title}</div><div class="card-meta"><span class="card-price">${price}</span>${pc}</div>
-    <div class="card-store">${p.store_name} · Pos #${p.current_position}${p.previous_position>0?' (was #'+p.previous_position+')':''}</div></div></div>`
+    <div class="card-store">${p.store_name} · Pos #${p.current_position}${p.previous_position>0?' (was #'+p.previous_position+')':''} ${sub}</div></div></div>`
 }
 
 function loadStores(){
@@ -269,7 +376,6 @@ function loadStores(){
       <td><strong>${s.name}</strong></td>
       <td><a class="store-link" href="${s.url}" target="_blank">${s.url}</a></td>
       <td>${s.monthly_visitors}</td><td>${s.niche}</td><td>${s.country}</td>
-      <td>${s.product_count}</td>
       <td class="actions">
         <button class="btn btn-g" onclick="event.stopPropagation();editStore(${s.id},'${s.name.replace(/'/g,"\\'")}','${s.url}','${s.monthly_visitors}','${s.niche}','${s.country.replace(/'/g,"\\'")}')">Edit</button>
         <button class="btn btn-danger" onclick="event.stopPropagation();delStore(${s.id},'${s.name.replace(/'/g,"\\'")}')">Delete</button>

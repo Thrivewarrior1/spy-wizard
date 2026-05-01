@@ -115,15 +115,17 @@ class StoreUpdate(BaseModel):
 @app.get("/api/stores")
 async def get_stores(db: Session = Depends(get_db)):
     stores = db.query(Store).order_by(Store.name).all()
-    # Count only fashion-flagged products. Non-fashion rows (shipping
-    # protection, gift cards, retired stale entries) stay in the table
-    # for history but must not inflate the per-store count the user sees.
+    # Counts are split by feed and exposed separately so the UI can show
+    # whichever is relevant. The Stores tab no longer surfaces them at
+    # all per the latest design decision, but the API still returns
+    # them for /api/stats and any future consumer.
     return [{
         "id": s.id, "name": s.name, "url": s.url,
         "monthly_visitors": s.monthly_visitors, "niche": s.niche,
         "country": s.country,
         "product_count": sum(1 for p in s.products if p.is_fashion),
-        "last_scraped": max((p.last_scraped for p in s.products if p.is_fashion), default=None),
+        "general_count": sum(1 for p in s.products if not p.is_fashion and p.subniche),
+        "last_scraped": max((p.last_scraped for p in s.products if p.is_fashion or p.subniche), default=None),
     } for s in stores]
 
 @app.post("/api/stores")
@@ -425,10 +427,136 @@ def _product_dict(p):
         "label": p.label,
         "ai_tags": p.ai_tags or "",
         "is_fashion": bool(p.is_fashion),
+        "subniche": p.subniche or "",
         "store_name": p.store.name, "store_url": p.store.url,
         "store_visitors": p.store.monthly_visitors,
         "last_scraped": p.last_scraped.isoformat() if p.last_scraped else None,
     }
+
+
+# Allowed subniche labels for the General feed filter pills. Mirrors the
+# enum in classifier.py so the UI surfaces the same vocabulary.
+GENERAL_SUBNICHES = (
+    "jewelry", "accessories", "electronics", "home", "beauty",
+    "health", "food", "toys-books", "services", "other",
+)
+
+
+def _general_base_query(db: Session, store_id: Optional[int] = None):
+    q = db.query(Product).join(Store).filter(
+        Product.is_fashion == False,
+        Product.subniche != "",
+    )
+    if store_id is not None:
+        q = q.filter(Product.store_id == store_id)
+    return q
+
+
+@app.get("/api/general/combined")
+async def get_combined_general(
+    sort: str = Query("high-low"),
+    label: Optional[str] = Query(None),
+    subniche: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    limit: int = Query(30, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """Cross-store General feed. Same shape as /api/bestsellers/combined
+    but filtered to is_fashion=False with a non-empty subniche so we
+    only surface products Gemini actually labelled for this tab.
+    """
+    query = _general_base_query(db)
+    if label and label != "all":
+        query = query.filter(Product.label == label)
+    if subniche and subniche != "all":
+        query = query.filter(Product.subniche == subniche)
+
+    if search and search.strip():
+        s = search.strip()
+        ai_query = query
+        for cond in build_ai_tag_filters(s):
+            ai_query = ai_query.filter(cond)
+        ai_results = ai_query.all()
+        if ai_results:
+            products = ai_results
+        else:
+            strict, loose = build_search_filters(s)
+            strict_query = query
+            for cond in strict:
+                strict_query = strict_query.filter(cond)
+            strict_results = strict_query.all()
+            if strict_results:
+                products = strict_results
+            else:
+                products = query.filter(or_(*loose)).all() if loose else []
+    else:
+        products = query.all()
+
+    if sort == "volume":
+        products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position))
+    elif sort == "low-high":
+        products.sort(key=lambda p: (-p.current_position,))
+    else:
+        products.sort(key=lambda p: p.current_position)
+
+    return [_product_dict(p) for p in products[:limit]]
+
+
+@app.get("/api/general/store/{store_id}")
+async def get_store_general(
+    store_id: int,
+    sort: str = Query("high-low"),
+    label: Optional[str] = Query(None),
+    subniche: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    limit: int = Query(30, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    store = db.query(Store).filter(Store.id == store_id).first()
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+    query = _general_base_query(db, store_id=store_id)
+    if label and label != "all":
+        query = query.filter(Product.label == label)
+    if subniche and subniche != "all":
+        query = query.filter(Product.subniche == subniche)
+    if search and search.strip():
+        s = search.strip()
+        ai_query = query
+        for cond in build_ai_tag_filters(s):
+            ai_query = ai_query.filter(cond)
+        ai_results = ai_query.order_by(Product.current_position).limit(limit).all()
+        if ai_results:
+            products = ai_results
+        else:
+            strict, loose = build_search_filters(s)
+            strict_query = query
+            for cond in strict:
+                strict_query = strict_query.filter(cond)
+            strict_results = strict_query.order_by(Product.current_position).limit(limit).all()
+            if strict_results:
+                products = strict_results
+            elif loose:
+                products = query.filter(or_(*loose)).order_by(Product.current_position).limit(limit).all()
+            else:
+                products = []
+    else:
+        products = query.order_by(Product.current_position).limit(limit).all()
+    return [_product_dict(p) for p in products]
+
+
+@app.get("/api/general/subniches")
+async def get_general_subniches(db: Session = Depends(get_db)):
+    """Return the set of subniches that actually have at least one
+    product in the DB right now, with counts. Powers the filter pills.
+    """
+    rows = (
+        db.query(Product.subniche, func.count(Product.id))
+        .filter(Product.is_fashion == False, Product.subniche != "")
+        .group_by(Product.subniche)
+        .all()
+    )
+    return [{"subniche": s, "count": c} for s, c in rows if s in GENERAL_SUBNICHES]
 
 # --- Scrape triggers ---
 @app.post("/api/scrape")
@@ -476,10 +604,15 @@ async def trigger_store_scrape(store_id: int, db: Session = Depends(get_db)):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
-    products, errors = await scrape_store_bestsellers(store.url)
-    if products:
-        update_products_in_db(db, store, products)
-    return {"success": len(products) > 0, "products_found": len(products), "errors": errors}
+    fashion, general, errors = await scrape_store_bestsellers(store.url)
+    if fashion or general:
+        update_products_in_db(db, store, fashion, general)
+    return {
+        "success": (len(fashion) + len(general)) > 0,
+        "products_found": len(fashion),
+        "general_found": len(general),
+        "errors": errors,
+    }
 
 
 @app.get("/api/debug/fetch/{store_id}")

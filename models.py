@@ -47,6 +47,12 @@ class Product(Base):
 
     ai_tags = Column(Text, default="")
     is_fashion = Column(Boolean, default=True)
+    # Subniche category for non-fashion items shown on the General tab.
+    # Gemini picks ONE of: jewelry, accessories, electronics, home, beauty,
+    # health, food, toys-books, services, other. Empty string for products
+    # that haven't been (re-)classified since this column was added — the
+    # General feed filters those out.
+    subniche = Column(String(50), default="")
 
     last_scraped = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)

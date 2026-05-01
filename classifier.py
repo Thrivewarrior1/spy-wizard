@@ -73,28 +73,38 @@ async def _classify_batch_with_gemini(batch: list, api_key: str, model: str):
     ]
 
     prompt = (
-        "You are a STRICT fashion classifier for a clothing bestseller tracker.\n\n"
-        "For EACH product below, decide if it is FASHION.\n\n"
-        "FASHION = clothing, shoes, or bags ONLY. This includes:\n"
+        "You are a STRICT product classifier for a Shopify bestseller tracker.\n"
+        "Two parallel feeds use your output:\n"
+        "  - Fashion feed (is_fashion=true): clothing, shoes, bags ONLY.\n"
+        "  - General feed (is_fashion=false): everything else, grouped by subniche.\n\n"
+        "For EACH product below, decide:\n"
+        "  1. is_fashion: true ONLY for clothing/shoes/bags. False for jewelry, "
+        "accessories that are not clothing/shoes/bags, electronics, home decor, "
+        "beauty, supplements, services, gift cards, etc.\n"
+        "  2. subniche: ONE label from this fixed list:\n"
+        "     - fashion          (clothing/shoes/bags — only when is_fashion=true)\n"
+        "     - jewelry          (necklaces, earrings, rings, bracelets, watches)\n"
+        "     - accessories      (hats, scarves, belts, sunglasses, gloves, ties)\n"
+        "     - electronics      (gadgets, phones, cases, chargers, headphones)\n"
+        "     - home             (lamps, candles, furniture, kitchenware, bedding, decor)\n"
+        "     - beauty           (skincare, makeup, perfume, fragrances)\n"
+        "     - health           (supplements, vitamins, wellness)\n"
+        "     - food             (snacks, drinks, edibles)\n"
+        "     - toys-books       (toys, games, books, stationery, pet products)\n"
+        "     - services         (shipping protection, route insurance, gift cards, donations, "
+        "warranties, slidecart upsells, '100% coverage' add-ons)\n"
+        "     - other            (anything that doesn't fit above)\n"
+        "  3. tags: 2-6 short English keyword tags (comma-separated, lowercase) "
+        "describing the product so we can find it from a multi-language search. "
+        "Translate non-English titles into English keywords.\n\n"
+        "FASHION = clothing, shoes, or bags ONLY:\n"
         "  - Clothing: shirts, t-shirts, blouses, tops, sweaters, hoodies, jackets, "
         "coats, dresses, skirts, pants, jeans, shorts, leggings, jumpsuits, "
         "swimwear, lingerie, sleepwear, activewear.\n"
         "  - Shoes: sneakers, boots, heels, sandals, flats, loafers, slippers.\n"
         "  - Bags: handbags, backpacks, totes, clutches, wallets, crossbody bags.\n\n"
-        "NOT FASHION (is_fashion=false) — be strict, when in doubt say false:\n"
-        "  - Jewelry of any kind (necklaces, earrings, rings, bracelets, watches).\n"
-        "  - Accessories that are not clothing/shoes/bags (hats, scarves, belts, "
-        "sunglasses, gloves, ties, hair accessories).\n"
-        "  - Shipping protection, package protection, route insurance, "
-        "delivery guarantees.\n"
-        "  - Gift cards, donations, tips, samples.\n"
-        "  - Electronics, phone cases, chargers, headphones.\n"
-        "  - Home decor, candles, furniture, kitchenware, bedding, rugs, art.\n"
-        "  - Beauty, skincare, makeup, perfume, supplements, vitamins, food.\n"
-        "  - Toys, books, stationery, pet products.\n\n"
-        "Also produce 2-6 short English keyword tags per product describing it "
-        "(e.g. 'summer,floral,maxi,dress'), comma-separated, all lowercase. "
-        "Translate non-English titles into English keywords.\n\n"
+        "When is_fashion=true you MUST set subniche='fashion'. When is_fashion=false "
+        "you MUST set subniche to one of the other labels. Be strict.\n\n"
         f"Products (JSON):\n{json.dumps(items, ensure_ascii=False)}\n\n"
         "Respond with a JSON array, one object per product, matching the input indices."
     )
@@ -106,9 +116,10 @@ async def _classify_batch_with_gemini(batch: list, api_key: str, model: str):
             "properties": {
                 "index": {"type": "integer"},
                 "is_fashion": {"type": "boolean"},
+                "subniche": {"type": "string"},
                 "tags": {"type": "string"},
             },
-            "required": ["index", "is_fashion", "tags"],
+            "required": ["index", "is_fashion", "subniche", "tags"],
         },
     }
 
@@ -179,6 +190,9 @@ async def _classify_batch_with_gemini(batch: list, api_key: str, model: str):
             # Only flip is_fashion when Gemini gives us a real boolean.
             if "is_fashion" in r:
                 batch[i]["is_fashion"] = bool(r.get("is_fashion"))
+            subniche = (r.get("subniche") or "").strip().lower()
+            if subniche:
+                batch[i]["subniche"] = subniche
             tags = (r.get("tags") or "").strip().lower()
             if tags:
                 batch[i]["ai_tags"] = tags

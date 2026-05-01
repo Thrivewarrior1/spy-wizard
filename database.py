@@ -39,6 +39,9 @@ def widen_text_columns():
         "ALTER TABLE products ALTER COLUMN shopify_id TYPE TEXT",
         "ALTER TABLE products ALTER COLUMN handle TYPE TEXT",
         "ALTER TABLE products ALTER COLUMN title TYPE TEXT",
+        # General-tab subniche classification. ADD COLUMN IF NOT EXISTS so
+        # this is idempotent across redeploys.
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS subniche VARCHAR(50) DEFAULT ''",
     ]
     with engine.connect() as conn:
         for stmt in statements:

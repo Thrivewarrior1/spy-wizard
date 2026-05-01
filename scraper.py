@@ -48,10 +48,14 @@ HISTORY_RETENTION_DAYS = 30
 # Aggressive page cap so a store with lots of non-fashion mixed near the
 # top of its best-seller list can still surface our fashion target.
 # Loop also exits early when a fetched page yields zero new product links
-# (catalog exhausted). 100 pages × ~16-50 products each is more than
-# enough to find 300 fashion products on every store we track.
+# (catalog exhausted).
 MAX_PAGES = 100
 TARGET_FASHION = 300
+# General-feed cap. 100 of each store's bestselling NON-fashion items
+# (gadgets, home decor, beauty, services like shipping protection, etc.)
+# get tracked separately on the General tab. Independent positions
+# 1..100, independent hero/villain, independent retirement.
+TARGET_GENERAL = 100
 
 # Per-store override for the collection path used to find best-sellers.
 # Some Shopify shops have a misconfigured /collections/all (e.g. Lumenrosa
@@ -422,16 +426,24 @@ def _extract_products_from_html(soup: BeautifulSoup, base_url: str, seen: set, h
     return products
 
 
-async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_FASHION):
-    """Scrape a store's best-selling collection until we have `target_fashion`
-    confirmed-fashion products, or we run out of pages.
+async def scrape_store_bestsellers(
+    store_url: str,
+    target_fashion: int = TARGET_FASHION,
+    target_general: int = TARGET_GENERAL,
+):
+    """Scrape a store's best-selling collection into TWO ranked lists:
+    fashion-only (up to `target_fashion`) and everything-else
+    (up to `target_general`). Both come from the same HTML pages.
 
-    Returns (fashion_products, errors):
-      - fashion_products: up to `target_fashion` products with sequential
-        positions 1..N reflecting their fashion-only bestseller order.
+    Returns (fashion_products, general_products, errors):
+      - fashion_products: up to `target_fashion` items with sequential
+        positions 1..N reflecting fashion-only bestseller order.
+      - general_products: up to `target_general` items with sequential
+        positions 1..N reflecting general bestseller order. Each carries
+        a `subniche` label (jewelry/electronics/home/beauty/services/...)
+        from Gemini for the General tab's filter pills.
       - errors: list of human-readable strings describing any non-fatal
-        problems (Gemini failures, missing API key, HTTP errors per page).
-        Empty list if everything was clean.
+        problems. Empty when everything was clean.
     """
     base_url = store_url.rstrip("/")
     # Pick the collection slug to scrape. Defaults to the universal
@@ -442,18 +454,17 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
     host = re.sub(r"^https?://", "", base_url, flags=re.I).split("/", 1)[0].lower()
     collection_slug = COLLECTION_OVERRIDES.get(host, "all")
     fashion: list = []
+    general: list = []
     seen: set = set()
     errors: list = []
     has_gemini = bool(os.getenv("GEMINI_API_KEY"))
     if not has_gemini:
-        # Degraded mode: without Gemini we cannot enforce fashion-only, but
-        # we still scrape so the user sees the feed. Loud warning so they
-        # know to set the key for the strict fashion-filtered behavior.
+        # Degraded mode: without Gemini we cannot split fashion vs general,
+        # so everything goes to the fashion feed unclassified. Loud warning.
         errors.append(
-            "GEMINI_API_KEY is not set on the server — fashion classification "
-            "is DISABLED. Showing all best-selling products with their raw "
-            "ranks. Set GEMINI_API_KEY in Railway env vars to enable "
-            "fashion-only filtering."
+            "GEMINI_API_KEY is not set on the server — fashion/general "
+            "classification is DISABLED. Set GEMINI_API_KEY in Railway env "
+            "vars to enable strict filtering."
         )
 
     try:
@@ -461,7 +472,10 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
             timeout=30.0, follow_redirects=True, headers=_build_headers()
         ) as client:
             page = 1
-            while len(fashion) < target_fashion and page <= MAX_PAGES:
+            while (
+                (len(fashion) < target_fashion or len(general) < target_general)
+                and page <= MAX_PAGES
+            ):
                 url = f"{base_url}/collections/{collection_slug}?sort_by=best-selling&page={page}"
                 try:
                     resp = await _fetch_with_retry(client, url)
@@ -480,17 +494,16 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
                 )
                 logger.info(
                     f"{base_url} page {page}: parsed {len(page_products)} new products "
-                    f"(running fashion total {len(fashion)})"
+                    f"(fashion={len(fashion)} general={len(general)})"
                 )
 
                 if not page_products:
                     break
 
-                # Hard pre-filter: drop obvious non-fashion (shipping
-                # protection, gift cards, route insurance, etc.) BEFORE
-                # Gemini ever sees them. This catches cases where the
-                # title alone is ambiguous to a small model but the
-                # Shopify-provided product_type leaves no doubt.
+                # Pre-classify obvious services (shipping protection, gift
+                # cards, slidecart upsells) so Gemini doesn't waste a slot
+                # on them. They go straight to the General feed under the
+                # 'services' subniche.
                 gemini_input = []
                 for p in page_products:
                     title = p.get("title", "")
@@ -500,6 +513,7 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
                         or (ptype and NON_FASHION_TYPE_RE.search(ptype))
                     ):
                         p["is_fashion"] = False
+                        p["subniche"] = "services"
                         p["ai_tags"] = ""
                     else:
                         gemini_input.append(p)
@@ -508,26 +522,33 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
                     ok, classifier_errors = await _classify_or_fail(gemini_input)
                     errors.extend(classifier_errors)
                     if not ok:
-                        # Hard fail — without classification we cannot meet
-                        # the fashion-only requirement, so stop rather than
-                        # corrupt the feed with unclassified items.
+                        # Hard fail — without classification we cannot
+                        # split fashion vs general reliably, so stop
+                        # rather than corrupt the feeds.
                         break
                 elif not has_gemini:
-                    # Degraded path: anything not caught by the blacklist
-                    # is treated as fashion so the feed populates.
+                    # Degraded path: route everything not blacklisted into
+                    # fashion so the main feed populates.
                     for p in gemini_input:
                         p["is_fashion"] = True
+                        p["subniche"] = "fashion"
                         p["ai_tags"] = ""
 
+                # Distribute classified products into the two ranked
+                # lists. Each list is independently positioned 1..N in
+                # the order it encounters its members on the bestseller
+                # pages, so per-feed hero/villain math stays meaningful.
                 for p in page_products:
-                    if not p.get("is_fashion"):
-                        continue
-                    p["position"] = len(fashion) + 1
-                    fashion.append(p)
-                    if len(fashion) >= target_fashion:
-                        break
+                    if p.get("is_fashion"):
+                        if len(fashion) < target_fashion:
+                            p["position"] = len(fashion) + 1
+                            fashion.append(p)
+                    else:
+                        if len(general) < target_general:
+                            p["position"] = len(general) + 1
+                            general.append(p)
 
-                if len(fashion) >= target_fashion:
+                if len(fashion) >= target_fashion and len(general) >= target_general:
                     break
 
                 page += 1
@@ -535,19 +556,17 @@ async def scrape_store_bestsellers(store_url: str, target_fashion: int = TARGET_
     except Exception as e:
         errors.append(f"unexpected error: {e}")
         logger.exception(f"Error scraping {base_url}")
-        return fashion, errors
+        return fashion, general, errors
 
-    if not fashion:
-        # If we have errors, the caller surfaces those. Otherwise note that
-        # the page yielded no fashion products at all (rare but possible).
+    if not fashion and not general:
         if not errors:
-            errors.append("no fashion products parsed from any page")
+            errors.append("no products parsed from any page")
 
     logger.info(
-        f"{base_url}: returning {len(fashion)} fashion products "
-        f"(positions 1..{len(fashion)}, errors={len(errors)})"
+        f"{base_url}: returning {len(fashion)} fashion + {len(general)} general "
+        f"(errors={len(errors)})"
     )
-    return fashion, errors
+    return fashion, general, errors
 
 
 async def _classify_or_fail(batch: list):
@@ -642,57 +661,43 @@ async def debug_fetch(store_url: str) -> dict:
     }
 
 
-def update_products_in_db(db: Session, store: Store, scraped_products: list):
-    """Persist scraped fashion products. All inputs are already is_fashion=True
-    (the scraper filters before this). Hero/villain assignment requires a
-    product to have >= 2 prior PositionHistory rows.
-
-    Also retires (sets is_fashion=False on) any existing product that
-    wasn't in this scrape's fashion list, so:
-      - shipping-protection / 100%-coverage rows from older scrapes that
-        beat the current blacklist now drop out of the feed,
-      - stale entries from a prior collection_slug (e.g. Lumenrosa rows
-        scraped from /collections/all before we switched the host to
-        /collections/damen) stop appearing alongside fresh data with
-        duplicate position numbers.
-    Skipped on partial scrapes (< 50% of target) to avoid wiping a
-    store's catalog when one run hiccups.
+def _upsert_one(
+    db: Session,
+    store: Store,
+    existing_products: dict,
+    product_data: dict,
+    *,
+    is_fashion: bool,
+    subniche: str,
+    now: datetime,
+):
+    """Upsert one product row and write a PositionHistory snapshot.
+    Hero/villain is computed against the previous current_position only
+    when the product is staying in the SAME feed (fashion↔fashion or
+    general↔general); a feed flip resets the label to 'normal' so a
+    product hopping between tabs doesn't get a misleading direction.
     """
-    existing_products = {p.shopify_id: p for p in store.products if p.shopify_id}
-    now = datetime.utcnow()
-    scraped_ids = {p["shopify_id"] for p in scraped_products}
+    shopify_id = product_data["shopify_id"]
+    new_position = product_data["position"]
 
-    for product_data in scraped_products:
-        shopify_id = product_data["shopify_id"]
-        new_position = product_data["position"]
+    if shopify_id in existing_products:
+        product = existing_products[shopify_id]
+        old_position = product.current_position or 0
+        was_fashion = bool(product.is_fashion)
+        feed_changed = was_fashion != is_fashion
 
-        if shopify_id in existing_products:
-            product = existing_products[shopify_id]
-            old_position = product.current_position or 0
+        history_count = (
+            db.query(func.count(PositionHistory.id))
+            .filter(PositionHistory.product_id == product.id)
+            .scalar()
+        ) or 0
 
-            history_count = (
-                db.query(func.count(PositionHistory.id))
-                .filter(PositionHistory.product_id == product.id)
-                .scalar()
-            ) or 0
-
+        if feed_changed:
+            # Switching feeds — old position isn't comparable anymore.
+            product.previous_position = 0
+            product.label = "normal"
+        else:
             product.previous_position = old_position
-            product.current_position = new_position
-            product.title = product_data["title"]
-            product.image_url = product_data["image_url"]
-            product.price = product_data["price"]
-            product.product_url = product_data["product_url"]
-            product.vendor = product_data.get("vendor", "")
-            product.product_type = product_data.get("product_type", "")
-            product.ai_tags = product_data.get("ai_tags", "")
-            product.is_fashion = True
-            product.last_scraped = now
-
-            # Hero/villain only meaningful when we have a real prior snapshot
-            # to compare against. history_count counts rows BEFORE this scrape
-            # writes its own row, so >=1 means at least one earlier scrape
-            # exists. With no history at all (first scrape ever for this
-            # product) we always emit 'normal'.
             if history_count >= 1 and old_position > 0:
                 if new_position < old_position:
                     product.label = "hero"
@@ -702,47 +707,119 @@ def update_products_in_db(db: Session, store: Store, scraped_products: list):
                     product.label = "normal"
             else:
                 product.label = "normal"
-        else:
-            product = Product(
-                store_id=store.id,
-                shopify_id=shopify_id,
-                title=product_data["title"],
-                handle=product_data["handle"],
-                image_url=product_data["image_url"],
-                price=product_data["price"],
-                vendor=product_data.get("vendor", ""),
-                product_type=product_data.get("product_type", ""),
-                product_url=product_data["product_url"],
-                current_position=new_position,
-                previous_position=0,
-                label="normal",
-                ai_tags=product_data.get("ai_tags", ""),
-                is_fashion=True,
-                last_scraped=now,
-            )
-            db.add(product)
-            db.flush()
 
-        history = PositionHistory(
-            product_id=product.id,
-            position=new_position,
-            date=now,
+        product.current_position = new_position
+        product.title = product_data["title"]
+        product.image_url = product_data["image_url"]
+        product.price = product_data["price"]
+        product.product_url = product_data["product_url"]
+        product.vendor = product_data.get("vendor", "")
+        product.product_type = product_data.get("product_type", "")
+        product.ai_tags = product_data.get("ai_tags", "")
+        product.is_fashion = is_fashion
+        product.subniche = subniche
+        product.last_scraped = now
+    else:
+        product = Product(
+            store_id=store.id,
+            shopify_id=shopify_id,
+            title=product_data["title"],
+            handle=product_data["handle"],
+            image_url=product_data["image_url"],
+            price=product_data["price"],
+            vendor=product_data.get("vendor", ""),
+            product_type=product_data.get("product_type", ""),
+            product_url=product_data["product_url"],
+            current_position=new_position,
+            previous_position=0,
+            label="normal",
+            ai_tags=product_data.get("ai_tags", ""),
+            is_fashion=is_fashion,
+            subniche=subniche,
+            last_scraped=now,
         )
-        db.add(history)
+        db.add(product)
+        db.flush()
 
-    # Retire stale entries — only when this scrape is reasonably complete
-    # so a partial run doesn't wipe legitimate data.
-    retired = 0
-    if len(scraped_products) >= max(30, TARGET_FASHION // 2):
+    db.add(PositionHistory(
+        product_id=product.id,
+        position=new_position,
+        date=now,
+    ))
+
+
+def update_products_in_db(
+    db: Session,
+    store: Store,
+    fashion_products: list,
+    general_products: list | None = None,
+):
+    """Persist this scrape's fashion AND general lists for `store`.
+
+    Each list has its own position numbering 1..N. Retirement is also
+    per-feed:
+      - any existing fashion row whose shopify_id isn't in this scrape's
+        fashion list flips is_fashion=False (drops out of Fashion tab),
+      - any existing non-fashion row whose shopify_id isn't in the
+        general list has its subniche cleared (drops out of General tab).
+
+    Both retirements only run when the corresponding list is at least
+    half-full so a partial scrape can't wipe legitimate data.
+    """
+    general_products = general_products or []
+    existing_products = {p.shopify_id: p for p in store.products if p.shopify_id}
+    now = datetime.utcnow()
+    fashion_ids = {p["shopify_id"] for p in fashion_products}
+    general_ids = {p["shopify_id"] for p in general_products}
+
+    for product_data in fashion_products:
+        _upsert_one(
+            db, store, existing_products, product_data,
+            is_fashion=True, subniche="fashion", now=now,
+        )
+
+    for product_data in general_products:
+        sub = (product_data.get("subniche") or "other").strip().lower()
+        if sub == "fashion":
+            # Defensive: a misclassification slipped through. Treat as
+            # 'other' on the General feed rather than mixing labels.
+            sub = "other"
+        _upsert_one(
+            db, store, existing_products, product_data,
+            is_fashion=False, subniche=sub, now=now,
+        )
+
+    # Per-feed retirement. We never look at the OTHER feed's IDs when
+    # deciding whether to retire — a product that moved feeds is already
+    # represented in its new feed's list.
+    fashion_retired = 0
+    general_retired = 0
+    if len(fashion_products) >= max(30, TARGET_FASHION // 2):
         for shopify_id, product in existing_products.items():
-            if shopify_id not in scraped_ids and product.is_fashion:
+            if (
+                product.is_fashion
+                and shopify_id not in fashion_ids
+                and shopify_id not in general_ids
+            ):
                 product.is_fashion = False
-                retired += 1
+                product.subniche = ""
+                fashion_retired += 1
+    if len(general_products) >= max(15, TARGET_GENERAL // 2):
+        for shopify_id, product in existing_products.items():
+            if (
+                not product.is_fashion
+                and product.subniche
+                and shopify_id not in general_ids
+                and shopify_id not in fashion_ids
+            ):
+                product.subniche = ""
+                general_retired += 1
 
     db.commit()
     logger.info(
-        f"Updated {len(scraped_products)} fashion products for {store.name}"
-        + (f" (retired {retired} stale)" if retired else "")
+        f"Updated {store.name}: {len(fashion_products)} fashion + "
+        f"{len(general_products)} general"
+        + (f" (retired f={fashion_retired} g={general_retired})" if fashion_retired or general_retired else "")
     )
 
 
@@ -780,26 +857,35 @@ async def scrape_all_stores(db: Session) -> dict:
     results = {
         "stores": [],
         "total_products": 0,
+        "total_general": 0,
         "stores_with_products": 0,
         "stores_failed": 0,
     }
 
     for store in stores:
-        store_result = {"id": store.id, "name": store.name, "products": 0, "errors": []}
+        store_result = {
+            "id": store.id, "name": store.name,
+            "products": 0, "general": 0, "errors": [],
+        }
         logger.info(f"Scraping {store.name} ({store.url})...")
         try:
-            products, errors = await scrape_store_bestsellers(store.url)
+            fashion, general, errors = await scrape_store_bestsellers(store.url)
             store_result["errors"] = errors
-            if products:
-                update_products_in_db(db, store, products)
-                store_result["products"] = len(products)
-                results["total_products"] += len(products)
+            if fashion or general:
+                update_products_in_db(db, store, fashion, general)
+                store_result["products"] = len(fashion)
+                store_result["general"] = len(general)
+                results["total_products"] += len(fashion)
+                results["total_general"] += len(general)
                 results["stores_with_products"] += 1
-                logger.info(f"  ✓ {len(products)} fashion products for {store.name}")
+                logger.info(
+                    f"  ✓ {len(fashion)} fashion + {len(general)} general "
+                    f"for {store.name}"
+                )
             else:
                 results["stores_failed"] += 1
                 logger.warning(
-                    f"  ✗ No fashion products for {store.name} — errors: {errors}"
+                    f"  ✗ No products for {store.name} — errors: {errors}"
                 )
         except Exception as e:
             store_result["errors"].append(f"unhandled: {e}")
@@ -815,7 +901,8 @@ async def scrape_all_stores(db: Session) -> dict:
         logger.error(f"History cleanup failed: {e}")
 
     logger.info(
-        f"Scrape complete: {results['total_products']} products across "
+        f"Scrape complete: {results['total_products']} fashion + "
+        f"{results['total_general']} general across "
         f"{results['stores_with_products']}/{len(stores)} stores"
     )
     return results
