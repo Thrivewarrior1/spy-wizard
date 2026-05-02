@@ -211,16 +211,19 @@ _FORCE_FASHION_PATTERNS = [
     r"\bpajamas?\b", r"\bpyjamas?\b", r"\bnightgowns?\b",
     r"\bsleepwear\b", r"\bloungewear\b", r"\bponcho\b",
     r"\bcardigans?\b", r"\bleggings?\b", r"\boveralls?\b",
-    # === Apparel — German (compound-friendly) ===
+    # === Apparel — German (compound-friendly; umlauts cover their
+    # === ASCII transliterations too, since image URLs / Shopify
+    # === handles routinely flatten ä→ae, ö→oe, ü→ue).
     r"\bhemden?\b", r"\bblusen?\b", r"\bpullover\w*",
     r"\bjacken?\b", r"\bjacke\b",
-    r"\bm[äa]ntel\w*", r"\bmantel\w*",
-    r"\bkleid\w*", r"\br[öo]ck\b", r"\br[öo]cke\b",
-    r"\br[öo]cken\b", r"\br[öo]ckes\b",
+    r"\bm(?:ä|a|ae)ntel\w*", r"\bmantel\w*",
+    r"\bkleid\w*", r"\br(?:ö|o|oe)ck\b", r"\br(?:ö|o|oe)cke\b",
+    r"\br(?:ö|o|oe)cken\b", r"\br(?:ö|o|oe)ckes\b",
     r"\bhose\b", r"\bhosen\w*", r"\bjogginghose\w*",
     r"\bsakkos?\b",
     r"\bbademantel\w*", r"\bbademaentel\w*",
-    r"\bnachthemd\w*", r"\bschlafanzug\w*", r"\bschlafanz[üu]g\w*",
+    r"\bnachthemd\w*", r"\bschlafanzug\w*",
+    r"\bschlafanz(?:ü|u|ue)g\w*",
     # === Apparel — French ===
     r"\bchemises?\b", r"\bchemisiers?\b", r"\bblousons?\b",
     r"\bvestes?\b", r"\bmanteaux\b", r"\bmanteau\b",
@@ -243,10 +246,10 @@ _FORCE_FASHION_PATTERNS = [
     r"\bbriefs?\b", r"\bboxers?\b", r"\bthongs?\b",
     r"\bbras?\b", r"\blingerie\b", r"\bshapewear\b",
     r"\bhosiery\b", r"\btights\b", r"\bstockings?\b", r"\bsocks?\b",
-    # === Underwear — German ===
-    r"\bunterw[äa]sche\w*", r"\bunterhose\w*",
-    r"\bmiederwaren\w*", r"\bstr[üu]mpfe\b",
-    r"\bstr[üu]mpfh[öo]se\w*", r"\bsocken\b",
+    # === Underwear — German (umlauts also accept ASCII ae/oe/ue) ===
+    r"\bunterw(?:ä|a|ae)sche\w*", r"\bunterhose\w*",
+    r"\bmiederwaren\w*", r"\bstr(?:ü|u|ue)mpfe\b",
+    r"\bstr(?:ü|u|ue)mpfh(?:ö|o|oe)se\w*", r"\bsocken\b",
     # === Underwear — French ===
     r"\bsous[\s\-]?v[êe]tements?\b", r"\bculottes?\b",
     r"\bsoutien[\s\-]?gorges?\b", r"\bcollants\b",
@@ -266,8 +269,8 @@ _FORCE_FASHION_PATTERNS = [
     r"\bsandals?\b", r"\bslippers?\b", r"\bslip[\s\-]?ons?\b",
     r"\bheels?\b", r"\bstilettos?\b", r"\bloafers?\b",
     r"\bflats\b", r"\boxfords?\b",
-    # === Footwear — German (compound-friendly) ===
-    r"\borthoschuh\w*", r"\borthop[äa]disch\w*",
+    # === Footwear — German (compound-friendly; umlauts accept ASCII too) ===
+    r"\borthoschuh\w*", r"\borthop(?:ä|a|ae)disch\w*",
     r"\bschuh\w*", r"\bstiefel\w*", r"\bsandalen\b",
     r"\bhausschuh\w*", r"\bhalbschuh\w*",
     # === Footwear — French ===
@@ -292,7 +295,7 @@ _FORCE_FASHION_PATTERNS = [
     # === Swimwear ===
     r"\bbikinis?\b", r"\bswimsuits?\b", r"\bswimwear\b",
     r"\bboard[\s\-]shorts?\b",
-    r"\bbademode\w*", r"\bbadeanz[üu]g\w*",
+    r"\bbademode\w*", r"\bbadeanz(?:ü|u|ue)g\w*",
     r"\bba[ñn]ador\w*",
     r"\bcostumi?[\s\-]da[\s\-]bagno\b",
     r"\bbadpak\w*",
