@@ -375,6 +375,18 @@ _FORCE_FASHION_PATTERNS = [
     r"\bsalkin\b", r"\bsakin\b",
 ]
 
+_FORCE_FASHION_PATTERNS += [
+    # === Costumes / cosplay / Halloween — these COUNT as fashion
+    # === per the user rule (dress-up = fashion). Skim risk: 'costume
+    # === jewelry' would already promote, fine; 'costume design book'
+    # === would FP, accepted.
+    r"\bcostumes?\b", r"\bcosplay\w*",
+    r"\bhalloween[\s\-]?(?:mask|costume|outfit|wig)\w*",
+    r"\blatex[\s\-]?mask\w*", r"\bfancy[\s\-]?dress\b",
+    r"\bmascot[\s\-]?costume\w*",
+]
+
+
 FORCE_FASHION_TITLE_RE = re.compile(
     "|".join(_FORCE_FASHION_PATTERNS),
     re.IGNORECASE,
@@ -384,6 +396,180 @@ FORCE_FASHION_TITLE_RE = re.compile(
 # live among the alternations safely (alternation order would matter),
 # so we keep it in its own regex and OR-merge in `_is_forced_fashion`.
 FORCE_FASHION_BH_RE = re.compile(r"\bbh\b|\bb\.h\.?", re.IGNORECASE)
+
+
+# ===================================================================
+# FASHION vs GENERAL — the user rule (also documented at the top of
+# classifier.py): items chosen primarily for STYLE go to Fashion;
+# items chosen primarily for FUNCTION go to General — even if they
+# are worn or carried on the body.
+#
+# FORCE_GENERAL_RE is the mirror of FORCE_FASHION_RE for wearable
+# items that are FUNCTION-driven (medical, safety, utility, smart-
+# tech, pet protective gear). Anything matching here gets is_fashion
+# forced to FALSE and OVERRIDES FORCE_FASHION when both match — so a
+# 'smartwatch' (matches both \bwatch from fashion AND smartwatch from
+# here) lands on General.
+# ===================================================================
+_FORCE_GENERAL_PATTERNS = [
+    # === Wearable medical devices ===
+    r"\bposture[\s\-]?correct(?:or|er)s?\b",
+    r"\bposture[\s\-]?brace\w*", r"\bposture[\s\-]?bra\b",
+    r"\bhaltungs(?:korrektur|trainer|bandage|bra|gurt)\w*",
+    r"\bsupport[\s\-]?(?:band|belt|brace)\w*",
+    r"\bst(?:ü|u|ue)tzg(?:ü|u|ue)rtel\w*",
+    r"\bst(?:ü|u|ue)tzband\w*", r"\bst(?:ü|u|ue)tzbandage\w*",
+    r"\bknee[\s\-]?brace\w*", r"\bback[\s\-]?brace\w*",
+    r"\belbow[\s\-]?brace\w*", r"\bwrist[\s\-]?brace\w*",
+    r"\bankle[\s\-]?brace\w*",
+    r"\bknieorthese\w*",
+    r"\br(?:ü|u|ue)ckenst(?:ü|u|ue)tze\w*",
+    r"\borthese\w*",  # German for orthotic / brace
+    r"\borthopedic[\s\-]?(?:insoles?|toe|foot|brace|support|pad)\w*",
+    r"\borthop(?:ä|a|ae)dische?[\s\-]?einlagen\w*",
+    r"\binsoles?\b", r"\beinlagen\b",
+    r"\btoe[\s\-]?spacers?\b", r"\bzehenspreizer\w*",
+    r"\bbunion[\s\-]?correct(?:or|er)s?\b",
+    r"\bbunionette\b", r"\bhammertoe\b",
+    r"\btoe[\s\-]?straightener\w*",
+    r"\bfoot[\s\-]?pain[\s\-]?(?:pad|relief|cushion|insert)\w*",
+    r"\bmetatarsal[\s\-]?support\w*", r"\bmetatarsalgia\b",
+    r"\bmorton'?s?[\s\-]?neuroma\b",
+    r"\bgel[\s\-]?(?:cushion|pad|insole|insert)\w*",
+    r"\bcompression[\s\-]?(?:sleeve|sock|stocking|legging|garment|wear|shirt)\w*",
+    r"\bkompressions(?:[äa]rmel|str(?:ü|u|ue)mpfe|socke\w*|leggings?)",
+    r"\bsciatica[\s\-]?(?:relief|brace|belt|support)\w*",
+    r"\bhip[\s\-]?and[\s\-]?thigh[\s\-]?support\w*",
+    # === Wearable safety / utility ===
+    r"\bled[\s\-]?(?:dog|pet|safety)[\s\-]?collars?\b",
+    r"\bled[\s\-]?(?:hunde)?halsband\w*",
+    r"\breflective[\s\-]?(?:vest|jacket|band|harness|safety)\w*",
+    r"\bself[\s\-]?defen(?:s|c)e\w*",
+    r"\bselbstverteidigung\w*",
+    r"\btrekking[\s\-]?pole\w*", r"\bhiking[\s\-]?pole\w*",
+    r"\bnordic[\s\-]?walking[\s\-]?pole\w*",
+    r"\bwanderstock\w*", r"\bwanderst(?:ö|o|oe)cke\w*",
+    r"\bb[âa]ton[\s\-]?(?:de[\s\-]?)?(?:marche|trekking|randonn[ée]e)\w*",
+    r"\bbast(?:ó|o)n[\s\-]?(?:trekking|monta(?:ñ|n)a)\w*",
+    r"\bbastoni?[\s\-]?(?:trekking|nordic[\s\-]?walking)\w*",
+    r"\bwalking[\s\-]?stick\w*",
+    r"\bspazierstock\w*",
+    # === Wearable tech (smartwatches, fitness trackers) ===
+    r"\bsmart[\s\-]?watch\w*", r"\bsmartwatch\w*",
+    r"\bfitness[\s\-]?tracker\w*", r"\bfitness[\s\-]?band\w*",
+    r"\bactivity[\s\-]?tracker\w*",
+    r"\bsmart[\s\-]?ring\w*", r"\bsmart[\s\-]?band\w*",
+    r"\bsmart[\s\-]?glasses\b",
+    r"\bheart[\s\-]?rate[\s\-]?(?:monitor|watch|band)\w*",
+    r"\bblood[\s\-]?(?:sugar|glucose|pressure)[\s\-]?(?:monitor|watch)\w*",
+    r"\becg[\s\-]?(?:watch|monitor)\w*",
+    r"\bhealth[\s\-]?(?:smart[\s\-]?)?watch\w*",
+    r"\bsenior[\s\-]?smart[\s\-]?watch\w*",
+    # === Pet protective gear (NOT style accessories) ===
+    r"\bdog[\s\-]?raincoat\w*", r"\bpet[\s\-]?raincoat\w*",
+    r"\bhundemantel\w*", r"\bhunderegen\w*",
+    r"\bdog[\s\-]?harness\w*", r"\bpet[\s\-]?harness\w*",
+    r"\bhundegeschirr\w*",
+    r"\bdog[\s\-]?muzzle\w*", r"\bpet[\s\-]?muzzle\w*",
+    r"\bmaulkorb\w*",
+    r"\bdog[\s\-]?leash\w*", r"\bpet[\s\-]?leash\w*",
+    r"\bhundeleine\w*",
+    r"\bdog[\s\-]?bootie?s?\b",
+    r"\bpaw[\s\-]?(?:protect|boot)\w*",
+    r"\btraining[\s\-]?collar\w*", r"\be[\s\-]?collar\w*",
+    # === Wearable beauty devices (function not style) ===
+    r"\bsnap[\s\-]?on[\s\-]?veneer\w*",
+    r"\bcosmetic[\s\-]?veneer\w*",
+    r"\bface[\s\-]?massager\w*", r"\bfacial[\s\-]?massager\w*",
+    r"\bbeauty[\s\-]?wand\w*",
+    # === Carried/handheld even with neck strap ===
+    r"\bmagnifying[\s\-]?glass\w*",
+    r"\bhand[\s\-]?free[\s\-]?magnif\w*",
+    r"\blupe\b", r"\blupen\b", r"\blesehilfe\w*",
+    r"\bvergr(?:ö|o|oe)(?:ß|s|ss)erungsglas\w*",
+    r"\bumbrella\w*", r"\bregenschirm\w*", r"\bparapluie\w*",
+    r"\bparaguas\b", r"\bombrello\b", r"\bparaplu\b",
+]
+
+FORCE_GENERAL_TITLE_RE = re.compile(
+    "|".join(_FORCE_GENERAL_PATTERNS),
+    re.IGNORECASE,
+)
+
+
+def _is_forced_general(
+    title: str = "",
+    product_type: str = "",
+    handle: str = "",
+    product_url: str = "",
+    image_url: str = "",
+) -> bool:
+    """True iff any field looks like a wearable-but-functional product
+    (smartwatch, posture corrector, dog raincoat, magnifying glass,
+    etc.). Mirrors `_is_forced_fashion` but for the function-over-
+    form decision rule (see FASHION vs GENERAL doc at top of
+    classifier.py). Wins precedence: a smartwatch matches both
+    \\bwatch (fashion) AND smartwatch (general); the general check
+    fires first in the distribution loop and the item lands on the
+    General feed.
+    """
+    for field in (title, product_type, handle, product_url, image_url):
+        if not field:
+            continue
+        if FORCE_GENERAL_TITLE_RE.search(field):
+            return True
+    return False
+
+
+# Inferred subniche when demoting is_fashion=True rows that match
+# FORCE_GENERAL_RE — used by the migration so the General feed
+# surfaces them under a sensible category instead of 'fashion'.
+_FORCE_GENERAL_SUBNICHE_HEURISTICS = [
+    (re.compile(
+        r"smart[\s\-]?watch|smartwatch|fitness[\s\-]?(?:tracker|band)|"
+        r"activity[\s\-]?tracker|smart[\s\-]?(?:ring|band|glasses)|"
+        r"heart[\s\-]?rate|blood[\s\-]?(?:sugar|pressure|glucose)|"
+        r"ecg|health[\s\-]?(?:smart[\s\-]?)?watch|senior[\s\-]?smart",
+        re.I,
+    ), "electronics"),
+    (re.compile(
+        r"posture|brace|support[\s\-]?(?:band|belt|brace)|orthopedic|"
+        r"toe[\s\-]?spacer|foot[\s\-]?pain|compression|sciatica|"
+        r"gel[\s\-]?(?:cushion|pad|insole|insert)|insoles?\b|einlagen|"
+        r"haltungs|orthese|bunion|hammertoe|metatarsal|morton",
+        re.I,
+    ), "health"),
+    (re.compile(
+        r"dog[\s\-]?(?:raincoat|harness|muzzle|leash|collar|booties?)|"
+        r"pet[\s\-]?(?:raincoat|harness|muzzle|leash)|hundeleine|"
+        r"maulkorb|hundegeschirr|hundemantel|led[\s\-]?(?:dog|pet)|"
+        r"paw[\s\-]?protect|training[\s\-]?collar|e[\s\-]?collar",
+        re.I,
+    ), "toys-books"),
+    (re.compile(
+        r"trekking[\s\-]?pole|walking[\s\-]?stick|self[\s\-]?defen|"
+        r"magnifying|hand[\s\-]?free[\s\-]?magnif|monocular|telescope|"
+        r"spazierstock|wanderstock|umbrella|regenschirm|parapluie|"
+        r"reflective[\s\-]?(?:vest|jacket|band)",
+        re.I,
+    ), "other"),
+    (re.compile(
+        r"snap[\s\-]?on[\s\-]?veneer|cosmetic[\s\-]?veneer|"
+        r"face[\s\-]?massager|facial[\s\-]?massager|beauty[\s\-]?wand",
+        re.I,
+    ), "beauty"),
+]
+
+
+def _classify_general_subniche(title: str) -> str:
+    """Pick a sensible General-feed bucket for a row that just got
+    demoted from Fashion via FORCE_GENERAL_RE. Defaults to 'other'."""
+    if not title:
+        return "other"
+    for pattern, label in _FORCE_GENERAL_SUBNICHE_HEURISTICS:
+        if pattern.search(title):
+            return label
+    return "other"
 
 
 def _is_forced_fashion(
@@ -891,21 +1077,39 @@ async def scrape_store_bestsellers(
                         continue
                     if sub in WEARABLE_SUBNICHES:
                         p["is_fashion"] = True
-                    # Apparel / footwear / eyewear / intimates safety net.
-                    # Gemini occasionally routes Bademantel to 'home',
-                    # Unterwäsche to 'beauty', orthopedic shoes to
-                    # 'health', wedding dresses to 'other', etc. The
-                    # multilingual allowlist forces is_fashion=True for
-                    # any wearable category Gemini missed and rewrites
-                    # the subniche to 'fashion' so the upsert doesn't
-                    # later squash it back to a General-feed bucket.
-                    if _is_forced_fashion(
-                        title=p.get("title", ""),
-                        product_type=p.get("product_type", ""),
-                        handle=p.get("handle", ""),
-                        product_url=p.get("product_url", ""),
-                        image_url=p.get("image_url", ""),
+                    # FORCE_GENERAL precedence — wearable-but-
+                    # functional items (smartwatches, posture
+                    # correctors, dog raincoats, magnifying glasses,
+                    # trekking poles) MUST land on General even when
+                    # they would otherwise match the apparel allowlist.
+                    # The user rule: function over form. Run this
+                    # check BEFORE the FORCE_FASHION promotion so a
+                    # smartwatch (matches both \bwatch and smartwatch)
+                    # never gets promoted.
+                    title = p.get("title", "")
+                    ptype = p.get("product_type", "")
+                    handle = p.get("handle", "")
+                    purl = p.get("product_url", "")
+                    iurl = p.get("image_url", "")
+                    if _is_forced_general(
+                        title=title, product_type=ptype, handle=handle,
+                        product_url=purl, image_url=iurl,
                     ):
+                        p["is_fashion"] = False
+                        # Re-bucket if the previous subniche was a
+                        # wearable label or empty — pick a sensible
+                        # General feed slot.
+                        if sub in WEARABLE_SUBNICHES or not sub:
+                            p["subniche"] = _classify_general_subniche(title)
+                            sub = p["subniche"]
+                    elif _is_forced_fashion(
+                        title=title, product_type=ptype, handle=handle,
+                        product_url=purl, image_url=iurl,
+                    ):
+                        # Apparel / footwear / eyewear / intimates safety
+                        # net. Forces is_fashion=True for any wearable
+                        # category Gemini missed and rewrites the
+                        # subniche to 'fashion'.
                         p["is_fashion"] = True
                         if sub not in WEARABLE_SUBNICHES:
                             p["subniche"] = "fashion"
@@ -1182,22 +1386,50 @@ def update_products_in_db(
             product.subniche = ""
             junk_purged += 1
 
-    # Apparel / footwear / eyewear / intimates sweep. Promotes any
-    # is_fashion=False row that NOW matches the multilingual fashion
-    # allowlist (Bademantel, Unterwäsche, Orthoschuh, Brille, etc.)
-    # to is_fashion=True. Coerces the subniche to 'fashion' if it was
-    # previously a General bucket so downstream queries don't surface
-    # it under a non-wearable label.
-    forced_promoted = 0
+    # FORCE_GENERAL sweep — runs FIRST because the function-over-form
+    # rule wins over the apparel allowlist. Demotes any currently-
+    # Fashion row that matches the wearable-gadget regex (smartwatch,
+    # posture corrector, dog raincoat, magnifying glass, trekking pole,
+    # etc.) and re-buckets the subniche to a sensible General label.
+    forced_demoted = 0
     for shopify_id, product in existing_products.items():
-        if product.is_fashion:
+        if not product.is_fashion:
             continue
-        if not _is_forced_fashion(
+        if not _is_forced_general(
             title=product.title or "",
             product_type=product.product_type or "",
             handle=product.handle or "",
             product_url=product.product_url or "",
             image_url=product.image_url or "",
+        ):
+            continue
+        product.is_fashion = False
+        product.subniche = _classify_general_subniche(product.title or "")
+        forced_demoted += 1
+
+    # Apparel / footwear / eyewear / intimates sweep. Promotes any
+    # is_fashion=False row that NOW matches the multilingual fashion
+    # allowlist (Bademantel, Unterwäsche, Orthoschuh, Brille, etc.)
+    # to is_fashion=True — UNLESS the row also matches FORCE_GENERAL
+    # (e.g. 'orthopedic insoles' have 'orthopedic' but FORCE_GENERAL
+    # wins because it's a medical accessory, not footwear).
+    forced_promoted = 0
+    for shopify_id, product in existing_products.items():
+        if product.is_fashion:
+            continue
+        title = product.title or ""
+        ptype = product.product_type or ""
+        handle = product.handle or ""
+        purl = product.product_url or ""
+        iurl = product.image_url or ""
+        if _is_forced_general(
+            title=title, product_type=ptype, handle=handle,
+            product_url=purl, image_url=iurl,
+        ):
+            continue
+        if not _is_forced_fashion(
+            title=title, product_type=ptype, handle=handle,
+            product_url=purl, image_url=iurl,
         ):
             continue
         product.is_fashion = True
@@ -1238,6 +1470,7 @@ def update_products_in_db(
         f"{len(general_products)} general"
         + (f" (retired f={fashion_retired} g={general_retired})" if fashion_retired or general_retired else "")
         + (f" (purged {junk_purged} junk)" if junk_purged else "")
+        + (f" (demoted {forced_demoted} gadgets)" if forced_demoted else "")
         + (f" (promoted {forced_promoted} apparel)" if forced_promoted else "")
     )
 
@@ -1265,6 +1498,42 @@ def migrate_wearables_to_fashion(db: Session) -> int:
     return len(rows)
 
 
+def migrate_force_general_to_general(db: Session) -> int:
+    """One-shot DB migration: any existing Fashion-tab row whose
+    title / product_type / handle / image_url matches the wearable-
+    gadget allowlist (smartwatches, posture correctors, dog raincoats,
+    magnifying glasses, trekking poles, etc.) gets demoted to
+    is_fashion=False with subniche re-bucketed to a sensible General
+    label. Implements the user's 'function over form' rule: items
+    chosen for FUNCTION (medical, safety, utility, smart-tech, pet
+    protective gear) belong on General even when they are worn or
+    carried.
+
+    Idempotent — safe to call on every restart.
+    """
+    rows = db.query(Product).filter(Product.is_fashion == True).all()
+    demoted = 0
+    for product in rows:
+        if not _is_forced_general(
+            title=product.title or "",
+            product_type=product.product_type or "",
+            handle=product.handle or "",
+            product_url=product.product_url or "",
+            image_url=product.image_url or "",
+        ):
+            continue
+        product.is_fashion = False
+        product.subniche = _classify_general_subniche(product.title or "")
+        demoted += 1
+    if demoted:
+        db.commit()
+        logger.info(
+            f"migrate_force_general_to_general: demoted {demoted} "
+            f"wearable-gadget rows from Fashion to General"
+        )
+    return demoted
+
+
 def migrate_apparel_to_fashion(db: Session) -> int:
     """One-shot DB migration: any existing General-tab row whose title,
     product_type, handle, product_url, or image_url matches the
@@ -1279,12 +1548,23 @@ def migrate_apparel_to_fashion(db: Session) -> int:
     rows = db.query(Product).filter(Product.is_fashion == False).all()
     promoted = 0
     for product in rows:
+        title = product.title or ""
+        ptype = product.product_type or ""
+        handle = product.handle or ""
+        purl = product.product_url or ""
+        iurl = product.image_url or ""
+        # FORCE_GENERAL precedence — function-over-form items must
+        # NEVER be promoted by the apparel migration even if the title
+        # also matches an apparel pattern (e.g. 'orthopedic insoles'
+        # has 'orthopedic' but is a medical accessory, not footwear).
+        if _is_forced_general(
+            title=title, product_type=ptype, handle=handle,
+            product_url=purl, image_url=iurl,
+        ):
+            continue
         if not _is_forced_fashion(
-            title=product.title or "",
-            product_type=product.product_type or "",
-            handle=product.handle or "",
-            product_url=product.product_url or "",
-            image_url=product.image_url or "",
+            title=title, product_type=ptype, handle=handle,
+            product_url=purl, image_url=iurl,
         ):
             continue
         product.is_fashion = True

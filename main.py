@@ -24,6 +24,7 @@ from scraper import (
     cleanup_non_product_rows,
     migrate_wearables_to_fashion,
     migrate_apparel_to_fashion,
+    migrate_force_general_to_general,
 )
 from seed import seed_stores
 
@@ -47,7 +48,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # Override at deploy time with the TRUST_EPOCH_UTC env var (ISO 8601).
 # Default is the most recent significant change — bump it when shipping
 # a cap change, hard-drop tightening, schema migration, etc.
-_DEFAULT_TRUST_EPOCH = datetime(2026, 5, 2, 0, 0, 0)
+_DEFAULT_TRUST_EPOCH = datetime(2026, 5, 3, 0, 0, 0)
 
 
 def _parse_trust_epoch(raw: Optional[str]) -> datetime:
@@ -151,6 +152,16 @@ async def lifespan(app: FastAPI):
         migrate_apparel_to_fashion(db)
     except Exception as e:
         logger.warning(f"startup apparel migration failed: {e}")
+    try:
+        # Function-over-form sweep: demote any Fashion-tab row that's
+        # actually a wearable gadget (smartwatch, posture corrector,
+        # dog raincoat, magnifying glass, trekking pole, etc.). Runs
+        # AFTER the apparel migration so anything legitimately on
+        # Fashion stays on Fashion, and only the function-driven
+        # items get pulled back to General.
+        migrate_force_general_to_general(db)
+    except Exception as e:
+        logger.warning(f"startup force-general migration failed: {e}")
     finally:
         db.close()
     # Schedule daily scrape at 6 AM UTC

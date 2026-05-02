@@ -1,8 +1,69 @@
 """Gemini-powered fashion classifier (BEST-EFFORT enrichment, NOT a feed gate).
 
+==========================================================================
+USER RULE — FASHION vs GENERAL (the line, in plain English)
+==========================================================================
+
+The deciding question for every product is:
+
+    "Is this product chosen primarily because of how it makes you LOOK
+     (style/aesthetic), or for what it DOES (function/medical/safety/
+     utility)?"
+
+If STYLE dominates → FASHION. If FUNCTION dominates → GENERAL.
+This is true EVEN IF the product is worn or carried on the body.
+
+FASHION (is_fashion=true):
+  - Apparel, footwear, hats, scarves, belts, gloves, ties, swimwear,
+    intimates, sleepwear, robes, pyjamas
+  - Jewelry, classic/mechanical/quartz/style watches
+  - Bags chosen for style: handbags, totes, wallets, clutches, backpacks,
+    make-up bags, watch holder travel cases, felt bag organisers
+  - Sunglasses, prescription/reading/style eyewear
+  - Costumes: Halloween masks, cosplay, fancy dress, mascot costumes,
+    pet costumes (dress-up, NOT functional pet wear)
+  - Pet items chosen primarily for STYLE: decorative pet bandanas, fancy
+    pet bowties, fashion pet hats
+
+GENERAL (is_fashion=false), even when wearable:
+  - Smartwatches, fitness trackers, fitness/smart bands, smart rings,
+    smart glasses, ECG/blood-pressure/blood-sugar wrist monitors
+  - Wearable medical: posture correctors, support bands, knee/back/
+    elbow/wrist/ankle braces, orthopedic insoles, toe spacers, foot
+    pain relief pads, gel cushions, compression sleeves/socks/
+    stockings (medical grade), sciatica relief belts
+  - Wearable safety/utility: LED safety lights/lamps including LED dog
+    collars, reflective safety vests, self-defense devices/sticks,
+    trekking poles, walking sticks, magnifying glasses (even with
+    neck strap), umbrellas
+  - Pet protective gear (NOT style): pet raincoats, harnesses, muzzles,
+    leashes, paw booties, training collars, e-collars
+  - Wearable beauty devices: face/facial massagers, beauty wands,
+    snap-on cosmetic veneers, posture-correcting bras (medical, NOT
+    lingerie/shapewear)
+  - Carried/handheld items even with neck/wrist straps: monoculars,
+    telescopes, magnifying glasses, cameras
+
+Edge-case examples:
+  - Smartwatch        → GENERAL
+  - Classic mechanical/quartz watch → FASHION
+  - LED dog collar    → GENERAL
+  - Decorative dog bandana → FASHION
+  - Posture corrector → GENERAL
+  - Shapewear         → FASHION
+  - Trekking pole     → GENERAL
+  - Umbrella          → GENERAL (utility)
+  - Dog raincoat      → GENERAL
+  - Halloween costume → FASHION (dress-up)
+
+==========================================================================
+
 Gemini reads a product title/vendor and returns:
-  - is_fashion: bool (clothing/shoes/bags vs. obvious junk like gift cards
-                 and shipping protection)
+  - is_fashion: bool (style-driven wearable vs function-driven /
+                 non-physical add-on)
+  - subniche: high-level bucket label (fashion / bags / jewelry /
+              accessories / electronics / home / beauty / health / food
+              / toys-books / exclude / other)
   - ai_tags: short English keyword list for multi-language search
 
 This module is purely additive. Products arrive with is_fashion=True already
@@ -10,6 +71,13 @@ set by the scraper. We only FLIP to False on items Gemini explicitly marks
 non-fashion. Missing API key, batch failure, missing item in the response —
 all of those leave is_fashion alone, so a Gemini outage never empties the
 bestseller feed.
+
+Hard-coded regex layers in scraper.py (FORCE_FASHION_RE / FORCE_GENERAL_RE)
+override Gemini for the obvious cases — multilingual apparel keywords promote
+to Fashion, multilingual wearable-gadget keywords demote to General. The
+function-over-form rule wins precedence: FORCE_GENERAL_RE always beats
+FORCE_FASHION_RE when both match (e.g. 'smartwatch' → General even though
+'watch' alone would be Fashion).
 """
 import os
 import json
@@ -73,22 +141,49 @@ async def _classify_batch_with_gemini(batch: list, api_key: str, model: str):
     ]
 
     prompt = (
-        "You are a STRICT product classifier for a Shopify bestseller tracker.\n"
+        "You are a STRICT product classifier for a Shopify bestseller tracker.\n\n"
+        "THE DECIDING QUESTION for every product is:\n"
+        "  'Is this chosen primarily because of how it makes you LOOK\n"
+        "   (style/aesthetic), or for what it DOES (function / medical /\n"
+        "   safety / utility / smart-tech)?'\n"
+        "If STYLE dominates → FASHION. If FUNCTION dominates → GENERAL.\n"
+        "This is true EVEN IF the product is worn or carried on the body.\n\n"
         "Two parallel feeds use your output, plus an 'exclude' bucket:\n"
-        "  - Fashion feed (is_fashion=true): EVERYTHING people wear or carry on\n"
-        "    their person. Clothing, footwear, intimates/underwear, eyewear,\n"
-        "    swimwear, sleepwear, bags, jewelry, watches, accessories. If a\n"
-        "    HUMAN can wear it, it is fashion — this includes orthopedic shoes,\n"
-        "    bathrobes, lingerie, bras, panties, socks, tights, sunglasses,\n"
-        "    reading glasses, progressive lenses, beach sandals, slippers,\n"
-        "    wedding-guest dresses. Apparel-shaped therapy products (e.g.\n"
-        "    'magnetic massage underwear', 'shapewear', compression hosiery)\n"
-        "    are STILL fashion — the form factor wins.\n"
-        "  - General feed (is_fashion=false, subniche != exclude): non-wearable\n"
-        "    physical products (electronics, home, beauty, health, food, toys-books,\n"
-        "    other), grouped by subniche.\n"
+        "  - Fashion feed (is_fashion=true): style-driven wearables.\n"
+        "    Apparel, footwear, intimates, sleepwear, eyewear, hats, scarves,\n"
+        "    belts, swimwear, classic/mechanical/quartz watches, jewelry,\n"
+        "    style bags (handbags, totes, wallets, make-up bags, felt bag\n"
+        "    organisers, watch holder cases). Costumes COUNT (Halloween,\n"
+        "    cosplay, fancy dress, pet costumes for dress-up). Pet items\n"
+        "    chosen for STYLE (decorative bandanas, fancy bowties) too.\n"
+        "  - General feed (is_fashion=false, subniche != exclude): function-\n"
+        "    driven physical products, INCLUDING wearable-but-functional ones\n"
+        "    (smartwatches, fitness trackers, posture correctors, support\n"
+        "    bands, orthopedic insoles, toe spacers, gel cushions, compression\n"
+        "    medical hosiery, LED dog collars, dog raincoats, harnesses,\n"
+        "    muzzles, leashes, training/e-collars, magnifying glasses with\n"
+        "    neck straps, trekking poles, walking sticks, self-defense sticks,\n"
+        "    umbrellas, snap-on cosmetic veneers, face massagers).\n"
         "  - Excluded (subniche='exclude'): items that are NOT physical products\n"
         "    at all — these are dropped entirely by the caller.\n\n"
+        "DISAMBIGUATION (memorise these):\n"
+        "  - smartwatch / fitness tracker / smart ring / smart band     → GENERAL\n"
+        "  - classic mechanical / quartz / style watch (jewelry-like)   → FASHION\n"
+        "  - LED dog collar                                              → GENERAL\n"
+        "  - decorative pet bandana / fancy pet bowtie                   → FASHION\n"
+        "  - posture corrector / posture brace / back brace              → GENERAL\n"
+        "  - shapewear / bodyshaper / waist trainer (style)              → FASHION\n"
+        "  - dog raincoat / harness / muzzle / leash / paw booties       → GENERAL\n"
+        "  - dog costume / superhero costume / Halloween mask            → FASHION\n"
+        "  - trekking pole / walking stick / self-defense stick          → GENERAL\n"
+        "  - umbrella                                                    → GENERAL\n"
+        "  - magnifying glass (even with neck strap)                     → GENERAL\n"
+        "  - snap-on cosmetic veneers / face massager / beauty wand      → GENERAL\n"
+        "  - orthopedic shoes / orthoschuh                               → FASHION\n"
+        "  - orthopedic insoles / toe spacers / gel foot pads            → GENERAL\n"
+        "  - bathrobe / pajamas / sleepwear / loungewear                 → FASHION\n"
+        "  - compression medical socks / surgical stockings              → GENERAL\n"
+        "  - regular fashion socks / tights / hosiery                    → FASHION\n\n"
         "For EACH product below, decide:\n"
         "  1. is_fashion: true for ANY apparel/footwear/intimates/eyewear/bag/\n"
         "                 jewelry/accessory category listed below. False for\n"
@@ -374,56 +469,59 @@ async def classify_products_batch(products: list):
 
 
 _RECLASSIFY_STRICT_QUESTION = (
-    "Is this product WORN ON THE BODY, or used TO DRESS THE BODY, or "
-    "used as a WEARABLE ACCESSORY?\n\n"
-    "Examples that are YES (is_fashion=true):\n"
-    " - Clothing of any kind (shirts, dresses, pants, jackets, coats, "
-    "bathrobes, robes, pajamas, sleepwear, loungewear, ponchos)\n"
-    " - Shoes / footwear (sneakers, boots, sandals, slippers, slip-ons, "
-    "heels, orthopedic / diabetic shoes, shoe covers)\n"
-    " - Underwear / intimates (panties, briefs, boxers, thongs, bras, "
-    "lingerie, shapewear, hosiery, tights, stockings, socks, slips)\n"
-    " - Eyewear (sunglasses, glasses, reading glasses, progressive "
-    "lenses, frames, eyewear, NOT magnifying glasses or hearing aids)\n"
-    " - Hats, scarves, belts, gloves, ties, umbrellas, wallets\n"
-    " - Bags (handbags, backpacks, totes, clutches, crossbody, pouches)\n"
-    " - Jewelry (necklaces, earrings, rings, bracelets, pendants, "
-    "watches, anklets, brooches, chokers)\n"
-    " - Swimwear (bikinis, swimsuits, board shorts)\n"
-    " - Wedding apparel (bride dresses, wedding-guest dresses)\n"
-    " - Pet collars, pet harnesses, pet clothes, pet sweaters, pet "
-    "raincoats, pet boots — these COUNT as wearable accessories.\n\n"
-    "Examples that are NO (is_fashion=false):\n"
-    " - Toys, games, books, stationery\n"
-    " - Electronics (phones, cases, chargers, headphones, cameras, SSDs)\n"
-    " - Home decor (lamps, candles, furniture, kitchenware, bedding, rugs)\n"
-    " - Beauty (skincare, makeup, perfume, hair tools)\n"
-    " - Health (supplements, vitamins, medical aids, braces, urine bags)\n"
-    " - Food / drinks / supplements\n"
-    " - Tools / hardware / pest control / outdoor gear\n"
-    " - Pet food, pet beds, pet cushions, pet treats\n"
-    " - Costumes (Halloween, cosplay, superhero, latex masks) — these "
-    "are NOT fashion, they're toys.\n"
-    " - Watch boxes (storage), magnifying glasses, foot pain pads, "
-    "walking sticks, gel cushions, hearing aids."
+    "Is this product chosen primarily because of how it makes you LOOK\n"
+    "(STYLE / aesthetic), as opposed to what it DOES (function /\n"
+    "medical / safety / utility / smart-tech)?\n\n"
+    "STYLE-driven (is_fashion=true):\n"
+    " - Clothing, footwear, intimates, sleepwear, swimwear, robes,\n"
+    "   pajamas, ponchos\n"
+    " - Hats, scarves, belts, gloves, ties\n"
+    " - Sunglasses / reading glasses / style eyewear\n"
+    " - Style bags: handbags, totes, wallets, clutches, backpacks,\n"
+    "   make-up bags, watch holder travel cases, felt bag organisers\n"
+    " - Jewelry, classic mechanical / quartz / style watches\n"
+    " - Costumes: Halloween masks, cosplay, fancy dress, superhero\n"
+    "   costumes, mascot costumes, dog/pet COSTUMES (dress-up)\n"
+    " - Pet items chosen for STYLE: decorative bandanas, fancy bowties\n"
+    " - Shapewear / bodyshapers / waist trainers (style)\n\n"
+    "FUNCTION-driven (is_fashion=false), even if wearable:\n"
+    " - Smartwatches, fitness trackers, fitness/smart bands, smart\n"
+    "   rings, smart glasses, ECG/blood-pressure/blood-sugar wrist\n"
+    "   monitors, senior smartwatches\n"
+    " - Wearable medical: posture correctors, support bands, knee/\n"
+    "   back/elbow braces, orthopedic insoles, toe spacers, gel\n"
+    "   cushions, foot pain relief pads, compression sleeves/socks/\n"
+    "   stockings (medical), sciatica relief belts, hip and thigh\n"
+    "   support bands\n"
+    " - Wearable safety/utility: LED safety lamps including LED dog\n"
+    "   collars, reflective safety vests, self-defense devices/sticks,\n"
+    "   trekking poles, walking sticks, magnifying glasses (even with\n"
+    "   neck strap), umbrellas\n"
+    " - Pet protective gear (NOT style): pet raincoats, harnesses,\n"
+    "   muzzles, leashes, paw booties, training collars, e-collars\n"
+    " - Wearable beauty devices: face/facial massagers, beauty wands,\n"
+    "   snap-on cosmetic veneers, posture-correcting bras (medical)\n"
+    " - Carried/handheld even with neck or wrist strap: monoculars,\n"
+    "   telescopes, magnifying glasses, cameras\n"
+    " - Standard non-wearable buckets: home decor (lamps, candles,\n"
+    "   kitchenware, bedding), electronics (phones, SSDs, headphones),\n"
+    "   beauty (skincare, makeup, hair tools), health (supplements,\n"
+    "   medical aids), food, tools, hardware, pet beds/cushions, toys"
 )
 
 _RECLASSIFY_BROAD_QUESTION = (
-    "Could a reasonable person consider this product to be in the "
-    "FASHION, APPAREL, FOOTWEAR, ACCESSORY, EYEWEAR, JEWELRY, or "
-    "WEARABLE category?\n\n"
-    "If a person could wear it, carry it on their person, dress "
-    "themselves with it, or buy it specifically to dress their pet, "
-    "the answer is YES.\n\n"
-    "If it's a household object, decoration, electronic device, "
-    "beauty/health/food product, kitchenware, tool, pet bed/food/treat, "
-    "OR specifically a costume / Halloween mask / cosplay item, the "
-    "answer is NO.\n\n"
-    "Be DECISIVE — when in doubt, say YES rather than NO. The cost of "
-    "false positives (a borderline home item ending up on Fashion) is "
-    "far less than the cost of false negatives (real apparel staying on "
-    "General). When the title is opaque, lean on the handle (URL slug) "
-    "and image_url (CDN filename) — those reveal the category."
+    "Apply the STYLE-vs-FUNCTION rule one more time, leaning slightly\n"
+    "toward STYLE when the title is ambiguous but the product is\n"
+    "clearly something a person would buy to look or feel attractive.\n\n"
+    "Bavarian/Oktoberfest/Dirndl/Lederhosen/kimono/sari/kilt/kids'\n"
+    "wearable sleep sacks/onesies/footed pajamas/Christmas-jumper-style\n"
+    "items all count as STYLE (FASHION).\n\n"
+    "But the FUNCTION-driven exclusions still apply STRICTLY: a smart-\n"
+    "watch is GENERAL, a posture corrector is GENERAL, a dog raincoat\n"
+    "is GENERAL, a magnifying glass with neck strap is GENERAL, a\n"
+    "trekking pole is GENERAL — even if you 'wear' or 'carry' them.\n"
+    "Costumes / Halloween masks / cosplay / superhero costumes / pet\n"
+    "costumes are ALL fashion (dress-up = style)."
 )
 
 

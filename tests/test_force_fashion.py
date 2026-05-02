@@ -93,6 +93,11 @@ _LIVE_SNAPSHOT_LEAKERS = [
     # pinning. Pin them here so any future regex regression fails loud.
     "Ilsa - Authentisch Traditionelles Oktoberfest Ensemble",
     "Foldable Kids' Sleeping Bag in Animal Shape – Snoozi",
+    # === Costumes (per FASHION vs GENERAL rule, dress-up = style) ===
+    "BowLift | Realistic Superhero Costume for Kids & Adults",
+    "BowLift | Realistic Latex Mask | Halloween Cosplay Costume | Full Face",
+    "Large Dog Skeleton Bodysuit Costume",
+    "BowLift | Creepy Old Man Mask – Realistic Latex Halloween Mask for Adults",
 ]
 
 
@@ -116,16 +121,8 @@ _LEGITIMATE_GENERAL_TITLES = [
     "Portable SSD External Drive with High-Speed Data Transfer and Compact Design",
     "BowLift | Smart Robot",
     "Cordless Hair Clipper for Precision Grooming and Styling",
-    "BowLift | Realistic Latex Mask | Halloween Cosplay Costume | Full Face",
-    "BowLift | Realistic Superhero Costume for Kids & Adults",
-    "Large Dog Skeleton Bodysuit Costume",
-    "ComfortStep Morton's Neuroma and Metatarsalgia Relief Pads | Gel Cushion and Metatarsal Support",
-    "BowLift | Hands-Free Magnifying Glass with Neck Strap - 5X Magnification for Reading",
-    "Elegante Herren Uhrenbox",
-    "BowLift | Hip and Thigh Support Band for Pain Relief",
     "Bathroom Bar Wall Light For Above Mirror",
     "Bowling-style Pin Decoration",
-    "BowLift | Snap-On Cosmetic Veneers",
     "BowLift | Mustang Car Shaped Whiskey Decanter",
     "Acrylic Light-Up Reindeer Lawn Ornament",
 ]
@@ -247,12 +244,14 @@ def test_migrate_apparel_preserves_existing_wearable_subniche(db, store):
 
 
 def test_migrate_apparel_skips_legitimate_general_rows(db, store):
-    """Lamps, costumes, hair tools must stay on General after the
+    """Lamps, hair tools, table runners must stay on General after the
     migration runs — the safety net should not paint everything as
-    fashion."""
+    fashion. (Costumes ARE fashion under the style-vs-function rule,
+    so they're tested as positives in the leakers list above, not here.)
+    """
     safe_cases = [
         ("legacy-lamp", "Bauhaus Colored Glass Pendant Light", "home"),
-        ("legacy-costume", "BowLift | Realistic Superhero Costume", "other"),
+        ("legacy-decanter", "Mustang Car Shaped Whiskey Decanter", "home"),
         ("legacy-hairtool", "Cordless Hair Clipper for Styling", "beauty"),
     ]
     for handle, title, sub in safe_cases:
