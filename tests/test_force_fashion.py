@@ -88,6 +88,11 @@ _LIVE_SNAPSHOT_LEAKERS = [
     "Wasserdichter und unzerstörbarer Schuhüberzug",                  # DE compound shoe
     "von Salkin",                                                     # truncated brand
     "BowLift | Men's Magnetic Massage Underwear | Supportive Comfort Design",
+    # Traditional / cultural / kids-wearable survivors that slipped past
+    # the Gemini-driven reclassify endpoint and required explicit regex
+    # pinning. Pin them here so any future regex regression fails loud.
+    "Ilsa - Authentisch Traditionelles Oktoberfest Ensemble",
+    "Foldable Kids' Sleeping Bag in Animal Shape – Snoozi",
 ]
 
 
@@ -122,7 +127,6 @@ _LEGITIMATE_GENERAL_TITLES = [
     "Bowling-style Pin Decoration",
     "BowLift | Snap-On Cosmetic Veneers",
     "BowLift | Mustang Car Shaped Whiskey Decanter",
-    "Foldable Kids' Sleeping Bag in Animal Shape – Snoozi",
     "Acrylic Light-Up Reindeer Lawn Ornament",
 ]
 

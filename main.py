@@ -1015,6 +1015,53 @@ async def debug_env():
     }
 
 
+class ForcePromotePayload(BaseModel):
+    handles: list[str] = []
+    ids: list[int] = []
+
+
+@app.post("/api/admin/force-promote")
+async def force_promote(req: ForcePromotePayload, db: Session = Depends(get_db)):
+    """Escape hatch: force is_fashion=True on a hand-picked list of
+    products by handle (Shopify slug) or DB id. Used to resolve
+    Gemini false negatives the operator catches in manual review —
+    Oktoberfest Ensembles, kids' sleep sacks, brand-cryptic titles
+    that no automated check can resolve.
+
+    Subniche is rewritten to 'fashion' unless the row already had a
+    wearable subniche (jewelry/bags/accessories), which is preserved.
+    Idempotent: items already on Fashion remain unchanged.
+    """
+    from scraper import WEARABLE_SUBNICHES
+
+    if not req.handles and not req.ids:
+        raise HTTPException(status_code=400, detail="Provide handles or ids.")
+
+    q = db.query(Product)
+    filters = []
+    if req.handles:
+        filters.append(Product.handle.in_(req.handles))
+    if req.ids:
+        filters.append(Product.id.in_(req.ids))
+    rows = q.filter(or_(*filters)).all() if filters else []
+
+    promoted = []
+    for p in rows:
+        was_fashion = bool(p.is_fashion)
+        p.is_fashion = True
+        sub = (p.subniche or "").strip().lower()
+        if sub not in WEARABLE_SUBNICHES:
+            p.subniche = "fashion"
+        promoted.append({
+            "id": p.id, "handle": p.handle, "title": p.title,
+            "store": p.store.name if p.store else "",
+            "previous_subniche": sub, "was_already_fashion": was_fashion,
+        })
+    if promoted:
+        db.commit()
+    return {"matched_count": len(rows), "promoted": promoted}
+
+
 @app.post("/api/admin/reclassify-general")
 async def reclassify_general(
     framing: str = Query(

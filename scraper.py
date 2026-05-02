@@ -360,6 +360,17 @@ _FORCE_FASHION_PATTERNS = [
     r"\bvestido[\s\-]de[\s\-]novia\b",
     # === Strong fashion signals ===
     r"\bnahtlos\w*", r"\bseamless\b",
+    # === Traditional / ethnic / cultural apparel ===
+    # Oktoberfest 'Ensemble' titles slip past the title-only Gemini
+    # check (Ensemble = music ensemble in another reading) — pin them
+    # via regex so they always promote.
+    r"\boktoberfest\w*", r"\bdirndl\w*", r"\blederhose\w*",
+    r"\btrachten?\w*", r"\bkimono\w*", r"\bkilt\b",
+    # === Kids' wearable sleep-sacks (sleeping bag shaped to wear) ===
+    r"\bsleep[\s\-]?sack\w*", r"\bschlafsack\w*", r"\bsnoozi\b",
+    # === Christmas / seasonal apparel-motif tokens ===
+    r"\bsnowman[\s\-]?motif\b", r"\bchristmas[\s\-]?jumper\b",
+    r"\bweihnachtspulli\w*", r"\bweihnachtspullover\w*",
     # === Brand tokens (truncated titles per user spec) ===
     r"\bsalkin\b", r"\bsakin\b",
 ]
