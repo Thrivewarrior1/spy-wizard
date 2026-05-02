@@ -22,6 +22,7 @@ from scraper import (
     reset_all_labels,
     debug_fetch,
     cleanup_non_product_rows,
+    migrate_wearables_to_fashion,
 )
 from seed import seed_stores
 
@@ -133,6 +134,13 @@ async def lifespan(app: FastAPI):
         cleanup_non_product_rows(db)
     except Exception as e:
         logger.warning(f"startup junk cleanup failed: {e}")
+    try:
+        # Promote legacy jewelry/accessories/bags rows from General to
+        # Fashion so the user-visible reclassification takes effect on
+        # the next page load instead of waiting for tomorrow's scrape.
+        migrate_wearables_to_fashion(db)
+    except Exception as e:
+        logger.warning(f"startup wearable migration failed: {e}")
     finally:
         db.close()
     # Schedule daily scrape at 6 AM UTC
@@ -301,6 +309,11 @@ def _singularize(term: str) -> set:
 # "Stud Studded Loops" with no obvious keyword. Keys are the canonical
 # subniche labels Gemini emits in classifier.py.
 SUBNICHE_SYNONYMS = {
+    "bags": [
+        "bag", "handbag", "handbags", "backpack", "backpacks", "tote",
+        "totes", "clutch", "clutches", "wallet", "wallets", "purse",
+        "purses", "crossbody", "pouch", "pouches", "satchel", "satchels",
+    ],
     "jewelry": [
         "jewellery", "jewel", "jewels", "earring", "earrings", "necklace",
         "necklaces", "ring", "rings", "bracelet", "bracelets", "pendant",
@@ -464,17 +477,18 @@ def build_search_filters(search_query: str):
 
 
 def build_ai_tag_filters(search_query: str):
-    """AND-of-words match across ai_tags + product_type + subniche,
-    with naive singularisation so 'bags' matches both 'bag' and 'bags'
-    tags. subniche is included here for the same reason as in
-    _word_match_condition — it's the canonical Gemini category label
-    that lets opaque titles still match a topical search.
+    """AND-of-words match across ai_tags + product_type + subniche.
+    Each word is expanded via expand_single_term so naive plurals,
+    multi-language translations, and subniche reverse-lookup
+    ('earring' → 'jewelry') ALL participate on the primary search
+    path — otherwise the fallback would miss subniche-only hits
+    whenever the ai_tags query returns any unrelated results.
     """
     words = [w for w in search_query.lower().split() if w]
     conds = []
     for w in words:
         word_or = []
-        for variant in _singularize(w):
+        for variant in expand_single_term(w):
             if len(variant) < 3:
                 continue
             for col in AI_TAG_SEARCH_COLUMNS:

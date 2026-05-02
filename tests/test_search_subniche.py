@@ -79,6 +79,18 @@ def test_canonical_subniche_label_expands_to_synonyms():
     assert "necklace" in variants
 
 
+def test_pouch_term_expands_to_bags_subniche():
+    """Bags are now on the Fashion tab with subniche='bags'. Typing
+    'pouch' should match bags-tagged products via reverse-lookup."""
+    variants = expand_single_term("pouch")
+    assert "bags" in variants
+
+
+def test_handbag_term_expands_to_bags_subniche():
+    variants = expand_single_term("handbag")
+    assert "bags" in variants
+
+
 def test_search_matches_product_with_only_subniche_set(db, store):
     """An opaque-titled product whose only category info is in the
     subniche column must surface for a related search term."""
@@ -112,16 +124,17 @@ def test_search_for_subniche_matches_via_title_too(db, store):
     assert c.id not in hits
 
 
-def test_subniche_synonyms_cover_all_general_subniche_labels():
+def test_subniche_synonyms_cover_all_taggable_subniche_labels():
     """Every Gemini subniche label that we expect on real data should
-    have at least one English synonym registered, otherwise typing the
-    obvious keyword for that category wouldn't match.
-
-    'other' is intentionally empty (catch-all) and 'fashion' isn't a
-    General-feed subniche so they don't need synonyms."""
+    have at least one English synonym registered, otherwise typing
+    the obvious keyword for that category wouldn't match. Includes
+    the wearable categories now on Fashion (bags / accessories /
+    jewelry) plus the General-feed categories. 'fashion' is the
+    catch-all clothing/shoes label and 'other' is intentionally
+    empty, so neither needs synonyms here."""
     expected = {
-        "jewelry", "accessories", "electronics", "home", "beauty",
-        "health", "food", "toys-books",
+        "bags", "jewelry", "accessories", "electronics", "home",
+        "beauty", "health", "food", "toys-books",
     }
     missing = [k for k in expected if not SUBNICHE_SYNONYMS.get(k)]
     assert not missing, f"missing synonyms for: {missing}"

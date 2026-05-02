@@ -51,6 +51,14 @@ HISTORY_RETENTION_DAYS = 30
 # (catalog exhausted).
 MAX_PAGES = 100
 TARGET_FASHION = 300
+
+# Subniches that belong on the Fashion tab. Fashion now spans
+# clothing/shoes ('fashion'), bags, accessories (hats, scarves, belts,
+# sunglasses, etc.), AND jewelry (necklaces, earrings, rings, etc.).
+# Any product whose Gemini-assigned subniche is in this set is forced
+# to is_fashion=True regardless of what Gemini said for is_fashion —
+# wearables NEVER appear on the General tab.
+WEARABLE_SUBNICHES = {"fashion", "bags", "accessories", "jewelry"}
 # General-feed cap. 100 of each store's bestselling NON-fashion items
 # (gadgets, home decor, beauty, services like shipping protection, etc.)
 # get tracked separately on the General tab. Independent positions
@@ -646,11 +654,22 @@ async def scrape_store_bestsellers(
                 # pages, so per-feed hero/villain math stays meaningful.
                 # Anything Gemini flagged as 'exclude' (a non-product
                 # the regex missed) is dropped here too.
+                #
+                # Reconciliation: a wearable subniche
+                # (fashion/bags/accessories/jewelry) ALWAYS implies the
+                # Fashion feed even if Gemini accidentally returned
+                # is_fashion=false. Catches the case where Gemini
+                # classifies an earring as 'jewelry' but forgets to
+                # flip is_fashion. The user explicitly wants jewelry
+                # and accessories on Fashion, never on General.
                 for p in page_products:
                     if p.get("_excluded"):
                         continue
-                    if p.get("subniche") == "exclude":
+                    sub = (p.get("subniche") or "").strip().lower()
+                    if sub == "exclude":
                         continue
+                    if sub in WEARABLE_SUBNICHES:
+                        p["is_fashion"] = True
                     if p.get("is_fashion"):
                         if len(fashion) < target_fashion:
                             p["position"] = len(fashion) + 1
@@ -863,17 +882,37 @@ def update_products_in_db(
     fashion_ids = {p["shopify_id"] for p in fashion_products}
     general_ids = {p["shopify_id"] for p in general_products}
 
+    # Allowed subniches per feed. Fashion now spans clothing/shoes
+    # (subniche='fashion'), bags, accessories, AND jewelry — all
+    # 'wearable' categories. Anything else Gemini emits collapses to
+    # the safe default for that feed.
+    FASHION_SUBNICHES = {"fashion", "bags", "accessories", "jewelry"}
+    GENERAL_SUBNICHES = {
+        "electronics", "home", "beauty", "health", "food", "toys-books", "other",
+    }
+
     for product_data in fashion_products:
+        sub = (product_data.get("subniche") or "fashion").strip().lower()
+        if sub not in FASHION_SUBNICHES:
+            # Gemini said this was fashion but tagged it with a
+            # non-fashion subniche — fall back to the generic
+            # 'fashion' label rather than mixing General categories
+            # into the Fashion feed.
+            sub = "fashion"
         _upsert_one(
             db, store, existing_products, product_data,
-            is_fashion=True, subniche="fashion", now=now,
+            is_fashion=True, subniche=sub, now=now,
         )
 
     for product_data in general_products:
         sub = (product_data.get("subniche") or "other").strip().lower()
-        if sub == "fashion":
-            # Defensive: a misclassification slipped through. Treat as
-            # 'other' on the General feed rather than mixing labels.
+        if sub not in GENERAL_SUBNICHES:
+            # Defensive: Gemini routed a wearable-category subniche
+            # (fashion/bags/accessories/jewelry) into the general
+            # bucket. The is_fashion flag is the source of truth, but
+            # the subniche needs sanitising so the General feed query
+            # (subniche != '') doesn't surface it under a wearable
+            # label. Bucket as 'other'.
             sub = "other"
         _upsert_one(
             db, store, existing_products, product_data,
@@ -936,6 +975,29 @@ def update_products_in_db(
         + (f" (retired f={fashion_retired} g={general_retired})" if fashion_retired or general_retired else "")
         + (f" (purged {junk_purged} junk)" if junk_purged else "")
     )
+
+
+def migrate_wearables_to_fashion(db: Session) -> int:
+    """One-shot DB migration: any existing row stored as
+    is_fashion=False with a wearable subniche (jewelry, accessories,
+    bags) belongs on the Fashion tab under the new classification.
+    Flip is_fashion=True so the change takes effect immediately on
+    startup rather than waiting for the next scrape to re-classify
+    every store. Idempotent — safe to call on every restart.
+    """
+    rows = db.query(Product).filter(
+        Product.is_fashion == False,
+        Product.subniche.in_(list(WEARABLE_SUBNICHES - {"fashion"})),
+    ).all()
+    for p in rows:
+        p.is_fashion = True
+    if rows:
+        db.commit()
+        logger.info(
+            f"migrate_wearables_to_fashion: promoted {len(rows)} "
+            f"jewelry/accessories/bags rows to the Fashion feed"
+        )
+    return len(rows)
 
 
 def cleanup_non_product_rows(db: Session) -> int:
