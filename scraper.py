@@ -189,6 +189,159 @@ NON_FASHION_TITLE_RE = NON_PRODUCT_TITLE_RE
 NON_FASHION_TYPE_RE = NON_PRODUCT_TYPE_RE
 
 
+# Apparel / footwear / eyewear / intimates allowlist — multilingual safety
+# net inverted from NON_PRODUCT_*_RE. Items matching any pattern are
+# FORCED to is_fashion=True even if Gemini routed them to electronics/
+# home/beauty/health/other. The user's explicit directive: false
+# positives (a pet-goggle ending up on Fashion) are far less bad than
+# false negatives (a Bademantel staying on General). All twelve stores
+# ship across DE/FR/ES/IT/NL/UK markets so every category is covered
+# in those languages too.
+#
+# Compound-friendly tokens (Bademantel, Schuh, Unterwäsche) use \w*
+# rather than a trailing \b so they catch German compounds like
+# "Schuhüberzug" / "Frottee-Bademantel" / "Strumpfhosen" in one shot.
+_FORCE_FASHION_PATTERNS = [
+    # === Apparel — English ===
+    r"\bt[\s\-]?shirts?\b", r"\bblouses?\b", r"\bsweaters?\b",
+    r"\bhoodies?\b", r"\bjackets?\b", r"\bcoats?\b",
+    r"\bdress(?:es)?\b", r"\bskirts?\b",
+    r"\bjeans\b", r"\btrousers\b", r"\bjumpsuits?\b",
+    r"\brobes?\b", r"\bbathrobes?\b", r"\bbathoobe\b",
+    r"\bpajamas?\b", r"\bpyjamas?\b", r"\bnightgowns?\b",
+    r"\bsleepwear\b", r"\bloungewear\b", r"\bponcho\b",
+    r"\bcardigans?\b", r"\bleggings?\b", r"\boveralls?\b",
+    # === Apparel — German (compound-friendly) ===
+    r"\bhemden?\b", r"\bblusen?\b", r"\bpullover\w*",
+    r"\bjacken?\b", r"\bjacke\b",
+    r"\bm[äa]ntel\w*", r"\bmantel\w*",
+    r"\bkleid\w*", r"\br[öo]ck\b", r"\br[öo]cke\b",
+    r"\br[öo]cken\b", r"\br[öo]ckes\b",
+    r"\bhose\b", r"\bhosen\w*", r"\bjogginghose\w*",
+    r"\bsakkos?\b",
+    r"\bbademantel\w*", r"\bbademaentel\w*",
+    r"\bnachthemd\w*", r"\bschlafanzug\w*", r"\bschlafanz[üu]g\w*",
+    # === Apparel — French ===
+    r"\bchemises?\b", r"\bchemisiers?\b", r"\bblousons?\b",
+    r"\bvestes?\b", r"\bmanteaux\b", r"\bmanteau\b",
+    r"\bjupes?\b", r"\bpantalons?\b", r"\bpeignoirs?\b",
+    # === Apparel — Spanish ===
+    r"\bcamisas?\b", r"\bcamisetas?\b", r"\bblusas?\b",
+    r"\bsu[ée]teres?\b", r"\bchaquetas?\b", r"\babrigos?\b",
+    r"\bvestidos?\b", r"\bfaldas?\b", r"\bbatas?\b",
+    r"\bpijamas?\b",
+    # === Apparel — Italian ===
+    r"\bcamicie\b", r"\bcamicia\b", r"\bcamicette\b",
+    r"\bmaglioni?\b", r"\bgiacche?\b", r"\bcappotti?\b",
+    r"\bcappotto\b", r"\bvestiti?\b", r"\bvestito\b",
+    r"\bgonne?\b", r"\bpantaloni\b", r"\bvestaglie?\b",
+    # === Apparel — Dutch ===
+    r"\bjurken?\b", r"\bjurk\b", r"\brokken?\b", r"\bbroeken?\b",
+    r"\btruien?\b", r"\bjassen?\b", r"\bbadjassen?\b", r"\bbadjas\b",
+    # === Underwear / intimates — English ===
+    r"\bunderwear\b", r"\bunderpants\b", r"\bpanty\b", r"\bpanties\b",
+    r"\bbriefs?\b", r"\bboxers?\b", r"\bthongs?\b",
+    r"\bbras?\b", r"\blingerie\b", r"\bshapewear\b",
+    r"\bhosiery\b", r"\btights\b", r"\bstockings?\b", r"\bsocks?\b",
+    # === Underwear — German ===
+    r"\bunterw[äa]sche\w*", r"\bunterhose\w*",
+    r"\bmiederwaren\w*", r"\bstr[üu]mpfe\b",
+    r"\bstr[üu]mpfh[öo]se\w*", r"\bsocken\b",
+    # === Underwear — French ===
+    r"\bsous[\s\-]?v[êe]tements?\b", r"\bculottes?\b",
+    r"\bsoutien[\s\-]?gorges?\b", r"\bcollants\b",
+    r"\bchaussettes\b",
+    # === Underwear — Spanish ===
+    r"\bropa[\s\-]?interior\b", r"\bbragas?\b", r"\bbraguitas?\b",
+    r"\bsost[ée]nes?\b", r"\bsost[ée]n\b", r"\bmedias\b",
+    r"\bcalcetines\b",
+    # === Underwear — Italian ===
+    r"\bintimo\b", r"\bbiancheria[\s\-]?intima\b",
+    r"\breggisen[oi]\b", r"\bcalze\b",
+    # === Underwear — Dutch ===
+    r"\bondergoed\b", r"\bonderbroeken?\b", r"\bbehas?\b",
+    r"\bkousen\b", r"\bsokken\b",
+    # === Footwear — English ===
+    r"\bshoes?\b", r"\bsneakers?\b", r"\bboots?\b",
+    r"\bsandals?\b", r"\bslippers?\b", r"\bslip[\s\-]?ons?\b",
+    r"\bheels?\b", r"\bstilettos?\b", r"\bloafers?\b",
+    r"\bflats\b", r"\boxfords?\b",
+    # === Footwear — German (compound-friendly) ===
+    r"\borthoschuh\w*", r"\borthop[äa]disch\w*",
+    r"\bschuh\w*", r"\bstiefel\w*", r"\bsandalen\b",
+    r"\bhausschuh\w*", r"\bhalbschuh\w*",
+    # === Footwear — French ===
+    r"\bchaussures?\b", r"\bbottes?\b", r"\bsandales?\b",
+    r"\bbaskets?\b", r"\bescarpins?\b",
+    # === Footwear — Spanish ===
+    r"\bzapatos?\b", r"\bbotas?\b", r"\bsandalias?\b",
+    r"\bzapatillas?\b",
+    # === Footwear — Italian ===
+    r"\bscarpe\b", r"\bstivali\b", r"\bsandali\b",
+    # === Footwear — Dutch ===
+    r"\bschoenen\b", r"\blaarzen\b",
+    # === Eyewear ===
+    r"\bsunglasses\b", r"\bgoggles\b", r"\bglasses\b",
+    r"\beyewear\b",
+    r"\breading[\s\-]glasses\b", r"\bprogressive[\s\-]glasses\b",
+    r"\bbrillen?\b", r"\bsonnenbrille\w*", r"\blesebrille\w*",
+    r"\blunettes\b",
+    r"\bgafas\b",
+    r"\bocchiali\b",
+    r"\bbril\b",
+    # === Swimwear ===
+    r"\bbikinis?\b", r"\bswimsuits?\b", r"\bswimwear\b",
+    r"\bboard[\s\-]shorts?\b",
+    r"\bbademode\w*", r"\bbadeanz[üu]g\w*",
+    r"\bba[ñn]ador\w*",
+    r"\bcostumi?[\s\-]da[\s\-]bagno\b",
+    r"\bbadpak\w*",
+    # === Wedding apparel ===
+    r"\bhochzeit\w*", r"\bbrautkleid\w*", r"\bbrautjungfern\w*",
+    r"\bwedding[\s\-]?(?:dress|gown|guest)\w*",
+    r"\brobe[\s\-]de[\s\-]mari[ée]\w*",
+    r"\bvestido[\s\-]de[\s\-]novia\b",
+    # === Strong fashion signals ===
+    r"\bnahtlos\w*", r"\bseamless\b",
+    # === Brand tokens (truncated titles per user spec) ===
+    r"\bsalkin\b", r"\bsakin\b",
+]
+
+FORCE_FASHION_TITLE_RE = re.compile(
+    "|".join(_FORCE_FASHION_PATTERNS),
+    re.IGNORECASE,
+)
+
+# German "BH" / "B.H." abbreviation. The 2-letter form is too short to
+# live among the alternations safely (alternation order would matter),
+# so we keep it in its own regex and OR-merge in `_is_forced_fashion`.
+FORCE_FASHION_BH_RE = re.compile(r"\bbh\b|\bb\.h\.?", re.IGNORECASE)
+
+
+def _is_forced_fashion(
+    title: str = "",
+    product_type: str = "",
+    handle: str = "",
+    product_url: str = "",
+    image_url: str = "",
+) -> bool:
+    """True iff any field looks like apparel/footwear/eyewear/intimates.
+    Used as a safety net AFTER Gemini classification — a match here
+    forces is_fashion=True regardless of what Gemini said. Same field
+    surface as `_is_non_product`, since handle / product_url / image
+    paths often reveal a category Gemini missed (e.g. handle
+    'luxus-bademantel-damen' on a title that didn't include the word).
+    """
+    for field in (title, product_type, handle, product_url, image_url):
+        if not field:
+            continue
+        if FORCE_FASHION_TITLE_RE.search(field):
+            return True
+        if FORCE_FASHION_BH_RE.search(field):
+            return True
+    return False
+
+
 def _is_non_product(
     title: str = "",
     product_type: str = "",
@@ -670,6 +823,25 @@ async def scrape_store_bestsellers(
                         continue
                     if sub in WEARABLE_SUBNICHES:
                         p["is_fashion"] = True
+                    # Apparel / footwear / eyewear / intimates safety net.
+                    # Gemini occasionally routes Bademantel to 'home',
+                    # Unterwäsche to 'beauty', orthopedic shoes to
+                    # 'health', wedding dresses to 'other', etc. The
+                    # multilingual allowlist forces is_fashion=True for
+                    # any wearable category Gemini missed and rewrites
+                    # the subniche to 'fashion' so the upsert doesn't
+                    # later squash it back to a General-feed bucket.
+                    if _is_forced_fashion(
+                        title=p.get("title", ""),
+                        product_type=p.get("product_type", ""),
+                        handle=p.get("handle", ""),
+                        product_url=p.get("product_url", ""),
+                        image_url=p.get("image_url", ""),
+                    ):
+                        p["is_fashion"] = True
+                        if sub not in WEARABLE_SUBNICHES:
+                            p["subniche"] = "fashion"
+                            sub = "fashion"
                     if p.get("is_fashion"):
                         if len(fashion) < target_fashion:
                             p["position"] = len(fashion) + 1
@@ -942,6 +1114,30 @@ def update_products_in_db(
             product.subniche = ""
             junk_purged += 1
 
+    # Apparel / footwear / eyewear / intimates sweep. Promotes any
+    # is_fashion=False row that NOW matches the multilingual fashion
+    # allowlist (Bademantel, Unterwäsche, Orthoschuh, Brille, etc.)
+    # to is_fashion=True. Coerces the subniche to 'fashion' if it was
+    # previously a General bucket so downstream queries don't surface
+    # it under a non-wearable label.
+    forced_promoted = 0
+    for shopify_id, product in existing_products.items():
+        if product.is_fashion:
+            continue
+        if not _is_forced_fashion(
+            title=product.title or "",
+            product_type=product.product_type or "",
+            handle=product.handle or "",
+            product_url=product.product_url or "",
+            image_url=product.image_url or "",
+        ):
+            continue
+        product.is_fashion = True
+        sub = (product.subniche or "").strip().lower()
+        if sub not in WEARABLE_SUBNICHES:
+            product.subniche = "fashion"
+        forced_promoted += 1
+
     # Per-feed retirement. We never look at the OTHER feed's IDs when
     # deciding whether to retire — a product that moved feeds is already
     # represented in its new feed's list.
@@ -974,6 +1170,7 @@ def update_products_in_db(
         f"{len(general_products)} general"
         + (f" (retired f={fashion_retired} g={general_retired})" if fashion_retired or general_retired else "")
         + (f" (purged {junk_purged} junk)" if junk_purged else "")
+        + (f" (promoted {forced_promoted} apparel)" if forced_promoted else "")
     )
 
 
@@ -998,6 +1195,42 @@ def migrate_wearables_to_fashion(db: Session) -> int:
             f"jewelry/accessories/bags rows to the Fashion feed"
         )
     return len(rows)
+
+
+def migrate_apparel_to_fashion(db: Session) -> int:
+    """One-shot DB migration: any existing General-tab row whose title,
+    product_type, handle, product_url, or image_url matches the
+    multilingual apparel/footwear/eyewear/intimates allowlist gets
+    promoted to is_fashion=True with subniche='fashion' (unless it
+    already had a wearable subniche, in which case the subniche is
+    preserved). Sister to migrate_wearables_to_fashion — this one
+    handles items Gemini routed to electronics/home/beauty/health/
+    other that are clearly clothing/shoes/glasses/underwear.
+    Idempotent — safe to call on every restart.
+    """
+    rows = db.query(Product).filter(Product.is_fashion == False).all()
+    promoted = 0
+    for product in rows:
+        if not _is_forced_fashion(
+            title=product.title or "",
+            product_type=product.product_type or "",
+            handle=product.handle or "",
+            product_url=product.product_url or "",
+            image_url=product.image_url or "",
+        ):
+            continue
+        product.is_fashion = True
+        sub = (product.subniche or "").strip().lower()
+        if sub not in WEARABLE_SUBNICHES:
+            product.subniche = "fashion"
+        promoted += 1
+    if promoted:
+        db.commit()
+        logger.info(
+            f"migrate_apparel_to_fashion: promoted {promoted} "
+            f"apparel/footwear/eyewear/intimate rows to the Fashion feed"
+        )
+    return promoted
 
 
 def cleanup_non_product_rows(db: Session) -> int:
