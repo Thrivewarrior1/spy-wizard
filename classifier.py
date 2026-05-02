@@ -360,3 +360,220 @@ async def classify_products_batch(products: list):
         total, ok, failed, fashion_count,
     )
     return errors
+
+
+# ===================================================================
+# Wearable-focused reclassification — used by the admin endpoint to
+# scan the existing General tab for any item that should have been on
+# Fashion. The regex safety net catches the easy multilingual cases;
+# this function uses Gemini directly with an explicit "is this worn /
+# carried / used to dress?" framing so we catch translingual edge
+# cases, branded items with opaque titles, and image-only signals
+# (Shopify CDN path often reveals the category when the title doesn't).
+# ===================================================================
+
+
+_RECLASSIFY_STRICT_QUESTION = (
+    "Is this product WORN ON THE BODY, or used TO DRESS THE BODY, or "
+    "used as a WEARABLE ACCESSORY?\n\n"
+    "Examples that are YES (is_fashion=true):\n"
+    " - Clothing of any kind (shirts, dresses, pants, jackets, coats, "
+    "bathrobes, robes, pajamas, sleepwear, loungewear, ponchos)\n"
+    " - Shoes / footwear (sneakers, boots, sandals, slippers, slip-ons, "
+    "heels, orthopedic / diabetic shoes, shoe covers)\n"
+    " - Underwear / intimates (panties, briefs, boxers, thongs, bras, "
+    "lingerie, shapewear, hosiery, tights, stockings, socks, slips)\n"
+    " - Eyewear (sunglasses, glasses, reading glasses, progressive "
+    "lenses, frames, eyewear, NOT magnifying glasses or hearing aids)\n"
+    " - Hats, scarves, belts, gloves, ties, umbrellas, wallets\n"
+    " - Bags (handbags, backpacks, totes, clutches, crossbody, pouches)\n"
+    " - Jewelry (necklaces, earrings, rings, bracelets, pendants, "
+    "watches, anklets, brooches, chokers)\n"
+    " - Swimwear (bikinis, swimsuits, board shorts)\n"
+    " - Wedding apparel (bride dresses, wedding-guest dresses)\n"
+    " - Pet collars, pet harnesses, pet clothes, pet sweaters, pet "
+    "raincoats, pet boots — these COUNT as wearable accessories.\n\n"
+    "Examples that are NO (is_fashion=false):\n"
+    " - Toys, games, books, stationery\n"
+    " - Electronics (phones, cases, chargers, headphones, cameras, SSDs)\n"
+    " - Home decor (lamps, candles, furniture, kitchenware, bedding, rugs)\n"
+    " - Beauty (skincare, makeup, perfume, hair tools)\n"
+    " - Health (supplements, vitamins, medical aids, braces, urine bags)\n"
+    " - Food / drinks / supplements\n"
+    " - Tools / hardware / pest control / outdoor gear\n"
+    " - Pet food, pet beds, pet cushions, pet treats\n"
+    " - Costumes (Halloween, cosplay, superhero, latex masks) — these "
+    "are NOT fashion, they're toys.\n"
+    " - Watch boxes (storage), magnifying glasses, foot pain pads, "
+    "walking sticks, gel cushions, hearing aids."
+)
+
+_RECLASSIFY_BROAD_QUESTION = (
+    "Could a reasonable person consider this product to be in the "
+    "FASHION, APPAREL, FOOTWEAR, ACCESSORY, EYEWEAR, JEWELRY, or "
+    "WEARABLE category?\n\n"
+    "If a person could wear it, carry it on their person, dress "
+    "themselves with it, or buy it specifically to dress their pet, "
+    "the answer is YES.\n\n"
+    "If it's a household object, decoration, electronic device, "
+    "beauty/health/food product, kitchenware, tool, pet bed/food/treat, "
+    "OR specifically a costume / Halloween mask / cosplay item, the "
+    "answer is NO.\n\n"
+    "Be DECISIVE — when in doubt, say YES rather than NO. The cost of "
+    "false positives (a borderline home item ending up on Fashion) is "
+    "far less than the cost of false negatives (real apparel staying on "
+    "General). When the title is opaque, lean on the handle (URL slug) "
+    "and image_url (CDN filename) — those reveal the category."
+)
+
+
+async def reclassify_general_with_gemini(
+    products: list, framing: str = "strict",
+) -> tuple[list, list]:
+    """Run the focused 'is wearable?' check against `products` (each is
+    a dict with at least title, handle, product_type, image_url).
+    Returns (flagged, errors): `flagged` is the subset Gemini said yes
+    to, with a `reason` field attached describing why; `errors` is a
+    list of human-readable problem strings (empty when everything was
+    clean).
+
+    Each product is scored independently — we don't flip is_fashion
+    here, the caller decides what to do with the YES list.
+    """
+    if not products:
+        return [], []
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return [], ["GEMINI_API_KEY not set on server"]
+
+    question = (
+        _RECLASSIFY_STRICT_QUESTION if framing == "strict"
+        else _RECLASSIFY_BROAD_QUESTION
+    )
+
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer"},
+                "is_fashion": {"type": "boolean"},
+                "reason": {"type": "string"},
+            },
+            "required": ["index", "is_fashion", "reason"],
+        },
+    }
+
+    flagged: list = []
+    errors: list = []
+    total = len(products)
+    for start in range(0, total, BATCH_SIZE):
+        batch = products[start:start + BATCH_SIZE]
+        if start > 0:
+            await asyncio.sleep(INTER_BATCH_DELAY)
+
+        items = [
+            {
+                "index": idx,
+                "title": p.get("title", "") or "",
+                "handle": p.get("handle", "") or "",
+                "product_type": p.get("product_type", "") or "",
+                # Send only the CDN filename, not the full URL — saves
+                # tokens and the basename is the only signal-bearing part.
+                "image_filename": (p.get("image_url") or "").split("/")[-1].split("?")[0][:120],
+            }
+            for idx, p in enumerate(batch)
+        ]
+
+        prompt = (
+            f"{question}\n\n"
+            "For EACH product below, answer is_fashion=true or "
+            "is_fashion=false plus a 1-sentence reason. Use the title, "
+            "handle (URL slug), product_type (Shopify category), AND "
+            "image_filename together — sometimes the title is opaque "
+            "(e.g. 'Mia™ Premium Set') but the handle / image filename "
+            "reveals the category clearly.\n\n"
+            f"Products (JSON):\n{json.dumps(items, ensure_ascii=False)}\n\n"
+            "Respond with a JSON array, one object per product, matching "
+            "input indices."
+        )
+
+        ok, parsed_or_err = await _gemini_yesno_call(prompt, schema, api_key)
+        if not ok:
+            errors.append(parsed_or_err)
+            continue
+
+        for r in parsed_or_err:
+            i = r.get("index")
+            if not (isinstance(i, int) and 0 <= i < len(batch)):
+                continue
+            if not r.get("is_fashion"):
+                continue
+            entry = dict(batch[i])
+            entry["reclassify_reason"] = (r.get("reason") or "").strip()[:200]
+            flagged.append(entry)
+
+    logger.info(
+        "reclassify_general_with_gemini[%s]: flagged %d/%d (errors=%d)",
+        framing, len(flagged), total, len(errors),
+    )
+    return flagged, errors
+
+
+async def _gemini_yesno_call(prompt: str, schema: dict, api_key: str):
+    """Stripped-down Gemini call mirroring _classify_batch_with_gemini's
+    retry / fallback chain. Returns (ok, parsed_or_error_string).
+    Separate from _classify_batch_with_gemini because the caller wants
+    the raw parsed JSON array, not a side-effect mutation of `batch`.
+    """
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+        },
+    }
+    models = [GEMINI_PRIMARY] + [m for m in GEMINI_FALLBACKS if m != GEMINI_PRIMARY]
+    first_error = None
+    for model in models:
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                last_status = None
+                last_body = ""
+                for attempt in range(MAX_RETRIES):
+                    resp = await client.post(
+                        _gemini_url(model),
+                        params={"key": api_key},
+                        json=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    if resp.status_code == 200:
+                        break
+                    last_status = resp.status_code
+                    last_body = (resp.text or "")[:300].replace("\n", " ")
+                    if resp.status_code not in RETRY_STATUSES or attempt == MAX_RETRIES - 1:
+                        msg = f"[{model}] HTTP {resp.status_code}: {last_body}"
+                        if first_error is None:
+                            first_error = msg
+                        break
+                    wait = (2 ** (attempt + 1)) + random.uniform(0, 2)
+                    await asyncio.sleep(wait)
+                else:
+                    msg = f"[{model}] HTTP {last_status} after {MAX_RETRIES} retries: {last_body}"
+                    if first_error is None:
+                        first_error = msg
+                    continue
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(text)
+            return True, parsed
+        except Exception as e:
+            msg = f"[{model}] {type(e).__name__}: {e}"
+            if first_error is None:
+                first_error = msg
+            continue
+    return False, first_error or "unknown Gemini failure"

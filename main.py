@@ -1015,6 +1015,95 @@ async def debug_env():
     }
 
 
+@app.post("/api/admin/reclassify-general")
+async def reclassify_general(
+    framing: str = Query(
+        "strict",
+        pattern="^(strict|broad)$",
+        description="strict = body-worn focus; broad = fashion-adjacent",
+    ),
+    dry_run: bool = Query(
+        False, description="When true, return the flagged list without flipping is_fashion."
+    ),
+    db: Session = Depends(get_db),
+):
+    """One-shot Gemini-driven sweep over the General tab. For every
+    is_fashion=False row we currently track, ask Gemini directly:
+    'is this worn / carried / used to dress?' and promote everything
+    that comes back YES.
+
+    The regex safety net (FORCE_FASHION_TITLE_RE) catches obvious
+    multilingual cases at scrape time. This endpoint is the second
+    line — it catches translingual edge cases, branded items with
+    opaque titles, and image-only signals that the regex would miss.
+    Idempotent: a second call after promotion only flags items that
+    are STILL on General, so you can run it twice (strict then broad)
+    to mop up edge cases.
+
+    Skips items matching NON_PRODUCT_*_RE so junk (shipping protection,
+    surprise boxes, gift cards) isn't mistakenly resurrected to Fashion.
+    """
+    from classifier import reclassify_general_with_gemini
+    from scraper import _is_non_product, WEARABLE_SUBNICHES
+
+    rows = (
+        db.query(Product)
+        .filter(Product.is_fashion == False, Product.subniche != "")
+        .all()
+    )
+    candidates = []
+    for p in rows:
+        if _is_non_product(
+            title=p.title or "", product_type=p.product_type or "",
+            handle=p.handle or "", product_url=p.product_url or "",
+            image_url=p.image_url or "",
+        ):
+            continue
+        candidates.append({
+            "_id": p.id,
+            "title": p.title or "",
+            "handle": p.handle or "",
+            "product_type": p.product_type or "",
+            "image_url": p.image_url or "",
+            "store_name": p.store.name if p.store else "",
+            "subniche": p.subniche or "",
+        })
+
+    flagged, errors = await reclassify_general_with_gemini(candidates, framing=framing)
+
+    promoted = []
+    if not dry_run:
+        flagged_ids = {f["_id"] for f in flagged}
+        id_to_reason = {f["_id"]: f.get("reclassify_reason", "") for f in flagged}
+        for p in rows:
+            if p.id not in flagged_ids:
+                continue
+            p.is_fashion = True
+            sub = (p.subniche or "").strip().lower()
+            if sub not in WEARABLE_SUBNICHES:
+                p.subniche = "fashion"
+            promoted.append({
+                "id": p.id,
+                "title": p.title,
+                "store": p.store.name if p.store else "",
+                "handle": p.handle,
+                "previous_subniche": sub,
+                "reason": id_to_reason.get(p.id, ""),
+            })
+        if promoted:
+            db.commit()
+
+    return {
+        "framing": framing,
+        "dry_run": dry_run,
+        "candidates_scanned": len(candidates),
+        "flagged_count": len(flagged),
+        "promoted_count": len(promoted),
+        "promoted": promoted,
+        "errors": errors,
+    }
+
+
 @app.get("/api/debug/gemini")
 async def debug_gemini():
     """One-shot Gemini call against a synthetic 2-item batch.
