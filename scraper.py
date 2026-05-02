@@ -129,6 +129,32 @@ NON_PRODUCT_TITLE_RE = re.compile(
     r"|(?:verzendverzekering|bezorgverzekering|pakketverzekering)"
     r"|(?:cadeaubon|cadeaukaart)"
     r"|(?:uitgebreide\s*garantie)"
+    # === Surprise / mystery boxes — these are NOT real trackable
+    # === SKUs (the contents change every order) so we drop them
+    # === from both feeds. Same family as gift cards: a slot the
+    # === merchant fills with whatever, not a real product.
+    # English
+    r"|(?:surprise\s*(?:box|product|package|bag|item))"
+    r"|(?:mystery\s*(?:box|product|package|bag|item))"
+    r"|(?:blind\s*box|lucky\s*(?:bag|box)|grab\s*bag)"
+    # German (compounds — Überraschungsprodukt, Mysterybox, etc.)
+    r"|(?:[üu]berraschungs(?:produkt|paket|box|tasche|t[üu]te|artikel)?)"
+    r"|(?:ueberraschungs(?:produkt|paket|box|tasche|tuete|artikel)?)"
+    r"|(?:mystery[\s\-]?(?:box|paket|produkt))"
+    r"|(?:wundert[üu]te|wundertuete|gl[üu]ckst[üu]te|gluecktuete)"
+    # French
+    r"|(?:bo[îi]te\s*(?:myst[èe]re|mystere|surprise))"
+    r"|(?:produit\s*(?:myst[èe]re|mystere|surprise))"
+    r"|(?:pochette\s*surprise|sac\s*(?:myst[èe]re|mystere|surprise))"
+    # Spanish
+    r"|(?:caja\s*(?:sorpresa|misteriosa|misterio))"
+    r"|(?:producto\s*sorpresa|bolsa\s*sorpresa)"
+    # Italian
+    r"|(?:scatola\s*(?:sorpresa|mistero|misteriosa))"
+    r"|(?:prodotto\s*sorpresa|busta\s*sorpresa)"
+    # Dutch
+    r"|(?:verrassings(?:product|doos|pakket|tas))"
+    r"|(?:mysterie(?:doos|box|product|pakket))"
     r")(?=\b|$)",
     re.IGNORECASE,
 )
@@ -142,7 +168,19 @@ NON_PRODUCT_TYPE_RE = re.compile(
     r"protection[\s\-]*exp[ée]dition|carte\s*cadeau|"
     r"protecci[óo]n[\s\-]*env[íi]o|tarjeta[\s\-]*regalo|"
     r"protezione[\s\-]*spedizione|carta[\s\-]*regalo|"
-    r"verzendverzekering|cadeaubon"
+    r"verzendverzekering|cadeaubon|"
+    # Surprise / mystery box product types
+    r"surprise[\s\-]*(?:box|product|package|bag)|"
+    r"mystery[\s\-]*(?:box|product|package|bag)|"
+    r"blind[\s\-]*box|lucky[\s\-]*(?:bag|box)|grab[\s\-]*bag|"
+    r"[üu]berraschungs(?:produkt|paket|box|tasche|t[üu]te|artikel)?|"
+    r"ueberraschungs(?:produkt|paket|box|tasche|tuete|artikel)?|"
+    r"wundert[üu]te|wundertuete|gl[üu]ckst[üu]te|gluecktuete|"
+    r"bo[îi]te[\s\-]*(?:myst[èe]re|mystere|surprise)|"
+    r"caja[\s\-]*(?:sorpresa|misteriosa|misterio)|"
+    r"scatola[\s\-]*(?:sorpresa|mistero|misteriosa)|"
+    r"verrassings(?:product|doos|pakket|tas)|"
+    r"mysterie(?:doos|box|product|pakket)"
     r")\b",
     re.IGNORECASE,
 )
@@ -177,7 +215,23 @@ NON_PRODUCT_URL_RE = re.compile(
     r"assicurazione[\-_](?:spedizione|consegna|trasporto)|"
     r"carta[\-_]regalo|buono[\-_]regalo|garanzia[\-_]estesa|"
     r"verzendverzekering|bezorgverzekering|pakketverzekering|"
-    r"cadeaubon|cadeaukaart|uitgebreide[\-_]garantie"
+    r"cadeaubon|cadeaukaart|uitgebreide[\-_]garantie|"
+    # Surprise / mystery boxes (handles, image basenames)
+    r"surprise[\-_](?:box|product|package|bag|item)|"
+    r"mystery[\-_](?:box|product|package|bag|item)|"
+    r"blind[\-_]box|lucky[\-_](?:bag|box)|grab[\-_]bag|"
+    r"ueberraschungs(?:produkt|paket|box|tasche|tuete|artikel)?|"
+    r"u[\-_]?berraschungs(?:produkt|paket|box|tasche|tuete|artikel)?|"
+    r"wundertuete|gluecktuete|"
+    r"boite[\-_](?:mystere|surprise)|"
+    r"produit[\-_](?:mystere|surprise)|"
+    r"pochette[\-_]surprise|sac[\-_](?:mystere|surprise)|"
+    r"caja[\-_](?:sorpresa|misteriosa|misterio)|"
+    r"producto[\-_]sorpresa|bolsa[\-_]sorpresa|"
+    r"scatola[\-_](?:sorpresa|mistero|misteriosa)|"
+    r"prodotto[\-_]sorpresa|busta[\-_]sorpresa|"
+    r"verrassings(?:product|doos|pakket|tas)|"
+    r"mysterie(?:doos|box|product|pakket)"
     r")(?=$|[/\-_.?#])",
     re.IGNORECASE,
 )
