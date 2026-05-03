@@ -33,6 +33,10 @@ import pytest
 
 from scraper import (
     _distribute_page_to_feeds,
+    _truncate_page_to_cap,
+    MAX_SOURCE_POSITION,
+    TARGET_FASHION,
+    TARGET_GENERAL,
     WEARABLE_SUBNICHES,
 )
 
@@ -251,6 +255,128 @@ def test_subniche_exclude_consumes_slot_too():
 
 
 # === User's exact wording: positions have GAPS, that's correct ===
+# =====================================================================
+# MAX_SOURCE_POSITION = 200 hard cap
+# =====================================================================
+# User's hard rule: never scrape past source position 200, regardless of
+# how few items end up in either feed after filtering. The truncation
+# helper drops any DOM-order tail beyond the cap before junk filter or
+# Gemini run, and the loop stops once source_position reaches 200.
+
+def test_max_source_position_constant_is_200():
+    """If you bump this, also bump TRUST_EPOCH_UTC — every existing
+    PositionHistory snapshot will have been taken with a different cap
+    and isn't a comparable baseline."""
+    assert MAX_SOURCE_POSITION == 200
+
+
+def test_truncate_helper_drops_tail_past_cap():
+    """A page with 24 items starting at source_position 195 should be
+    truncated to 5 items (positions 196..200)."""
+    page = [{"title": f"i{i}"} for i in range(24)]
+    truncated = _truncate_page_to_cap(page, 195, MAX_SOURCE_POSITION)
+    assert len(truncated) == 5
+    assert truncated == page[:5]
+
+
+def test_truncate_helper_returns_empty_when_already_at_cap():
+    page = [{"title": f"i{i}"} for i in range(24)]
+    assert _truncate_page_to_cap(page, 200, MAX_SOURCE_POSITION) == []
+    assert _truncate_page_to_cap(page, 250, MAX_SOURCE_POSITION) == []
+
+
+def test_truncate_helper_keeps_full_page_when_under_cap():
+    page = [{"title": f"i{i}"} for i in range(24)]
+    assert _truncate_page_to_cap(page, 0, MAX_SOURCE_POSITION) == page
+    assert _truncate_page_to_cap(page, 100, MAX_SOURCE_POSITION) == page
+
+
+def _simulate_paginated_scrape(catalog_size, fashion_indices=None,
+                                page_size=24,
+                                cap=MAX_SOURCE_POSITION):
+    """Test helper: simulate scrape_store_bestsellers's pagination loop
+    against an in-memory catalog. Mirrors the (non-async) parts of the
+    real loop — truncation + distribution — without needing httpx
+    mocking. Returns (fashion, general, final_source_position)."""
+    fashion_indices = set(fashion_indices or [])
+    fashion, general = [], []
+    source_position = 0
+    page = 1
+    while source_position < cap and page <= 100:
+        # Build the synthetic page in DOM order.
+        page_products = []
+        for i in range((page - 1) * page_size, min(page * page_size, catalog_size)):
+            is_fashion = i in fashion_indices
+            page_products.append({
+                "title": f"Item {i}",
+                "is_fashion": is_fashion,
+                "subniche": "fashion" if is_fashion else "home",
+                "handle": f"item-{i}", "image_url": "",
+                "product_type": "", "product_url": "",
+            })
+        if not page_products:
+            break  # catalog exhausted
+        page_products = _truncate_page_to_cap(page_products, source_position, cap)
+        if not page_products:
+            break
+        source_position = _distribute_page_to_feeds(
+            page_products, fashion, general,
+            TARGET_FASHION, TARGET_GENERAL, source_position,
+        )
+        page += 1
+    return fashion, general, source_position
+
+
+def test_pagination_stops_at_cap_for_oversized_catalog():
+    """A 250-product all-general catalog must stop at source position
+    200 — the remaining 50 are NEVER fetched / classified / stored."""
+    fashion, general, end_pos = _simulate_paginated_scrape(catalog_size=250)
+    assert end_pos == 200
+    assert len(general) == 200
+    assert len(fashion) == 0
+    # No item ever has a position past 200.
+    assert max(p["position"] for p in general) == 200
+
+
+def test_sparse_fashion_returns_just_5_no_backfill():
+    """The legacy behavior would have paginated past position 200 to
+    chase 100 fashion items. Now: if the first 200 source positions
+    contain only 5 fashion items, that's what gets stored. Period."""
+    fashion, general, end_pos = _simulate_paginated_scrape(
+        catalog_size=500, fashion_indices=[0, 50, 100, 150, 199],
+    )
+    assert end_pos == 200
+    assert len(fashion) == 5
+    assert len(general) == 195
+    # Source positions of the 5 fashion items are 1, 51, 101, 151, 200
+    # (0-indexed in the helper, 1-indexed once distributed).
+    assert sorted(p["position"] for p in fashion) == [1, 51, 101, 151, 200]
+
+
+def test_small_catalog_under_cap_scrapes_all():
+    """A 50-product catalog should yield 50 items total — pagination
+    stops because the catalog is exhausted, not because of the cap."""
+    fashion, general, end_pos = _simulate_paginated_scrape(catalog_size=50)
+    assert end_pos == 50
+    assert len(general) == 50
+    assert max(p["position"] for p in general) == 50
+
+
+def test_exactly_at_cap_does_not_double_count():
+    """A 200-product catalog should yield exactly 200 — neither overshoot
+    by triggering a phantom 201 fetch nor undershoot by stopping at 199."""
+    fashion, general, end_pos = _simulate_paginated_scrape(catalog_size=200)
+    assert end_pos == 200
+    assert len(general) == 200
+
+
+def test_fashion_target_constant_pinned_to_cap():
+    """TARGET_FASHION / TARGET_GENERAL must equal MAX_SOURCE_POSITION
+    so they never act as a separate constraint inside the cap window."""
+    assert TARGET_FASHION == MAX_SOURCE_POSITION
+    assert TARGET_GENERAL == MAX_SOURCE_POSITION
+
+
 def test_fashion_positions_have_gaps_when_general_items_interleave():
     """Per the user spec: the displayed list will have gaps. You might
     see #1, #2, #5, #7, #8 in the Fashion tab because items at

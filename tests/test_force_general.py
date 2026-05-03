@@ -69,6 +69,107 @@ def test_user_demote_titles_are_forced_general(title):
     )
 
 
+# === Lighting fixtures — ALWAYS general, never fashion. The user-
+# === reported bug was 'Crystal Ring Chandelier' on Fashion (the
+# === classifier was fooled by 'Ring' = jewelry-sounding modifier).
+# === Identify the NOUN, not the modifiers.
+_LIGHTING_TITLES = [
+    # English
+    "Crystal Ring Chandelier",
+    "Pearl Drop Pendant Light",
+    "Gold Wall Sconce",
+    "Rose Gold Floor Lamp",
+    "Diamond Crystal Table Lamp",
+    "Modern Brass Chandelier",
+    "Bauhaus Pendant Light",
+    "Bathroom Wall Sconce",
+    "Art Deco Floor Lamp",
+    "Bedside Table Lamp",
+    "Antique Brass Candelabra",
+    "Silver Candle Holders Set",
+    "LED Fairy Lights 100ft",
+    "Christmas String Lights",
+    "Reading Lamp Adjustable",
+    "Gold Lamp Shade",
+    "Solar Garden Lights Path",
+    "Ceiling Light Fixture",
+    "Ring Pendant Light Modern",
+    "Diamond LED Ceiling Lamp",
+    # German
+    "Kristall Kronleuchter Modern",
+    "Goldene Tischlampe Designer",
+    "Hängelampe Wohnzimmer Industrial",
+    "Pendelleuchte Esstisch Schwarz",
+    "LED Wandleuchte Aussen",
+    "Stehlampe Modern Design",
+    "Lampenschirm Stoff Beige",
+    "Lichterkette LED 10m",
+    "Kerzenhalter Silber 3-er Set",
+    "Designerlampe Glas",
+    # French
+    "Lustre Cristal Moderne",
+    "Suspension Bois Scandinave",
+    "Plafonnier LED Salon",
+    "Applique Murale Dorée",
+    "Lampe de Table Vintage",
+    "Lampe de Chevet Rose",
+    "Abat-Jour Tissu Beige",
+    "Guirlande Lumineuse Solaire",
+    "Bougeoir en Laiton",
+    # Spanish
+    "Araña de Cristal Moderna",
+    "Lámpara de Techo LED",
+    "Lámpara de Mesa Vintage",
+    "Lámpara de Pie Industrial",
+    "Candelabro de Plata",
+    # Italian
+    "Lampadario in Cristallo",
+    "Lampada da Tavolo Designer",
+    "Lampada da Terra Moderna",
+    "Candelabro in Ottone",
+    "Paralume Tessuto Bianco",
+    # Dutch
+    "Kroonluchter Kristal Modern",
+    "Plafondlamp LED Woonkamer",
+    "Tafellamp Industrieel Goud",
+    "Vloerlamp Hout Scandinavisch",
+    "Wandlamp Buitenverlichting",
+    "Kandelaar Set Zilver",
+]
+
+
+@pytest.mark.parametrize("title", _LIGHTING_TITLES)
+def test_lighting_titles_are_forced_general(title):
+    assert _is_forced_general(title=title), (
+        f"_is_forced_general missed lighting fixture {title!r}. "
+        "Lighting (chandeliers, lamps, sconces, candle holders, "
+        "string lights, etc.) must ALWAYS be General regardless of "
+        "jewelry-sounding modifiers like 'Crystal' or 'Ring'."
+    )
+
+
+def test_crystal_ring_chandelier_subniche_is_home():
+    """The user's exact bug case: Crystal Ring Chandelier was on
+    Fashion. After demote, the subniche heuristic must put it on
+    'home', not 'other'."""
+    assert _classify_general_subniche("Crystal Ring Chandelier") == "home"
+    assert _classify_general_subniche("Pearl Drop Pendant Light") == "home"
+    assert _classify_general_subniche("Gold Wall Sconce") == "home"
+    assert _classify_general_subniche("Kristall Kronleuchter") == "home"
+    assert _classify_general_subniche("Lustre Cristal Moderne") == "home"
+    assert _classify_general_subniche("Lampadario in Cristallo") == "home"
+
+
+def test_jewelry_with_lighting_lookalike_modifiers_stays_fashion():
+    """Inverse check — actual jewelry that uses lighting-adjacent
+    words must NOT be demoted by the lighting regex. The noun is
+    'bracelet' / 'ring' / 'necklace', not 'lamp' or 'chandelier'."""
+    assert not _is_forced_general(title="Diamond Gold Bracelet")
+    assert not _is_forced_general(title="Crystal Ring Set Sterling Silver")
+    assert not _is_forced_general(title="Pearl Drop Earrings")
+    assert not _is_forced_general(title="Rose Gold Necklace Pendant")
+
+
 # === Multilingual coverage — function-driven wearables in DE/FR/ES/IT/NL ===
 _MULTILINGUAL_GENERAL = [
     # Posture / support / brace (DE/FR/ES/IT)

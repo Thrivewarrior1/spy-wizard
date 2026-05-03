@@ -45,12 +45,24 @@ from classifier import classify_products_batch
 logger = logging.getLogger(__name__)
 
 HISTORY_RETENTION_DAYS = 30
-# Aggressive page cap so a store with lots of non-fashion mixed near the
-# top of its best-seller list can still surface our fashion target.
-# Loop also exits early when a fetched page yields zero new product links
-# (catalog exhausted).
+# === HARD source-position cap ===
+# Never scrape any product past source position 200 on the merchant's
+# best-seller list — regardless of how few items end up in Fashion or
+# General after filtering. The previous TARGET_FASHION-driven loop
+# pushed deep into the catalog tail to satisfy a per-feed count; the
+# user has overridden that. A store with sparse fashion in its top
+# 200 best-sellers is a real signal — backfilling from positions 201+
+# would just add irrelevant filler ranked far below the actual best-
+# sellers we care about.
+MAX_SOURCE_POSITION = 200
+# Aggressive page cap as a defensive secondary check — at typical
+# Shopify page sizes (24-48 products), MAX_SOURCE_POSITION trips
+# first. MAX_PAGES only matters if a store ships microscopic pages.
 MAX_PAGES = 100
-TARGET_FASHION = 300
+# Per-feed truncation upper bound. Pinned to MAX_SOURCE_POSITION so
+# they never act as a separate constraint inside the cap window —
+# the source-position cap is the only driver now.
+TARGET_FASHION = MAX_SOURCE_POSITION
 
 # Subniches that belong on the Fashion tab. Fashion now spans
 # clothing/shoes ('fashion'), bags, accessories (hats, scarves, belts,
@@ -59,11 +71,11 @@ TARGET_FASHION = 300
 # to is_fashion=True regardless of what Gemini said for is_fashion —
 # wearables NEVER appear on the General tab.
 WEARABLE_SUBNICHES = {"fashion", "bags", "accessories", "jewelry"}
-# General-feed cap. 100 of each store's bestselling NON-fashion items
-# (gadgets, home decor, beauty, services like shipping protection, etc.)
-# get tracked separately on the General tab. Independent positions
-# 1..100, independent hero/villain, independent retirement.
-TARGET_GENERAL = 100
+# General-feed truncation upper bound. Same logic as TARGET_FASHION
+# above — pinned to MAX_SOURCE_POSITION so the source-position cap is
+# the only driver of how far we paginate. Hero/villain math + per-feed
+# retirement still operate independently on the General tab.
+TARGET_GENERAL = MAX_SOURCE_POSITION
 
 # Per-store override for the collection path used to find best-sellers.
 # Some Shopify shops have a misconfigured /collections/all (e.g. Lumenrosa
@@ -489,6 +501,67 @@ _FORCE_GENERAL_PATTERNS = [
     r"\bvergr(?:ö|o|oe)(?:ß|s|ss)erungsglas\w*",
     r"\bumbrella\w*", r"\bregenschirm\w*", r"\bparapluie\w*",
     r"\bparaguas\b", r"\bombrello\b", r"\bparaplu\b",
+    # === Lighting fixtures — ALWAYS home/general, never fashion.
+    # === Trips on the noun even when modifiers ('Crystal Ring',
+    # === 'Pearl', 'Diamond', 'Gold', 'Silver') sound jewelry-like.
+    # === The user-reported bug was 'Crystal Ring Chandelier' on the
+    # === Fashion tab — chandelier is the NOUN, the rest are modifiers.
+    # English
+    r"\bchandeliers?\b", r"\bsconces?\b",
+    r"\bcandelabra\w*", r"\bcandle[\s\-]?holders?\b",
+    r"\b(?:pendant|ceiling|wall|table|floor|desk|night|reading|bedside|outdoor|hanging|swing[\s\-]?arm)\s+(?:light|lamp|fan|sconce|bulb|fixture|chandelier)s?\b",
+    r"\b(?:string|fairy|tape|christmas|rope)\s+lights?\b",
+    # Outdoor / garden / patio / landscape lighting — allow up to two
+    # adjective words between the qualifier and 'lights' so "Solar
+    # Garden Path Lights" / "Outdoor Pathway Lights" still match.
+    r"\b(?:solar|garden|outdoor|landscape|patio|pathway|driveway)[\s\-]+(?:\w+[\s\-]+){0,2}lights?\b",
+    r"\blamp[\s\-]?shades?\b", r"\blampshades?\b",
+    r"\blight\s+(?:fixture|bulb|kit|strip|panel)s?\b",
+    r"\bled\s+(?:bulb|strip|panel|tube|lamp)s?\b",
+    r"\b(?:floor|table|desk|night|wall|ceiling|pendant|reading|bedside|hanging)\s+lamps?\b",
+    r"\bnight[\s\-]?lights?\b",
+    # German (compound-friendly via \w*)
+    r"\bkronleuchter\w*",
+    r"\blampe\b", r"\blampen\b", r"\bleuchte\b", r"\bleuchten\b",
+    r"\bdeckenlamp\w*", r"\bdeckenleucht\w*",
+    r"\bh(?:ä|a|ae)ngelamp\w*", r"\bh(?:ä|a|ae)ngeleucht\w*",
+    r"\bpendelleucht\w*", r"\bpendellampe\w*", r"\bpendellampen\w*",
+    r"\bwandlamp\w*", r"\bwandleucht\w*",
+    r"\btischlamp\w*", r"\btischleucht\w*",
+    r"\bstehlamp\w*", r"\bstehleucht\w*",
+    r"\bnachtlicht\w*", r"\bnachtlampe\w*",
+    r"\blampenschirm\w*",
+    r"\blichterkett\w*",
+    r"\bkerzenhalter\w*", r"\bkerzenst(?:ä|a|ae)nder\w*",
+    r"\baussenlamp\w*", r"\baussenleucht\w*",
+    r"\bau(?:ß|ss)enlamp\w*", r"\bau(?:ß|ss)enleucht\w*",
+    r"\bdesignerlampe\w*", r"\bdesignlampe\w*",
+    r"\bgartenlamp\w*", r"\bgartenleucht\w*",
+    r"\bsolarleucht\w*", r"\bsolarlamp\w*",
+    # French
+    r"\blustres?\b", r"\bsuspensions?\b", r"\bplafonniers?\b",
+    r"\bappliques?\b",
+    r"\blampe\s+(?:de\s+)?(?:table|chevet|sol|bureau|nuit)\b",
+    r"\babat[\s\-]?jours?\b",
+    r"\bguirlandes?\s+lumineuses?\b",
+    r"\bbougeoirs?\b",
+    # Spanish
+    r"\bara(?:ñ|n)a\b",
+    r"\bl(?:á|a)mparas?\w*",
+    r"\bcandelabro\w*",
+    r"\bpantalla\b",
+    # Italian
+    r"\blampadar(?:io|i)\b", r"\blampadari\w*",
+    r"\blampada\b", r"\blampade\b",
+    r"\bcandelabr(?:o|i)\b",
+    r"\bparalume\w*",
+    # Dutch
+    r"\bkroonluchter\w*",
+    r"\blamp\b", r"\blampen\b",  # Dutch = same as German
+    r"\bplafondlamp\w*", r"\bwandlamp\w*",
+    r"\btafellamp\w*", r"\bvloerlamp\w*",
+    r"\bnachtlampje\w*", r"\blampenkap\w*",
+    r"\bkandelaars?\b",
 ]
 
 FORCE_GENERAL_TITLE_RE = re.compile(
@@ -525,6 +598,22 @@ def _is_forced_general(
 # FORCE_GENERAL_RE — used by the migration so the General feed
 # surfaces them under a sensible category instead of 'fashion'.
 _FORCE_GENERAL_SUBNICHE_HEURISTICS = [
+    # Lighting fixtures land on home (Crystal Ring Chandelier, etc.)
+    (re.compile(
+        r"chandelier|sconce|candelabra|candle[\s\-]?holder|"
+        r"(?:pendant|ceiling|wall|table|floor|desk|night|reading|bedside)\s+(?:light|lamp|fan|sconce|fixture)|"
+        r"(?:string|fairy|tape|christmas|solar|patio|rope)\s+lights|"
+        r"lamp[\s\-]?shade|lampshade|night[\s\-]?light|"
+        r"kronleuchter|lampe|leuchte|deckenlamp|deckenleucht|"
+        r"h(?:ä|a|ae)ngelamp|h(?:ä|a|ae)ngeleucht|"
+        r"pendelleucht|wandlamp|wandleucht|tischlamp|tischleucht|"
+        r"stehlamp|stehleucht|lampenschirm|lichterkett|kerzenhalter|"
+        r"lustre|suspension|plafonnier|applique|abat[\s\-]?jour|guirlande|"
+        r"ara(?:ñ|n)a|l(?:á|a)mpara|candelabro|"
+        r"lampadari?|lampada|paralume|"
+        r"kroonluchter|plafondlamp|tafellamp|vloerlamp|lampenkap|kandelaar",
+        re.I,
+    ), "home"),
     (re.compile(
         r"smart[\s\-]?watch|smartwatch|fitness[\s\-]?(?:tracker|band)|"
         r"activity[\s\-]?tracker|smart[\s\-]?(?:ring|band|glasses)|"
@@ -944,6 +1033,28 @@ def _extract_products_from_html(soup: BeautifulSoup, base_url: str, seen: set, h
     return products
 
 
+def _truncate_page_to_cap(
+    page_products: list,
+    current_source_position: int,
+    max_source_position: int = None,
+) -> list:
+    """Truncate `page_products` in DOM order if processing the whole
+    page would push the global source_position counter past
+    `max_source_position`. Returns a (possibly empty) sub-list of the
+    items the caller should actually distribute.
+
+    The user rule: never scrape past source position 200, even if
+    Fashion or General counts are sparse. Junk we drop still consumes
+    a slot, so the truncation is on raw page_products in DOM order
+    BEFORE the junk filter / Gemini run.
+    """
+    cap = MAX_SOURCE_POSITION if max_source_position is None else max_source_position
+    if current_source_position >= cap:
+        return []
+    remaining = cap - current_source_position
+    return page_products[:remaining]
+
+
 def _distribute_page_to_feeds(
     page_products: list,
     fashion: list,
@@ -1082,10 +1193,12 @@ async def scrape_store_bestsellers(
             timeout=30.0, follow_redirects=True, headers=_build_headers()
         ) as client:
             page = 1
-            while (
-                (len(fashion) < target_fashion or len(general) < target_general)
-                and page <= MAX_PAGES
-            ):
+            # Loop driver is now MAX_SOURCE_POSITION (default 200), NOT
+            # the per-feed counts. The user's hard rule: stop once we've
+            # walked 200 source positions, even if Fashion or General
+            # ended up sparse — that's the real signal, not filler we'd
+            # have to dredge from the catalog tail.
+            while source_position < MAX_SOURCE_POSITION and page <= MAX_PAGES:
                 url = f"{base_url}/collections/{collection_slug}?sort_by=best-selling&page={page}"
                 try:
                     resp = await _fetch_with_retry(client, url)
@@ -1107,6 +1220,17 @@ async def scrape_store_bestsellers(
                     f"(fashion={len(fashion)} general={len(general)})"
                 )
 
+                if not page_products:
+                    break
+
+                # HARD source-position cap — drop any DOM-order tail
+                # past MAX_SOURCE_POSITION before junk filter / Gemini
+                # so we never spend tokens classifying items we'd just
+                # discard. Junk inside the kept window still consumes
+                # a slot.
+                page_products = _truncate_page_to_cap(
+                    page_products, source_position, MAX_SOURCE_POSITION,
+                )
                 if not page_products:
                     break
 
@@ -1158,7 +1282,9 @@ async def scrape_store_bestsellers(
                     target_fashion, target_general, source_position,
                 )
 
-                if len(fashion) >= target_fashion and len(general) >= target_general:
+                # Source-position cap reached — no point fetching more
+                # pages, every product on them would be off-cap anyway.
+                if source_position >= MAX_SOURCE_POSITION:
                     break
 
                 page += 1
