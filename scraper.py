@@ -944,24 +944,111 @@ def _extract_products_from_html(soup: BeautifulSoup, base_url: str, seen: set, h
     return products
 
 
+def _distribute_page_to_feeds(
+    page_products: list,
+    fashion: list,
+    general: list,
+    target_fashion: int,
+    target_general: int,
+    source_position_start: int,
+) -> int:
+    """Walk one page of products in DOM order, assign every item a
+    LITERAL `source_position` (the cross-page counter starts at
+    `source_position_start` + 1 for the first item), apply the
+    FORCE_GENERAL → FORCE_FASHION → wearable-subniche reconciliation,
+    and append survivors to fashion / general using `source_position`
+    as the stored `position`.
+
+    The position the user sees on Spy Wizard MUST equal the literal
+    1-indexed slot the product occupies on the merchant's
+    /collections/all?sort_by=best-selling page. Junk we drop
+    (shipping protection, surprise box, gift cards) still consumes
+    a slot in the source HTML, so the counter increments through
+    `_excluded` items too — that's how the displayed Fashion list
+    can correctly show e.g. positions {2, 4, 5, 7, 9} when source
+    positions {1, 3, 6, 8} were General/junk.
+
+    Returns the new value of the source_position counter so the
+    caller can pass it forward to the next page.
+    """
+    source_pos = source_position_start
+    for p in page_products:
+        source_pos += 1
+        # Always stamp source_position — even on junk we drop —
+        # so debug introspection / future migrations can see what
+        # the merchant's list actually looks like.
+        p["source_position"] = source_pos
+        if p.get("_excluded"):
+            continue
+        sub = (p.get("subniche") or "").strip().lower()
+        if sub == "exclude":
+            continue
+        if sub in WEARABLE_SUBNICHES:
+            p["is_fashion"] = True
+        # FORCE_GENERAL precedence — wearable-but-functional items
+        # (smartwatches, posture correctors, dog raincoats, etc.)
+        # MUST land on General even when they would otherwise match
+        # the apparel allowlist. Function over form.
+        title = p.get("title", "")
+        ptype = p.get("product_type", "")
+        handle = p.get("handle", "")
+        purl = p.get("product_url", "")
+        iurl = p.get("image_url", "")
+        if _is_forced_general(
+            title=title, product_type=ptype, handle=handle,
+            product_url=purl, image_url=iurl,
+        ):
+            p["is_fashion"] = False
+            if sub in WEARABLE_SUBNICHES or not sub:
+                p["subniche"] = _classify_general_subniche(title)
+                sub = p["subniche"]
+        elif _is_forced_fashion(
+            title=title, product_type=ptype, handle=handle,
+            product_url=purl, image_url=iurl,
+        ):
+            p["is_fashion"] = True
+            if sub not in WEARABLE_SUBNICHES:
+                p["subniche"] = "fashion"
+                sub = "fashion"
+        if p.get("is_fashion"):
+            if len(fashion) < target_fashion:
+                p["position"] = source_pos
+                fashion.append(p)
+        else:
+            if len(general) < target_general:
+                p["position"] = source_pos
+                general.append(p)
+    return source_pos
+
+
 async def scrape_store_bestsellers(
     store_url: str,
     target_fashion: int = TARGET_FASHION,
     target_general: int = TARGET_GENERAL,
 ):
-    """Scrape a store's best-selling collection into TWO ranked lists:
+    """Scrape a store's best-selling collection into TWO lists:
     fashion-only (up to `target_fashion`) and everything-else
     (up to `target_general`). Both come from the same HTML pages.
 
+    The `position` written to each product is the LITERAL 1-indexed
+    slot it occupies on the merchant's /collections/all?sort_by=
+    best-selling source HTML — NOT a re-numbered fashion-only or
+    general-only sequence. Junk we hard-drop (shipping protection,
+    surprise boxes, gift cards) still consumes a slot, so the
+    Fashion list a user sees may show positions {2, 4, 5, 7, 9}
+    instead of {1, 2, 3, 4, 5}. That gap pattern is correct: it
+    means slots {1, 3, 6, 8} on the merchant's list were either
+    General products or junk we filtered out.
+
     Returns (fashion_products, general_products, errors):
-      - fashion_products: up to `target_fashion` items with sequential
-        positions 1..N reflecting fashion-only bestseller order.
-      - general_products: up to `target_general` items with sequential
-        positions 1..N reflecting general bestseller order. Each carries
-        a `subniche` label (jewelry/electronics/home/beauty/services/...)
-        from Gemini for the General tab's filter pills.
-      - errors: list of human-readable strings describing any non-fatal
-        problems. Empty when everything was clean.
+      - fashion_products: up to `target_fashion` items, each with
+        `position` = literal source position from the HTML.
+      - general_products: up to `target_general` items, each with
+        `position` = literal source position. Each carries a
+        `subniche` label (jewelry/electronics/home/beauty/...) from
+        Gemini for the General tab's filter pills.
+      - errors: list of human-readable strings describing any
+        non-fatal problems. Empty when everything was clean.
     """
     base_url = store_url.rstrip("/")
     # Pick the collection slug to scrape. Defaults to the universal
@@ -975,6 +1062,11 @@ async def scrape_store_bestsellers(
     general: list = []
     seen: set = set()
     errors: list = []
+    # Cross-page literal DOM-order counter. Increments by 1 for EVERY
+    # product encountered (including junk we drop) so the `position`
+    # we ultimately store reflects "where this item actually sits on
+    # the merchant's best-seller list" — gaps and all.
+    source_position = 0
     has_gemini = bool(os.getenv("GEMINI_API_KEY"))
     if not has_gemini:
         # Degraded mode: without Gemini we cannot split fashion vs general,
@@ -1055,73 +1147,16 @@ async def scrape_store_bestsellers(
                         p["subniche"] = "fashion"
                         p["ai_tags"] = ""
 
-                # Distribute classified products into the two ranked
-                # lists. Each list is independently positioned 1..N in
-                # the order it encounters its members on the bestseller
-                # pages, so per-feed hero/villain math stays meaningful.
-                # Anything Gemini flagged as 'exclude' (a non-product
-                # the regex missed) is dropped here too.
-                #
-                # Reconciliation: a wearable subniche
-                # (fashion/bags/accessories/jewelry) ALWAYS implies the
-                # Fashion feed even if Gemini accidentally returned
-                # is_fashion=false. Catches the case where Gemini
-                # classifies an earring as 'jewelry' but forgets to
-                # flip is_fashion. The user explicitly wants jewelry
-                # and accessories on Fashion, never on General.
-                for p in page_products:
-                    if p.get("_excluded"):
-                        continue
-                    sub = (p.get("subniche") or "").strip().lower()
-                    if sub == "exclude":
-                        continue
-                    if sub in WEARABLE_SUBNICHES:
-                        p["is_fashion"] = True
-                    # FORCE_GENERAL precedence — wearable-but-
-                    # functional items (smartwatches, posture
-                    # correctors, dog raincoats, magnifying glasses,
-                    # trekking poles) MUST land on General even when
-                    # they would otherwise match the apparel allowlist.
-                    # The user rule: function over form. Run this
-                    # check BEFORE the FORCE_FASHION promotion so a
-                    # smartwatch (matches both \bwatch and smartwatch)
-                    # never gets promoted.
-                    title = p.get("title", "")
-                    ptype = p.get("product_type", "")
-                    handle = p.get("handle", "")
-                    purl = p.get("product_url", "")
-                    iurl = p.get("image_url", "")
-                    if _is_forced_general(
-                        title=title, product_type=ptype, handle=handle,
-                        product_url=purl, image_url=iurl,
-                    ):
-                        p["is_fashion"] = False
-                        # Re-bucket if the previous subniche was a
-                        # wearable label or empty — pick a sensible
-                        # General feed slot.
-                        if sub in WEARABLE_SUBNICHES or not sub:
-                            p["subniche"] = _classify_general_subniche(title)
-                            sub = p["subniche"]
-                    elif _is_forced_fashion(
-                        title=title, product_type=ptype, handle=handle,
-                        product_url=purl, image_url=iurl,
-                    ):
-                        # Apparel / footwear / eyewear / intimates safety
-                        # net. Forces is_fashion=True for any wearable
-                        # category Gemini missed and rewrites the
-                        # subniche to 'fashion'.
-                        p["is_fashion"] = True
-                        if sub not in WEARABLE_SUBNICHES:
-                            p["subniche"] = "fashion"
-                            sub = "fashion"
-                    if p.get("is_fashion"):
-                        if len(fashion) < target_fashion:
-                            p["position"] = len(fashion) + 1
-                            fashion.append(p)
-                    else:
-                        if len(general) < target_general:
-                            p["position"] = len(general) + 1
-                            general.append(p)
+                # Distribute the classified page into fashion + general,
+                # carrying the cross-page source_position counter so the
+                # `position` written to the DB is the LITERAL DOM order
+                # on the merchant's best-seller page (not a re-numbered
+                # fashion-only / general-only sequence). See the docstring
+                # of `_distribute_page_to_feeds` for the full rationale.
+                source_position = _distribute_page_to_feeds(
+                    page_products, fashion, general,
+                    target_fashion, target_general, source_position,
+                )
 
                 if len(fashion) >= target_fashion and len(general) >= target_general:
                     break
