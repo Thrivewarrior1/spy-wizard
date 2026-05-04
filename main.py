@@ -1433,13 +1433,26 @@ async def get_stats(db: Session = Depends(get_db)):
         )
         .count()
     )
-    # New-store health check — flag any store whose most-recent scrape
-    # produced 0 fashion + 0 general (a dead scrape; usually means the
-    # store-add config is broken or Cloudflare blocked us) OR whose
-    # ratio between feeds is implausibly skewed (one feed > 100 with
-    # the other empty — usually means the classifier mis-routed
-    # everything, like the wild-eye-vision first-scrape regression
-    # the user reported).
+    # Health check — flag stores whose last scrape went visibly wrong.
+    # Two failure modes worth alerting on:
+    #
+    #  (1) Dead scrape: 0 fashion + 0 general. Usually means a new-
+    #      store config issue, Cloudflare block, or the upstream
+    #      collection page is gone.
+    #
+    #  (2) Skewed feeds against the store's declared niche: e.g. a
+    #      store with niche='General' returning 100+ fashion and 0
+    #      general (mis-routing); or niche='Fashion & General' with
+    #      only one feed populated. Pure-Fashion stores legitimately
+    #      have general=0, and pure-General stores legitimately have
+    #      fashion=0 — the niche field tells us what to expect.
+    def _expects_both(niche: str) -> bool:
+        n = (niche or "").lower()
+        # Mixed-niche stores ("Fashion & General", "Fashion & HD",
+        # "Multi") are expected to have both feeds. Pure single-niche
+        # stores ("Fashion" / "General") are not.
+        return ("&" in n) or ("multi" in n) or ("mixed" in n)
+
     unhealthy_stores = []
     for s in db.query(Store).all():
         fashion_n = sum(1 for p in s.products if p.is_fashion)
@@ -1447,15 +1460,25 @@ async def get_stats(db: Session = Depends(get_db)):
         if fashion_n == 0 and general_n == 0:
             unhealthy_stores.append({
                 "id": s.id, "name": s.name, "url": s.url,
+                "niche": s.niche,
                 "fashion": 0, "general": 0,
                 "reason": "dead-scrape (both feeds empty)",
             })
-        elif (fashion_n > 100 and general_n == 0) or (general_n > 100 and fashion_n == 0):
-            unhealthy_stores.append({
-                "id": s.id, "name": s.name, "url": s.url,
-                "fashion": fashion_n, "general": general_n,
-                "reason": "skewed-feeds (one populated, the other empty — likely mis-routing)",
-            })
+            continue
+        # Skew check only fires when the store's niche says BOTH feeds
+        # should populate — single-niche stores legitimately have one
+        # empty side and we don't want to spam alerts.
+        if _expects_both(s.niche or ""):
+            if (fashion_n > 100 and general_n == 0) or (general_n > 100 and fashion_n == 0):
+                unhealthy_stores.append({
+                    "id": s.id, "name": s.name, "url": s.url,
+                    "niche": s.niche,
+                    "fashion": fashion_n, "general": general_n,
+                    "reason": (
+                        "skewed-feeds (mixed-niche store but only one "
+                        "feed populated — likely mis-routing)"
+                    ),
+                })
     if unhealthy_stores:
         # Surface as logged warning too so Railway logs flag it without
         # waiting for a /api/stats request to discover it.
