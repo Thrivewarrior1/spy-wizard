@@ -25,6 +25,7 @@ from scraper import (
     migrate_wearables_to_fashion,
     migrate_apparel_to_fashion,
     migrate_force_general_to_general,
+    migrate_drop_off_cap_positions,
 )
 from seed import seed_stores
 
@@ -162,6 +163,15 @@ async def lifespan(app: FastAPI):
         migrate_force_general_to_general(db)
     except Exception as e:
         logger.warning(f"startup force-general migration failed: {e}")
+    try:
+        # Off-cap sweep: any row whose current_position exceeds
+        # MAX_SOURCE_POSITION is from a pre-cap scrape and the new
+        # logic can never refresh it. Retire unconditionally so the
+        # Fashion / General feeds don't surface zombie rows from the
+        # deep catalog tail (Breuermode at #1614 etc.).
+        migrate_drop_off_cap_positions(db)
+    except Exception as e:
+        logger.warning(f"startup off-cap migration failed: {e}")
     finally:
         db.close()
     # Schedule daily scrape at 6 AM UTC

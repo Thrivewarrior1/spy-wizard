@@ -1599,12 +1599,29 @@ def update_products_in_db(
             product.subniche = "fashion"
         forced_promoted += 1
 
+    # Off-cap sweep — anything still in the DB with current_position
+    # past MAX_SOURCE_POSITION is from a pre-cap scrape and the new
+    # logic can NEVER refresh it (we stop fetching at position 200).
+    # Retire unconditionally so the Fashion / General feeds don't
+    # surface zombie rows from the deep catalog tail.
+    off_cap_retired = 0
+    for shopify_id, product in existing_products.items():
+        if (product.current_position or 0) > MAX_SOURCE_POSITION:
+            if product.is_fashion or product.subniche:
+                product.is_fashion = False
+                product.subniche = ""
+                off_cap_retired += 1
+
     # Per-feed retirement. We never look at the OTHER feed's IDs when
     # deciding whether to retire — a product that moved feeds is already
-    # represented in its new feed's list.
+    # represented in its new feed's list. Threshold is a small safety
+    # guard against complete scrape failures (don't wipe everything if
+    # zero products came back). Sized to the new MAX_SOURCE_POSITION=200
+    # cap, where many stores legitimately yield <30 fashion items in
+    # their top-200 best-sellers.
     fashion_retired = 0
     general_retired = 0
-    if len(fashion_products) >= max(30, TARGET_FASHION // 2):
+    if len(fashion_products) >= 5:
         for shopify_id, product in existing_products.items():
             if (
                 product.is_fashion
@@ -1614,7 +1631,7 @@ def update_products_in_db(
                 product.is_fashion = False
                 product.subniche = ""
                 fashion_retired += 1
-    if len(general_products) >= max(15, TARGET_GENERAL // 2):
+    if len(general_products) >= 5:
         for shopify_id, product in existing_products.items():
             if (
                 not product.is_fashion
@@ -1630,6 +1647,7 @@ def update_products_in_db(
         f"Updated {store.name}: {len(fashion_products)} fashion + "
         f"{len(general_products)} general"
         + (f" (retired f={fashion_retired} g={general_retired})" if fashion_retired or general_retired else "")
+        + (f" (off-cap retired {off_cap_retired})" if off_cap_retired else "")
         + (f" (purged {junk_purged} junk)" if junk_purged else "")
         + (f" (demoted {forced_demoted} gadgets)" if forced_demoted else "")
         + (f" (promoted {forced_promoted} apparel)" if forced_promoted else "")
@@ -1657,6 +1675,36 @@ def migrate_wearables_to_fashion(db: Session) -> int:
             f"jewelry/accessories/bags rows to the Fashion feed"
         )
     return len(rows)
+
+
+def migrate_drop_off_cap_positions(db: Session) -> int:
+    """One-shot DB migration: any product whose current_position is
+    past MAX_SOURCE_POSITION (default 200) is from a pre-cap scrape
+    and the new logic can never refresh it (we stop fetching at
+    position 200). Retire unconditionally — clear is_fashion AND
+    subniche so the row drops out of both feeds. Idempotent.
+
+    Mirrors the inline off-cap sweep in update_products_in_db so the
+    catch-up happens on Railway redeploy without waiting for the next
+    scrape.
+    """
+    rows = db.query(Product).filter(
+        Product.current_position > MAX_SOURCE_POSITION,
+    ).all()
+    cleared = 0
+    for product in rows:
+        if product.is_fashion or product.subniche:
+            product.is_fashion = False
+            product.subniche = ""
+            cleared += 1
+    if cleared:
+        db.commit()
+        logger.info(
+            f"migrate_drop_off_cap_positions: retired {cleared} "
+            f"rows whose current_position exceeded MAX_SOURCE_POSITION="
+            f"{MAX_SOURCE_POSITION}"
+        )
+    return cleared
 
 
 def migrate_force_general_to_general(db: Session) -> int:

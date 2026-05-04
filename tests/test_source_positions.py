@@ -377,6 +377,91 @@ def test_fashion_target_constant_pinned_to_cap():
     assert TARGET_GENERAL == MAX_SOURCE_POSITION
 
 
+# === Off-cap migration: pre-cap scrapes left zombie rows with
+# === current_position past MAX_SOURCE_POSITION (e.g. 1614). The
+# === migration retires them on startup so they drop out of both
+# === feeds — the new scrape logic can never refresh them.
+def test_off_cap_migration_retires_zombie_rows():
+    from datetime import datetime
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from models import Base, Store, Product
+    from scraper import migrate_drop_off_cap_positions, MAX_SOURCE_POSITION
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    s = Store(name="Test", url="https://test.example/", monthly_visitors="1K",
+              niche="Fashion", country="DE")
+    db.add(s); db.commit(); db.refresh(s)
+
+    cases = [
+        # (handle, current_position, is_fashion, subniche, expected_retired)
+        ("zombie-fash-1614", 1614, True,  "fashion", True),
+        ("zombie-gen-2060",  2060, False, "home",    True),
+        ("kept-fash-1",      1,    True,  "fashion", False),
+        ("kept-fash-200",    200,  True,  "fashion", False),
+        ("kept-gen-150",     150,  False, "home",    False),
+        # Edge: position == MAX_SOURCE_POSITION+1 should be retired
+        ("zombie-201",       201,  True,  "fashion", True),
+    ]
+    for handle, pos, is_f, sub, _ in cases:
+        db.add(Product(
+            store_id=s.id, shopify_id=handle, title=handle, handle=handle,
+            image_url="", price="", vendor="", product_type="", product_url="",
+            current_position=pos, previous_position=0, label="",
+            ai_tags="", is_fashion=is_f, subniche=sub,
+            last_scraped=datetime.utcnow(),
+        ))
+    db.commit()
+
+    cleared = migrate_drop_off_cap_positions(db)
+    expected = sum(1 for _, _, _, _, retire in cases if retire)
+    assert cleared == expected
+
+    for handle, _, _, _, expected_retired in cases:
+        p = db.query(Product).filter(Product.shopify_id == handle).one()
+        if expected_retired:
+            assert p.is_fashion is False, f"{handle} should be off-cap retired"
+            assert p.subniche == "", f"{handle} subniche should be cleared"
+        else:
+            # Within-cap rows are untouched
+            pass
+    db.close()
+
+
+def test_off_cap_migration_is_idempotent():
+    from datetime import datetime
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from models import Base, Store, Product
+    from scraper import migrate_drop_off_cap_positions, MAX_SOURCE_POSITION
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    s = Store(name="Test", url="https://test.example/", monthly_visitors="1K",
+              niche="Fashion", country="DE")
+    db.add(s); db.commit(); db.refresh(s)
+
+    db.add(Product(
+        store_id=s.id, shopify_id="x", title="x", handle="x",
+        image_url="", price="", vendor="", product_type="", product_url="",
+        current_position=1500, previous_position=0, label="",
+        ai_tags="", is_fashion=True, subniche="fashion",
+        last_scraped=datetime.utcnow(),
+    ))
+    db.commit()
+
+    assert migrate_drop_off_cap_positions(db) == 1
+    assert migrate_drop_off_cap_positions(db) == 0
+    db.close()
+
+
 def test_fashion_positions_have_gaps_when_general_items_interleave():
     """Per the user spec: the displayed list will have gaps. You might
     see #1, #2, #5, #7, #8 in the Fashion tab because items at
