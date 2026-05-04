@@ -368,7 +368,11 @@ function loadStores(){
 
 function fmtStoreLine(s){
   const errs=(s.errors&&s.errors.length)?'\n      ⚠ '+s.errors.join('\n      ⚠ '):'';
-  return `  ${s.name}: ${s.products} fashion${errs}`;
+  // Both feeds visible per the user spec — fashion AND general counts.
+  // A row that has any unexpected-feed warning attached prepends the
+  // marker so the eye catches it in a wall of normal-looking lines.
+  const warn=s.warning?'  ⚠ '+s.warning+'\n':'';
+  return `${warn}  ${s.name}: ${s.products||0} fashion · ${s.general||0} general${errs}`;
 }
 let scrapePollTimer=null;
 function pollScrape(b){
@@ -385,9 +389,10 @@ function pollScrape(b){
     const total=d.total_products||0;
     const ok=d.stores_with_products||0;
     const failed=d.stores_failed||0;
+    const totalGeneral=d.total_general||0;
     let msg;
-    if(total===0){msg='⚠️ Scrape returned 0 fashion products.\n\n'}
-    else{msg=`✓ Scraped ${total} fashion products across ${ok} stores`+(failed?` (${failed} failed)`:'')+'\n\n'}
+    if(total===0&&totalGeneral===0){msg='⚠️ Scrape returned 0 products.\n\n'}
+    else{msg=`✓ Scraped ${total} fashion · ${totalGeneral} general across ${ok} stores`+(failed?` (${failed} failed)`:'')+'\n\n'}
     if(d.stores&&d.stores.length){msg+=d.stores.map(fmtStoreLine).join('\n')}
     alert(msg);
   }).catch(()=>{
@@ -404,10 +409,11 @@ function triggerScrape(){const b=document.getElementById('scrapeBtn');b.textCont
     pollScrape(b);
   }).catch(()=>{b.textContent='↻ Scrape All Stores';b.disabled=false;alert('Scrape request failed (network error)')})}
 function scrapeOne(id){fetch(`${API}/scrape/${id}`,{method:'POST'}).then(r=>r.json()).then(d=>{
-  const n=d.products_found||0;
+  const f=d.products_found||0;
+  const g=d.general_found||0;
   const errs=(d.errors&&d.errors.length)?'\n\n'+d.errors.join('\n'):'';
-  if(n===0){alert('⚠️ Scraped 0 fashion products.'+errs)}
-  else{alert(`✓ Scraped ${n} fashion products`+errs)}
+  if(f===0&&g===0){alert('⚠️ Scraped 0 products.'+errs)}
+  else{alert(`✓ Scraped ${f} fashion · ${g} general`+errs)}
   loadStores();loadCombined();loadStats()
 }).catch(()=>alert('Scrape request failed (network error)'))}
 

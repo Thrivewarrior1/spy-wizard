@@ -45,24 +45,31 @@ from classifier import classify_products_batch
 logger = logging.getLogger(__name__)
 
 HISTORY_RETENTION_DAYS = 30
-# === HARD source-position cap ===
-# Never scrape any product past source position 200 on the merchant's
-# best-seller list — regardless of how few items end up in Fashion or
-# General after filtering. The previous TARGET_FASHION-driven loop
-# pushed deep into the catalog tail to satisfy a per-feed count; the
-# user has overridden that. A store with sparse fashion in its top
-# 200 best-sellers is a real signal — backfilling from positions 201+
-# would just add irrelevant filler ranked far below the actual best-
-# sellers we care about.
-MAX_SOURCE_POSITION = 200
+# === Per-feed targets + outer source-position ceiling ===
+# The user spec: scrape 200 FASHION + 200 GENERAL per store. Both
+# feeds must reach 200 (or the catalog's true ceiling, whichever is
+# smaller). The previous "MAX_SOURCE_POSITION = 200, no backfill"
+# rule is OVERRIDDEN — under that rule, stores like Heidi Mode ended
+# up with only 96 fashion (because 104 of the top 200 source slots
+# went to General/junk) and ~0 general (no source positions left to
+# fetch deeper).
+#
+# New loop semantics:
+#   continue paginating WHILE
+#       (fashion < TARGET_FASHION OR general < TARGET_GENERAL)
+#       AND source_position < MAX_SOURCE_POSITION
+#       AND page returned > 0 new products
+#
+# MAX_SOURCE_POSITION is now an OUTER bound to keep us from running
+# away on stores with a sparse mix — 600 is generous (3x either
+# target) and bounded enough that quota / runtime stays sane.
+TARGET_FASHION = 200
+TARGET_GENERAL = 200
+MAX_SOURCE_POSITION = 600
 # Aggressive page cap as a defensive secondary check — at typical
-# Shopify page sizes (24-48 products), MAX_SOURCE_POSITION trips
-# first. MAX_PAGES only matters if a store ships microscopic pages.
+# Shopify page sizes (24-48 products), MAX_SOURCE_POSITION still
+# trips first.
 MAX_PAGES = 100
-# Per-feed truncation upper bound. Pinned to MAX_SOURCE_POSITION so
-# they never act as a separate constraint inside the cap window —
-# the source-position cap is the only driver now.
-TARGET_FASHION = MAX_SOURCE_POSITION
 
 # Subniches that belong on the Fashion tab. Fashion now spans
 # clothing/shoes ('fashion'), bags, accessories (hats, scarves, belts,
@@ -71,11 +78,6 @@ TARGET_FASHION = MAX_SOURCE_POSITION
 # to is_fashion=True regardless of what Gemini said for is_fashion —
 # wearables NEVER appear on the General tab.
 WEARABLE_SUBNICHES = {"fashion", "bags", "accessories", "jewelry"}
-# General-feed truncation upper bound. Same logic as TARGET_FASHION
-# above — pinned to MAX_SOURCE_POSITION so the source-position cap is
-# the only driver of how far we paginate. Hero/villain math + per-feed
-# retirement still operate independently on the General tab.
-TARGET_GENERAL = MAX_SOURCE_POSITION
 
 # Per-store override for the collection path used to find best-sellers.
 # Some Shopify shops have a misconfigured /collections/all (e.g. Lumenrosa
@@ -1226,12 +1228,17 @@ async def scrape_store_bestsellers(
             timeout=30.0, follow_redirects=True, headers=_build_headers()
         ) as client:
             page = 1
-            # Loop driver is now MAX_SOURCE_POSITION (default 200), NOT
-            # the per-feed counts. The user's hard rule: stop once we've
-            # walked 200 source positions, even if Fashion or General
-            # ended up sparse — that's the real signal, not filler we'd
-            # have to dredge from the catalog tail.
-            while source_position < MAX_SOURCE_POSITION and page <= MAX_PAGES:
+            # Loop driver — keep paginating WHILE either feed is below
+            # its target AND we haven't hit the outer source-position
+            # ceiling. Stops cleanly when both targets are met (catalog
+            # was rich enough) OR when the ceiling trips (sparse mix
+            # in the tail) OR when a fetched page returns 0 new
+            # products (catalog exhausted).
+            while (
+                (len(fashion) < target_fashion or len(general) < target_general)
+                and source_position < MAX_SOURCE_POSITION
+                and page <= MAX_PAGES
+            ):
                 url = f"{base_url}/collections/{collection_slug}?sort_by=best-selling&page={page}"
                 try:
                     resp = await _fetch_with_retry(client, url)
@@ -1315,8 +1322,17 @@ async def scrape_store_bestsellers(
                     target_fashion, target_general, source_position,
                 )
 
-                # Source-position cap reached — no point fetching more
-                # pages, every product on them would be off-cap anyway.
+                # Both targets met — stop now even if we haven't hit
+                # MAX_SOURCE_POSITION. Saves quota and runtime when
+                # the top of the catalog is dense in both feeds.
+                if (
+                    len(fashion) >= target_fashion
+                    and len(general) >= target_general
+                ):
+                    break
+                # Source-position ceiling reached — no point fetching
+                # more pages, every product on them would be off-cap
+                # anyway.
                 if source_position >= MAX_SOURCE_POSITION:
                     break
 
@@ -1878,6 +1894,34 @@ def reset_all_labels(db: Session) -> int:
     return count
 
 
+def _per_store_warning(niche: str, fashion_n: int, general_n: int) -> str | None:
+    """Decide whether a per-store scrape result deserves a warning row
+    in the popup. Mixed-niche stores ('Fashion & General', 'Fashion &
+    HD', 'MultiMarket', etc.) are EXPECTED to populate both feeds; if
+    one is 0 that's almost always a mis-routing or sparse-catalog
+    signal. Pure-niche stores (Fashion-only / General-only)
+    legitimately have one empty feed — no warning.
+
+    Centralised here so tests can pin the decision without standing
+    up a full async scrape pipeline.
+    """
+    if fashion_n == 0 and general_n == 0:
+        return "Dead scrape — both feeds empty"
+    n = (niche or "").lower()
+    expects_both = "&" in n or "multi" in n or "mixed" in n
+    if not expects_both:
+        return None
+    if fashion_n == 0:
+        return (
+            "Fashion feed empty (mixed-niche store expected to populate both)"
+        )
+    if general_n == 0:
+        return (
+            "General feed empty (mixed-niche store expected to populate both)"
+        )
+    return None
+
+
 async def scrape_all_stores(db: Session) -> dict:
     """Scrape all stores. Returns a per-store summary so the API can
     surface real success/failure (counts, errors) to the user."""
@@ -1895,7 +1939,9 @@ async def scrape_all_stores(db: Session) -> dict:
     for store in stores:
         store_result = {
             "id": store.id, "name": store.name,
-            "products": 0, "general": 0, "errors": [],
+            "niche": store.niche or "",
+            "products": 0, "general": 0,
+            "warning": None, "errors": [],
         }
         logger.info(f"Scraping {store.name} ({store.url})...")
         try:
@@ -1912,8 +1958,14 @@ async def scrape_all_stores(db: Session) -> dict:
                     f"  ✓ {len(fashion)} fashion + {len(general)} general "
                     f"for {store.name}"
                 )
+                store_result["warning"] = _per_store_warning(
+                    store.niche or "", len(fashion), len(general),
+                )
             else:
                 results["stores_failed"] += 1
+                store_result["warning"] = _per_store_warning(
+                    store.niche or "", 0, 0,
+                )
                 logger.warning(
                     f"  ✗ No products for {store.name} — errors: {errors}"
                 )

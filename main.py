@@ -49,7 +49,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # Override at deploy time with the TRUST_EPOCH_UTC env var (ISO 8601).
 # Default is the most recent significant change — bump it when shipping
 # a cap change, hard-drop tightening, schema migration, etc.
-_DEFAULT_TRUST_EPOCH = datetime(2026, 5, 4, 0, 0, 0)
+_DEFAULT_TRUST_EPOCH = datetime(2026, 5, 5, 0, 0, 0)
 
 
 def _parse_trust_epoch(raw: Optional[str]) -> datetime:
