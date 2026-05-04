@@ -21,13 +21,20 @@ class Store(Base):
     country = Column(String(255), default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    products = relationship("Product", back_populates="store", cascade="all, delete-orphan")
+    products = relationship(
+        "Product",
+        back_populates="store",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 class Product(Base):
     __tablename__ = "products"
 
     id = Column(Integer, primary_key=True, index=True)
-    store_id = Column(Integer, ForeignKey("stores.id"), nullable=False)
+    store_id = Column(
+        Integer, ForeignKey("stores.id", ondelete="CASCADE"), nullable=False,
+    )
     # Shopify product handles can be 200+ chars on stores with long German /
     # Dutch / French SEO-friendly product names. Use Text (unlimited) for
     # any field that holds a handle or a derived value to avoid silent
@@ -58,13 +65,20 @@ class Product(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     store = relationship("Store", back_populates="products")
-    history = relationship("PositionHistory", back_populates="product", cascade="all, delete-orphan")
+    history = relationship(
+        "PositionHistory",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 class PositionHistory(Base):
     __tablename__ = "position_history"
 
     id = Column(Integer, primary_key=True, index=True)
-    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+    product_id = Column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False,
+    )
     position = Column(Integer, nullable=False)
     date = Column(DateTime, default=datetime.utcnow)
 

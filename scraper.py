@@ -285,6 +285,11 @@ _FORCE_FASHION_PATTERNS = [
     r"\bm(?:ä|a|ae)ntel\w*", r"\bmantel\w*",
     r"\bkleid\w*", r"\br(?:ö|o|oe)ck\b", r"\br(?:ö|o|oe)cke\b",
     r"\br(?:ö|o|oe)cken\b", r"\br(?:ö|o|oe)ckes\b",
+    # Bare "Hose" matches German pants — but English "garden hose" /
+    # "fire hose" / "expandable hose" are utility hardware. The
+    # FORCE_GENERAL hose-tools block below catches those first; this
+    # pattern only fires when the title doesn't have a utility-hose
+    # qualifier in front of it.
     r"\bhose\b", r"\bhosen\w*", r"\bjogginghose\w*",
     r"\bsakkos?\b",
     r"\bbademantel\w*", r"\bbademaentel\w*",
@@ -353,6 +358,8 @@ _FORCE_FASHION_PATTERNS = [
     r"\bsunglasses\b", r"\bgoggles\b", r"\bglasses\b",
     r"\beyewear\b",
     r"\breading[\s\-]glasses\b", r"\bprogressive[\s\-]glasses\b",
+    r"\bprogressive[\s\-]?lenses?\b", r"\bbifocal[\s\-]?(?:glasses|lenses?)?\b",
+    r"\bvarifocal[\s\-]?(?:glasses|lenses?)?\b",
     r"\bbrillen?\b", r"\bsonnenbrille\w*", r"\blesebrille\w*",
     r"\blunettes\b",
     r"\bgafas\b",
@@ -501,6 +508,32 @@ _FORCE_GENERAL_PATTERNS = [
     r"\bvergr(?:ö|o|oe)(?:ß|s|ss)erungsglas\w*",
     r"\bumbrella\w*", r"\bregenschirm\w*", r"\bparapluie\w*",
     r"\bparaguas\b", r"\bombrello\b", r"\bparaplu\b",
+    # === Hose HARDWARE (English) — the German FORCE_FASHION 'Hose'
+    # === pattern catches these as pants by mistake. Wins precedence
+    # === because FORCE_GENERAL is checked first, so 'Garden Hose'
+    # === / 'Fire Hose' / 'Expandable Hose Attachment' all land on
+    # === General even though `\bhose\b` would have promoted them.
+    r"\bgarden[\s\-]?hoses?\b", r"\bgarten[\s\-]?schlauch\w*",
+    r"\bfire[\s\-]?hoses?\b",
+    r"\bexpandable[\s\-]?hoses?\b",
+    r"\bhose[\s\-]?(?:attachment|reel|nozzle|spray(?:er)?|connector|fitting)s?\b",
+    r"\b(?:high[\s\-]?pressure|water|spray)[\s\-]?hoses?\b",
+    # === Eyewear ACCESSORIES — utility / consumables for glasses,
+    # === NOT eyewear-as-fashion. These often live alongside real
+    # === eyewear in 'wild-eye-vision' / sunglasses-store catalogs
+    # === and would otherwise match the FORCE_FASHION glasses /
+    # === eyewear pattern via title proximity.
+    r"\blens[\s\-]?(?:cleaner|cleaning|cloth|wipe|wipes|spray|fog|case|kit|holder|polish)\w*",
+    r"\bmicrofib(?:er|re)[\s\-]?(?:lens[\s\-]?)?cloth\w*",
+    r"\bcontact[\s\-]?lens(?:[\s\-]?(?:solution|case|cleaner|holder))?\w*",
+    r"\beye[\s\-]?drops?\b", r"\baugentropfen\w*",
+    r"\bglasses[\s\-]?(?:chain|cord|strap|holder|stand|pouch|case|repair[\s\-]?kit|cleaner|cloth|wipes?|spray)\w*",
+    r"\beyeglass(?:es)?[\s\-]?(?:chain|cord|strap|holder|stand|pouch|case|repair[\s\-]?kit|cleaner|cloth|wipes?|spray)\w*",
+    r"\bsunglass(?:es)?[\s\-]?(?:case|pouch|cleaner|cloth|repair[\s\-]?kit|holder|stand|strap|cord)\w*",
+    r"\bbrillen(?:reiniger|tuch|t(?:ü|u|ue)cher|etui|halter|kette|band|kordel|spray)\w*",
+    r"\b(?:eyeglass|glasses|sunglasses)[\s\-]?(?:screwdriver|tightening|adjust)\w*",
+    r"\boptical[\s\-]?(?:cleaner|spray|wipes?|cloth)\w*",
+    r"\blens[\s\-]?fog[\s\-]?spray\w*", r"\banti[\s\-]?fog[\s\-]?spray\w*",
     # === Lighting fixtures — ALWAYS home/general, never fashion.
     # === Trips on the noun even when modifiers ('Crystal Ring',
     # === 'Pearl', 'Diamond', 'Gold', 'Silver') sound jewelry-like.

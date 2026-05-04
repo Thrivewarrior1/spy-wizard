@@ -397,6 +397,138 @@ SUBNICHE_SYNONYMS = {
 }
 
 
+# =====================================================================
+# CATEGORY-aware search — typing a category word ('lighting', 'shoes',
+# 'eyewear', 'earring') does NOT substring-match the title. A naïve
+# substring search for 'lighting' catches 'Lightweight Hiking Shoes'
+# via the 'light' substring; a search for 'shoes' catches 'Shoehorn
+# Steel'. Wrong both times.
+#
+# For category words we expand to a curated list of NOUN tokens and
+# search them with a word boundary on title / handle / product_type.
+# The bare category word is ALSO matched against ai_tags / subniche
+# (Gemini may have tagged 'lighting' or 'jewelry' directly), but
+# never against title — that's where the over-match would happen.
+# =====================================================================
+CATEGORY_NOUN_MAP = {
+    # --- Lighting (the user's BUG 2 case) ---
+    "lighting": [
+        "chandelier", "chandeliers", "sconce", "sconces", "candelabra",
+        "candleholder", "candle holder", "pendant light", "ceiling light",
+        "ceiling lamp", "wall light", "wall lamp", "wall sconce",
+        "table lamp", "floor lamp", "desk lamp", "night light",
+        "nightlight", "lamp shade", "lampshade", "string lights",
+        "fairy lights", "light bulb", "light fixture", "led bulb",
+        "led strip", "led panel",
+        "lamp", "lamps", "lampe", "lampen", "leuchte", "leuchten",
+        "kronleuchter", "tischlampe", "stehlampe", "wandlampe",
+        "deckenlampe", "hängelampe", "pendelleuchte", "wandleuchte",
+        "lichterkette", "lustre", "suspension", "plafonnier",
+        "applique", "abat-jour", "lampadario", "lampada", "paralume",
+        "kroonluchter", "tafellamp", "vloerlamp",
+        "araña", "lámpara", "candelabro",
+    ],
+    "lights": "lighting", "lamp": "lighting", "lamps": "lighting",
+    "chandelier": "lighting", "lampe": "lighting", "lampen": "lighting",
+    # --- Footwear ---
+    # Bare 'shoe' / 'shoes' deliberately omitted — they substring-match
+    # 'Shoehorn' / 'Shoe Polish' / 'Shoe Rack' (not footwear) too
+    # often. Real footwear is almost always titled with a specific
+    # noun (sneaker / boot / sandal / loafer / heel / slipper /
+    # oxford / Schuh / chaussure / zapato / scarpe / schoenen).
+    "footwear": [
+        "sneaker", "sneakers", "boot", "boots",
+        "sandal", "sandals", "slipper", "slippers", "heel", "heels",
+        "loafer", "loafers", "stiletto", "stilettos", "oxfords",
+        "schuh", "schuhe", "stiefel", "sandalen", "hausschuh",
+        "halbschuh", "chaussure", "chaussures", "botte", "bottes",
+        "sandale", "sandales", "basket", "baskets", "escarpins",
+        "zapato", "zapatos", "bota", "botas", "sandalia", "sandalias",
+        "zapatilla", "zapatillas", "scarpe", "stivali", "sandali",
+        "schoenen", "laarzen", "slip-on", "slip-ons", "orthoschuh",
+    ],
+    "shoes": "footwear", "shoe": "footwear", "sneakers": "footwear",
+    "boots": "footwear", "sandals": "footwear",
+    # --- Apparel / clothing ---
+    "apparel": [
+        "dress", "dresses", "shirt", "shirts", "blouse", "blouses",
+        "sweater", "sweaters", "hoodie", "hoodies", "jacket", "jackets",
+        "coat", "coats", "skirt", "skirts", "pants", "jeans", "shorts",
+        "trousers", "jumpsuit", "jumpsuits", "robe", "robes",
+        "bathrobe", "bathrobes", "pajamas", "pyjamas",
+        "kleid", "kleider", "hemd", "hemden", "bluse", "blusen",
+        "pullover", "jacke", "jacken", "mantel", "mäntel",
+        "rock", "röcke", "hose", "hosen", "bademantel",
+        "chemise", "chemisier", "veste", "manteau", "jupe", "pantalon",
+        "vestido", "camisa", "blusa", "chaqueta", "abrigo", "falda",
+        "vestiti", "vestito", "camicia", "giacca", "cappotto", "gonna",
+        "jurk", "rok", "broek", "trui", "jas",
+    ],
+    "clothing": "apparel", "clothes": "apparel",
+    # --- Eyewear (style — not eyewear-accessory utility) ---
+    "eyewear": [
+        "sunglasses", "glasses", "eyewear", "frames", "brille",
+        "brillen", "sonnenbrille", "lesebrille", "lunettes", "gafas",
+        "occhiali", "bril",
+    ],
+    "sunglasses": "eyewear", "glasses": "eyewear",
+    # --- Jewelry sub-categories ---
+    "earring": [
+        "earring", "earrings", "stud", "studs", "hoop", "hoops",
+        "drop earring", "ohrring", "ohrringe", "boucle d'oreille",
+        "pendiente", "orecchino", "oorbel",
+    ],
+    "earrings": "earring",
+    "necklace": [
+        "necklace", "necklaces", "pendant", "chain", "halskette",
+        "kette", "collier", "collar", "collana", "ketting",
+    ],
+    "necklaces": "necklace",
+    "bracelet": [
+        "bracelet", "bracelets", "armband", "armbänder",
+        "pulsera", "braccialetto", "armbandje",
+    ],
+    "bracelets": "bracelet",
+    # --- Bags ---
+    "bag": [
+        "bag", "bags", "handbag", "handbags", "backpack", "backpacks",
+        "tote", "totes", "clutch", "clutches", "wallet", "wallets",
+        "purse", "purses", "crossbody", "pouch", "pouches", "satchel",
+        "satchels", "tasche", "taschen", "rucksack", "sac", "bolso",
+        "borsa", "tas",
+    ],
+    "bags": "bag", "handbag": "bag", "backpack": "bag",
+}
+
+
+def _resolve_category_alias(term: str) -> str | None:
+    """If `term` (or its singular) is a key in CATEGORY_NOUN_MAP and
+    the value is a string, follow the alias chain to find the canonical
+    category. Returns the canonical key (whose value is the noun list)
+    or None if the term isn't a category word."""
+    for cand in _singularize(term.lower()):
+        if cand not in CATEGORY_NOUN_MAP:
+            continue
+        seen = set()
+        key = cand
+        while isinstance(CATEGORY_NOUN_MAP[key], str):
+            if key in seen:  # alias loop guard
+                return None
+            seen.add(key)
+            key = CATEGORY_NOUN_MAP[key]
+        return key
+    return None
+
+
+def category_nouns_for(term: str) -> list:
+    """Return the curated noun list for a category term, or [] if
+    the term isn't a category word."""
+    canonical = _resolve_category_alias(term)
+    if canonical is None:
+        return []
+    return list(CATEGORY_NOUN_MAP[canonical])
+
+
 def expand_single_term(term: str) -> list:
     """Expand a single search term to include its translations and a
     naive singular form. 'bags' -> {bags, bag, tasche, sac, ...},
@@ -452,6 +584,24 @@ def _match_clauses(column, variant: str):
     return [column.ilike(f"%{variant}%")]
 
 
+def _strict_word_clauses(column, term: str):
+    """Match `term` against `column` requiring a word boundary on BOTH
+    sides — so 'lamp' matches 'Table Lamp' / 'Floor Lamp' but NOT
+    'lamppost' or 'lampoon'. Used for CATEGORY-noun matches against
+    title / handle / product_type so 'lighting' doesn't catch
+    'Lightweight Hiking Shoes' via the bare 'light' substring.
+
+    Postgres: \\y boundary on both sides. SQLite: REGEXP function
+    registered in database.py with \\b boundary.
+    """
+    if _is_postgres_db():
+        pat = r"\y" + _re.escape(term) + r"\y"
+        return [column.op("~*")(pat)]
+    # SQLite (and any other dialect with REGEXP via the connect hook).
+    pat = r"\b" + _re.escape(term) + r"\b"
+    return [column.op("REGEXP")(pat)]
+
+
 # Columns the search hits. subniche is included here as BACKEND-ONLY
 # search metadata: a search for 'earring' must match a product whose
 # title is opaque ('Stud Studded Loops') but whose Gemini-assigned
@@ -473,9 +623,32 @@ def _word_match_condition(word: str):
     Winter Coats'); subniche carries Gemini's high-level category
     label so that 'earring' can hit subniche='jewelry'.
 
+    For CATEGORY words (lighting, footwear, apparel, eyewear, earring,
+    etc.) the bare word is NOT substring-matched against the title —
+    that would catch 'lightweight' for 'lighting' or 'shoehorn' for
+    'shoes'. Instead the search expands to a curated noun list with
+    word-boundary matches on title/handle/product_type. The bare
+    category word is still matched against ai_tags/subniche where
+    Gemini may have tagged it directly.
+
     Variants under 3 characters are dropped — too short to match
     meaningfully and they cause runaway false positives.
     """
+    nouns = category_nouns_for(word)
+    if nouns:
+        # Strict category mode: word-boundary noun match in title /
+        # handle / product_type, plus loose match in ai_tags / subniche
+        # for both nouns AND the bare category word.
+        pieces = []
+        for n in nouns:
+            for col in (Product.title, Product.handle, Product.product_type):
+                pieces.extend(_strict_word_clauses(col, n))
+            for col in (Product.ai_tags, Product.subniche):
+                pieces.extend(_match_clauses(col, n))
+        for col in (Product.ai_tags, Product.subniche):
+            pieces.extend(_match_clauses(col, word.lower()))
+        return or_(*pieces) if pieces else None
+
     variants = [v for v in expand_single_term(word) if len(v) >= 3]
     pieces = []
     for v in variants:
@@ -500,10 +673,18 @@ def build_search_filters(search_query: str):
 
     loose_conditions = []
     for word in words:
+        # Skip the loose-OR fallback for category words too — typing
+        # 'lighting' must NEVER fall through to a substring match for
+        # 'light' that catches 'Lightweight Hiking Shoes'.
+        if category_nouns_for(word):
+            cond = _word_match_condition(word)
+            if cond is not None:
+                loose_conditions.append(cond)
+            continue
         variants = [v for v in expand_single_term(word) if len(v) >= 3]
         for v in variants:
             for col in SEARCH_COLUMNS:
-                loose_conditions.extend(_match_clauses(col, v))
+                loose_conditions.append(_match_clauses(col, v)[0])
     return strict_conditions, loose_conditions
 
 
@@ -514,10 +695,31 @@ def build_ai_tag_filters(search_query: str):
     ('earring' → 'jewelry') ALL participate on the primary search
     path — otherwise the fallback would miss subniche-only hits
     whenever the ai_tags query returns any unrelated results.
+
+    For CATEGORY words, the same strict mode applies — the bare word
+    is matched against ai_tags / subniche only (where Gemini may have
+    tagged it), but the title-substring path is bypassed entirely so
+    'lighting' doesn't catch 'Lightweight'.
     """
     words = [w for w in search_query.lower().split() if w]
     conds = []
     for w in words:
+        nouns = category_nouns_for(w)
+        if nouns:
+            # Category mode: noun-list with strict word boundary on
+            # title/handle/product_type, plus loose match on ai_tags +
+            # subniche for nouns AND the bare category word.
+            word_or = []
+            for n in nouns:
+                for col in (Product.title, Product.handle, Product.product_type):
+                    word_or.extend(_strict_word_clauses(col, n))
+                for col in (Product.ai_tags, Product.subniche):
+                    word_or.extend(_match_clauses(col, n))
+            for col in (Product.ai_tags, Product.subniche):
+                word_or.extend(_match_clauses(col, w))
+            if word_or:
+                conds.append(or_(*word_or))
+            continue
         word_or = []
         for variant in expand_single_term(w):
             if len(variant) < 3:
@@ -1231,7 +1433,44 @@ async def get_stats(db: Session = Depends(get_db)):
         )
         .count()
     )
-    return {"stores": total_stores, "products": total_products, "heroes": heroes, "villains": villains}
+    # New-store health check — flag any store whose most-recent scrape
+    # produced 0 fashion + 0 general (a dead scrape; usually means the
+    # store-add config is broken or Cloudflare blocked us) OR whose
+    # ratio between feeds is implausibly skewed (one feed > 100 with
+    # the other empty — usually means the classifier mis-routed
+    # everything, like the wild-eye-vision first-scrape regression
+    # the user reported).
+    unhealthy_stores = []
+    for s in db.query(Store).all():
+        fashion_n = sum(1 for p in s.products if p.is_fashion)
+        general_n = sum(1 for p in s.products if not p.is_fashion and p.subniche)
+        if fashion_n == 0 and general_n == 0:
+            unhealthy_stores.append({
+                "id": s.id, "name": s.name, "url": s.url,
+                "fashion": 0, "general": 0,
+                "reason": "dead-scrape (both feeds empty)",
+            })
+        elif (fashion_n > 100 and general_n == 0) or (general_n > 100 and fashion_n == 0):
+            unhealthy_stores.append({
+                "id": s.id, "name": s.name, "url": s.url,
+                "fashion": fashion_n, "general": general_n,
+                "reason": "skewed-feeds (one populated, the other empty — likely mis-routing)",
+            })
+    if unhealthy_stores:
+        # Surface as logged warning too so Railway logs flag it without
+        # waiting for a /api/stats request to discover it.
+        logger.warning(
+            "Health check: %d unhealthy stores: %s",
+            len(unhealthy_stores),
+            [u["name"] for u in unhealthy_stores],
+        )
+    return {
+        "stores": total_stores,
+        "products": total_products,
+        "heroes": heroes,
+        "villains": villains,
+        "unhealthy_stores": unhealthy_stores,
+    }
 
 # --- Serve Frontend ---
 frontend_path = os.path.dirname(__file__)
