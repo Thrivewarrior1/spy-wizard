@@ -28,3 +28,24 @@ jobs:
           # Force the in-memory test path; never touch a real DB.
           DATABASE_URL: "sqlite:///:memory:"
         run: pytest -v
+
+      - name: Smoke-import main.py + boot lifespan
+        env:
+          DATABASE_URL: "sqlite:///:memory:"
+        run: |
+          # Catches the failure class where main.py parses fine in unit
+          # tests but the FastAPI lifespan startup blows up (missing
+          # import, lifespan-only code path, dialect mismatch, etc.).
+          # Without this step the failure surfaces only on Railway as a
+          # silent stuck deploy. Now it fails CI before merge.
+          python -c "
+          import sys, asyncio
+          sys.path.insert(0, '.')
+          import main
+          async def boot():
+              from contextlib import AsyncExitStack
+              async with AsyncExitStack() as stack:
+                  await stack.enter_async_context(main.lifespan(main.app))
+                  print('LIFESPAN BOOTED OK')
+          asyncio.run(boot())
+          "
