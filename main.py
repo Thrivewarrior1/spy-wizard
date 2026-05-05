@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
@@ -49,7 +49,20 @@ PORT = int(os.getenv("PORT", "8000"))
 # Override at deploy time with the TRUST_EPOCH_UTC env var (ISO 8601).
 # Default is the most recent significant change — bump it when shipping
 # a cap change, hard-drop tightening, schema migration, etc.
-_DEFAULT_TRUST_EPOCH = datetime(2026, 5, 5, 0, 0, 0)
+# 2026-05-04 was the day the source-position-correctness fix shipped
+# AND the day the first trustworthy snapshots landed in the DB. Setting
+# the epoch to 2026-05-04 00:00 UTC means: May 4 snapshots qualify as
+# priors for May 5 onwards. The previous bump to May 5 was wrong —
+# with both `PositionHistory.date < today_start` (today_start = May 5
+# 00:00) AND `PositionHistory.date >= TRUST_EPOCH_UTC` (May 5 00:00)
+# in force, NO row can satisfy both clauses simultaneously, so the
+# hero/villain query would silently return 0/0 forever.
+#
+# INVARIANT: TRUST_EPOCH_UTC must ALWAYS be < today's 00:00 UTC, or
+# the comparison filters become mutually exclusive. The startup check
+# below logs a loud warning if that invariant breaks so a future deploy
+# can never silently disable the labels again.
+_DEFAULT_TRUST_EPOCH = datetime(2026, 5, 4, 0, 0, 0)
 
 
 def _parse_trust_epoch(raw: Optional[str]) -> datetime:
@@ -72,6 +85,28 @@ def _parse_trust_epoch(raw: Optional[str]) -> datetime:
 
 
 TRUST_EPOCH_UTC = _parse_trust_epoch(os.getenv("TRUST_EPOCH_UTC"))
+
+
+def _trust_epoch_invariant_check() -> Optional[str]:
+    """Return an error message if TRUST_EPOCH_UTC is at or past today's
+    00:00 UTC — that's the misconfiguration that silently breaks the
+    hero/villain query (mutually-exclusive prior filters). Called at
+    startup and exposed on /api/debug/heroes so the failure mode is
+    loud rather than a silent 0/0.
+    """
+    today_start = datetime.utcnow().replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    if TRUST_EPOCH_UTC >= today_start:
+        return (
+            f"TRUST_EPOCH_UTC ({TRUST_EPOCH_UTC.isoformat()}) is at or past "
+            f"today's UTC midnight ({today_start.isoformat()}). The "
+            f"hero/villain query requires "
+            f"prior_date < today_start AND prior_date >= TRUST_EPOCH_UTC; "
+            f"those clauses are mutually exclusive when the epoch == today. "
+            f"Roll the epoch back to a date that is strictly before today."
+        )
+    return None
 
 
 # Hard cap on plausible day-over-day rank movement. Anything larger
@@ -180,6 +215,13 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(daily_scrape, "interval", hours=12, id="backup_scrape")
     scheduler.start()
     logger.info("Scheduler started - daily scrape at 06:00 UTC + every 12h backup")
+    # Loud failure mode if the trust-epoch was bumped to >= today_start.
+    # Without this, hero/villain queries silently return 0/0 because the
+    # `prior_date < today_start AND prior_date >= TRUST_EPOCH_UTC` filters
+    # become mutually exclusive. We've hit this regression twice now.
+    epoch_problem = _trust_epoch_invariant_check()
+    if epoch_problem:
+        logger.error("TRUST EPOCH INVARIANT VIOLATED — %s", epoch_problem)
     yield
     scheduler.shutdown()
 
@@ -1235,6 +1277,126 @@ async def debug_env():
             else "sqlite" if not os.getenv("DATABASE_URL") or "sqlite" in os.getenv("DATABASE_URL", "")
             else "other"
         ),
+    }
+
+
+@app.get("/api/debug/heroes")
+async def debug_heroes(db: Session = Depends(get_db)):
+    """Diagnostic for the hero/villain pipeline. Reports:
+
+      - the active TRUST_EPOCH_UTC and today's UTC midnight
+      - the invariant-violation flag (TRUST_EPOCH >= today_start
+        silently disables labels)
+      - per-store snapshot date histogram (last 5 UTC days)
+      - delta distribution between the most-recent prior snapshot
+        (date < today_start AND date >= TRUST_EPOCH_UTC) and
+        Product.current_position
+      - sample 10 fashion products with their prior + current
+        position so the operator can eyeball whether the join is
+        finding the right pairs
+
+    The user has hit the silent-0/0 regression twice now. This
+    endpoint exists so the next time it happens, the diagnosis is
+    one curl away instead of an investigation.
+    """
+    today_start = _today_start_utc()
+    invariant = _trust_epoch_invariant_check()
+
+    # Snapshot dates per store (last 5 UTC days)
+    five_days_ago = today_start - timedelta(days=5)
+    rows = (
+        db.query(
+            Store.name,
+            func.date(PositionHistory.date).label("snapshot_date"),
+            func.count(PositionHistory.id).label("n"),
+        )
+        .join(Product, Product.id == PositionHistory.product_id)
+        .join(Store, Store.id == Product.store_id)
+        .filter(PositionHistory.date >= five_days_ago)
+        .group_by(Store.name, func.date(PositionHistory.date))
+        .order_by(Store.name, func.date(PositionHistory.date))
+        .all()
+    )
+    histogram = {}
+    for store_name, snap_date, n in rows:
+        histogram.setdefault(store_name, []).append(
+            {"date": str(snap_date), "snapshots": int(n)},
+        )
+
+    # Compute the prior subquery and join Products to it.
+    sub = _prior_position_subquery(db, today_start)
+    pairs = (
+        db.query(
+            Product.id, Product.title, Store.name,
+            Product.is_fashion, Product.current_position,
+            sub.c.prior_position,
+        )
+        .join(Store, Store.id == Product.store_id)
+        .outerjoin(sub, sub.c.product_id == Product.id)
+        .all()
+    )
+    deltas = []
+    fashion_movers = []
+    for pid, title, sname, is_fash, cur, prior in pairs:
+        if prior is None:
+            continue
+        delta = (cur or 0) - prior
+        deltas.append(delta)
+        if is_fash and delta != 0 and len(fashion_movers) < 10:
+            fashion_movers.append({
+                "id": pid, "store": sname, "title": title[:80],
+                "prior": prior, "current": cur, "delta": delta,
+            })
+
+    if deltas:
+        deltas_sorted = sorted(deltas, key=abs)
+        n = len(deltas)
+        delta_summary = {
+            "n_with_prior": n,
+            "abs_min": min(abs(d) for d in deltas),
+            "abs_median": abs(deltas_sorted[n // 2]),
+            "abs_p90": abs(deltas_sorted[int(n * 0.9)]),
+            "abs_max": max(abs(d) for d in deltas),
+            "within_30_cap": sum(1 for d in deltas if abs(d) <= 30),
+            "exceeds_30_cap": sum(1 for d in deltas if abs(d) > 30),
+            "moved_up": sum(1 for d in deltas if d < 0),  # rank decreased = better
+            "moved_down": sum(1 for d in deltas if d > 0),
+            "unchanged": sum(1 for d in deltas if d == 0),
+        }
+    else:
+        delta_summary = {"n_with_prior": 0}
+
+    # Hero/villain SQL counts (mirrors get_stats but exposed here).
+    heroes_q = (
+        db.query(func.count(Product.id))
+        .join(sub, sub.c.product_id == Product.id)
+        .filter(
+            Product.is_fashion == True,
+            Product.current_position < sub.c.prior_position,
+            sub.c.prior_position - Product.current_position <= HERO_VILLAIN_DELTA_CAP,
+        )
+        .scalar() or 0
+    )
+    villains_q = (
+        db.query(func.count(Product.id))
+        .join(sub, sub.c.product_id == Product.id)
+        .filter(
+            Product.is_fashion == True,
+            Product.current_position > sub.c.prior_position,
+            Product.current_position - sub.c.prior_position <= HERO_VILLAIN_DELTA_CAP,
+        )
+        .scalar() or 0
+    )
+
+    return {
+        "trust_epoch_utc": TRUST_EPOCH_UTC.isoformat(),
+        "today_start_utc": today_start.isoformat(),
+        "invariant_violation": invariant,
+        "snapshots_per_store_last_5_days": histogram,
+        "delta_summary": delta_summary,
+        "fashion_heroes_count": int(heroes_q),
+        "fashion_villains_count": int(villains_q),
+        "sample_fashion_movers": fashion_movers,
     }
 
 
