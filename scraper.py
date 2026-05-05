@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from models import Store, Product, PositionHistory
 from classifier import classify_products_batch
+from categories import assign_product_category
 
 logger = logging.getLogger(__name__)
 
@@ -1482,6 +1483,12 @@ def _upsert_one(
         product.ai_tags = product_data.get("ai_tags", "")
         product.is_fashion = is_fashion
         product.subniche = subniche
+        product.product_category = assign_product_category(
+            title=product_data.get("title", ""),
+            handle=product_data.get("handle", ""),
+            image_url=product_data.get("image_url", ""),
+            product_type=product_data.get("product_type", ""),
+        )
         product.last_scraped = now
     else:
         product = Product(
@@ -1500,6 +1507,12 @@ def _upsert_one(
             ai_tags=product_data.get("ai_tags", ""),
             is_fashion=is_fashion,
             subniche=subniche,
+            product_category=assign_product_category(
+                title=product_data.get("title", ""),
+                handle=product_data.get("handle", ""),
+                image_url=product_data.get("image_url", ""),
+                product_type=product_data.get("product_type", ""),
+            ),
             last_scraped=now,
         )
         db.add(product)
@@ -1724,6 +1737,42 @@ def migrate_wearables_to_fashion(db: Session) -> int:
             f"jewelry/accessories/bags rows to the Fashion feed"
         )
     return len(rows)
+
+
+def migrate_backfill_product_category(db: Session) -> int:
+    """One-shot DB migration: assign `product_category` for every row
+    that doesn't have one yet, using the curated regex catalog in
+    categories.py. Idempotent — once a row has a non-empty category
+    we leave it alone (subsequent scrapes re-assign via _upsert_one
+    if the title changes).
+
+    Backfills the existing ~3500-row catalog without burning Gemini
+    quota, then every fresh scrape keeps category data current.
+    """
+    rows = (
+        db.query(Product)
+        .filter((Product.product_category == "") | (Product.product_category.is_(None)))
+        .all()
+    )
+    assigned = 0
+    for product in rows:
+        cat = assign_product_category(
+            title=product.title or "",
+            handle=product.handle or "",
+            image_url=product.image_url or "",
+            product_type=product.product_type or "",
+        )
+        if cat:
+            product.product_category = cat
+            assigned += 1
+    if assigned:
+        db.commit()
+        logger.info(
+            f"migrate_backfill_product_category: assigned {assigned} "
+            f"categories on existing rows (skipped {len(rows) - assigned} "
+            f"rows with no matching pattern)"
+        )
+    return assigned
 
 
 def migrate_drop_off_cap_positions(db: Session) -> int:

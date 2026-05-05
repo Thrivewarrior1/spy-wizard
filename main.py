@@ -26,6 +26,16 @@ from scraper import (
     migrate_apparel_to_fashion,
     migrate_force_general_to_general,
     migrate_drop_off_cap_positions,
+    migrate_backfill_product_category,
+)
+from categories import (
+    assign_product_category,
+    lookup_categories_for_query_token,
+    is_category_token,
+    PRODUCT_CATEGORIES,
+    PARENTS_TO_CHILDREN,
+    TOKEN_TO_CATEGORIES,
+    ALL_CATEGORY_NAMES,
 )
 from seed import seed_stores
 
@@ -207,6 +217,14 @@ async def lifespan(app: FastAPI):
         migrate_drop_off_cap_positions(db)
     except Exception as e:
         logger.warning(f"startup off-cap migration failed: {e}")
+    try:
+        # Backfill the new product_category column on every existing
+        # row using the curated regex catalog. Cheap (no Gemini calls)
+        # and idempotent — runs on every redeploy but only assigns to
+        # rows that don't already have a category.
+        migrate_backfill_product_category(db)
+    except Exception as e:
+        logger.warning(f"startup product_category backfill failed: {e}")
     finally:
         db.close()
     # Schedule daily scrape at 6 AM UTC
@@ -676,12 +694,21 @@ def _word_match_condition(word: str):
     Variants under 3 characters are dropped — too short to match
     meaningfully and they cause runaway false positives.
     """
+    pieces = []
+
+    # PRIMARY signal: the new `product_category` column. Multilingual
+    # token resolution (chandelier / Kronleuchter / lustre / lampadario
+    # all → 'chandelier') AND parent expansion (typing 'lighting' →
+    # union of every lighting child) live in categories.py.
+    matched_categories = lookup_categories_for_query_token(word)
+    if matched_categories:
+        pieces.append(Product.product_category.in_(list(matched_categories)))
+
     nouns = category_nouns_for(word)
     if nouns:
-        # Strict category mode: word-boundary noun match in title /
-        # handle / product_type, plus loose match in ai_tags / subniche
-        # for both nouns AND the bare category word.
-        pieces = []
+        # Legacy strict-noun list: word-boundary match in title /
+        # handle / product_type for products that haven't been
+        # re-classified yet. Plus loose match in ai_tags / subniche.
         for n in nouns:
             for col in (Product.title, Product.handle, Product.product_type):
                 pieces.extend(_strict_word_clauses(col, n))
@@ -689,10 +716,29 @@ def _word_match_condition(word: str):
                 pieces.extend(_match_clauses(col, n))
         for col in (Product.ai_tags, Product.subniche):
             pieces.extend(_match_clauses(col, word.lower()))
+
+    # If we got ANY category-driven match (new column or legacy nouns),
+    # ALSO apply the existing SUBNICHE_SYNONYMS expansion against
+    # title (with WORD BOUNDARIES so 'lighting' doesn't catch
+    # 'Lightweight') AND ai_tags / subniche (loose substring is fine
+    # there — those columns are curated). Lets umbrella terms like
+    # 'jewelry' still hit pre-backfill products via subniche AND via
+    # title substring of synonyms like 'earring'.
+    if matched_categories or nouns:
+        variants = [v for v in expand_single_term(word) if len(v) >= 3]
+        for v in variants:
+            # Title / handle / product_type — strict word boundary.
+            for col in (Product.title, Product.handle, Product.product_type):
+                pieces.extend(_strict_word_clauses(col, v))
+            # ai_tags / subniche — loose substring (curated columns).
+            for col in (Product.ai_tags, Product.subniche):
+                pieces.extend(_match_clauses(col, v))
         return or_(*pieces) if pieces else None
 
+    # Non-category token: existing substring search across title /
+    # ai_tags / product_type / subniche, with translations + reverse
+    # synonym expansion folded in.
     variants = [v for v in expand_single_term(word) if len(v) >= 3]
-    pieces = []
     for v in variants:
         for col in SEARCH_COLUMNS:
             pieces.extend(_match_clauses(col, v))
@@ -1277,6 +1323,86 @@ async def debug_env():
             else "sqlite" if not os.getenv("DATABASE_URL") or "sqlite" in os.getenv("DATABASE_URL", "")
             else "other"
         ),
+    }
+
+
+@app.get("/api/debug/search")
+async def debug_search(q: str = Query(""), db: Session = Depends(get_db)):
+    """Diagnostic for the hybrid search pipeline. Returns the parsed
+    query, per-token category resolution (with multilingual + parent
+    expansion), the SQL clause counts each strategy contributes, and
+    a sample 5 matches per strategy. Use to debug 'why didn't X show
+    up' in one curl.
+    """
+    tokens = [t for t in (q or "").lower().split() if t]
+    per_token = []
+    union_categories: set = set()
+    for tok in tokens:
+        cats = lookup_categories_for_query_token(tok)
+        legacy = category_nouns_for(tok) or []
+        per_token.append({
+            "token": tok,
+            "matched_categories": sorted(cats),
+            "legacy_nouns_sample": legacy[:8],
+            "is_category_token": bool(cats),
+            "is_parent_token": tok in PARENTS_TO_CHILDREN,
+        })
+        union_categories.update(cats)
+
+    counts = {}
+    samples = {}
+
+    # Strategy A — match on Product.product_category (the new column).
+    if union_categories:
+        cat_query = (
+            db.query(Product)
+            .filter(Product.product_category.in_(list(union_categories)))
+            .limit(500)
+        )
+        cat_rows = cat_query.all()
+        counts["product_category"] = len(cat_rows)
+        samples["product_category"] = [
+            {"id": p.id, "title": (p.title or "")[:80],
+             "category": p.product_category, "subniche": p.subniche}
+            for p in cat_rows[:5]
+        ]
+    else:
+        counts["product_category"] = 0
+        samples["product_category"] = []
+
+    # Strategy B — title substring (the existing path).
+    if q:
+        from sqlalchemy import or_
+        sub_q = db.query(Product)
+        for cond in build_ai_tag_filters(q):
+            sub_q = sub_q.filter(cond)
+        ai_rows = sub_q.limit(500).all()
+        counts["ai_tag_strict_AND"] = len(ai_rows)
+        samples["ai_tag_strict_AND"] = [
+            {"id": p.id, "title": (p.title or "")[:80],
+             "category": p.product_category, "subniche": p.subniche}
+            for p in ai_rows[:5]
+        ]
+
+        strict, loose = build_search_filters(q)
+        sq2 = db.query(Product)
+        for cond in strict:
+            sq2 = sq2.filter(cond)
+        strict_rows = sq2.limit(500).all()
+        counts["title_strict_AND"] = len(strict_rows)
+        samples["title_strict_AND"] = [
+            {"id": p.id, "title": (p.title or "")[:80],
+             "category": p.product_category, "subniche": p.subniche}
+            for p in strict_rows[:5]
+        ]
+
+    return {
+        "query": q,
+        "tokens": tokens,
+        "per_token": per_token,
+        "matched_categories_union": sorted(union_categories),
+        "strategy_counts": counts,
+        "strategy_samples": samples,
     }
 
 

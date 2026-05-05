@@ -60,6 +60,15 @@ class Product(Base):
     # that haven't been (re-)classified since this column was added — the
     # General feed filters those out.
     subniche = Column(String(50), default="")
+    # Fine-grained product category from the curated PRODUCT_CATEGORIES
+    # catalog (chandelier, table-lamp, sneaker, dress, bra, smartwatch,
+    # phone-case, etc.). Used by the hybrid search so a query for
+    # "chandelier" exhaustively returns chandelier products even when
+    # the title is opaque ("Aurora Crystal Pendant"). Empty string for
+    # products the regex classifier couldn't categorise — those still
+    # match via title/ai_tags but don't surface in strict-category
+    # searches.
+    product_category = Column(String(64), default="", index=True)
 
     last_scraped = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)

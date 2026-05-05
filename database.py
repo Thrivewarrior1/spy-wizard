@@ -66,6 +66,12 @@ def widen_text_columns():
         # General-tab subniche classification. ADD COLUMN IF NOT EXISTS so
         # this is idempotent across redeploys.
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS subniche VARCHAR(50) DEFAULT ''",
+        # Fine-grained product category for the hybrid search. Populated
+        # by assign_product_category() on every scrape and as a startup
+        # backfill so existing rows get categorised without waiting for
+        # the next scrape cycle.
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS product_category VARCHAR(64) DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS ix_products_product_category ON products(product_category)",
     ]
     with engine.connect() as conn:
         for stmt in statements:
