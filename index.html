@@ -420,8 +420,25 @@ function scrapeOne(id){fetch(`${API}/scrape/${id}`,{method:'POST'}).then(r=>r.js
 function openAdd(){editId=null;document.getElementById('modalTitle').textContent='Add Store';document.getElementById('mSubmit').textContent='Add Store';['mName','mUrl','mVisitors','mCountry'].forEach(x=>document.getElementById(x).value='');document.getElementById('mNiche').value='Fashion';document.getElementById('modal').classList.add('open')}
 function editStore(id,n,u,v,ni,co){editId=id;document.getElementById('modalTitle').textContent='Edit Store';document.getElementById('mSubmit').textContent='Save';document.getElementById('mName').value=n;document.getElementById('mUrl').value=u;document.getElementById('mVisitors').value=v;document.getElementById('mNiche').value=ni;document.getElementById('mCountry').value=co;document.getElementById('modal').classList.add('open')}
 function closeModal(){document.getElementById('modal').classList.remove('open')}
-function submitStore(){const d={name:document.getElementById('mName').value,url:document.getElementById('mUrl').value,monthly_visitors:document.getElementById('mVisitors').value,niche:document.getElementById('mNiche').value,country:document.getElementById('mCountry').value};
-  fetch(editId?`${API}/stores/${editId}`:`${API}/stores`,{method:editId?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>{if(!r.ok)throw 0;return r.json()}).then(()=>{closeModal();loadStores()}).catch(()=>alert('Failed to save'))}
+function submitStore(){
+  const d={name:document.getElementById('mName').value,url:document.getElementById('mUrl').value,monthly_visitors:document.getElementById('mVisitors').value,niche:document.getElementById('mNiche').value,country:document.getElementById('mCountry').value};
+  // Frontend pre-flight — catches the common typos before the API
+  // call so the user gets immediate feedback instead of a 400 round-trip.
+  if(!d.name||!d.name.trim()){alert('Please enter a store name');return}
+  if(!d.url||!d.url.trim()){alert('Please enter a store URL');return}
+  fetch(editId?`${API}/stores/${editId}`:`${API}/stores`,{method:editId?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
+    .then(async r=>{
+      if(r.ok)return r.json();
+      // Surface the actual server detail so the user sees the
+      // reason (duplicate URL, validation failure, etc.) instead of
+      // a generic "Failed to save".
+      let detail='HTTP '+r.status;
+      try{const j=await r.json();if(j&&j.detail){detail=j.detail}}catch(e){}
+      throw new Error(detail);
+    })
+    .then(()=>{closeModal();loadStores()})
+    .catch(err=>alert('Save failed: '+(err&&err.message?err.message:'unknown error')));
+}
 function delStore(id,n){if(!confirm(`Delete "${n}"?`))return;fetch(`${API}/stores/${id}`,{method:'DELETE'}).then(()=>{loadStores();loadStats()})}
 </script>
 </body>

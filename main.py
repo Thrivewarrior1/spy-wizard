@@ -271,6 +271,50 @@ class StoreUpdate(BaseModel):
     niche: Optional[str] = None
     country: Optional[str] = None
 
+
+def _normalise_store_url(raw: str) -> str:
+    """Make slight differences hash to the same store.
+
+      - strip leading/trailing whitespace
+      - lowercase the host portion only (paths stay case-sensitive
+        for stores that use case-significant slugs — none we know of
+        but kept conservative)
+      - prepend https:// when no scheme is given
+      - strip a trailing slash so 'novigood.com/' and 'novigood.com'
+        collide on the unique-URL check
+    """
+    if not raw:
+        return ""
+    u = raw.strip()
+    if not u:
+        return ""
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    if u.endswith("/"):
+        u = u[:-1]
+    return u
+
+
+def _validate_store_payload(name: str, url: str) -> Optional[str]:
+    """Return None if the (name, url) pair is acceptable, else a
+    human-readable error string. The string is surfaced as the 400
+    detail so the UI can show it instead of a generic 'Failed to save'."""
+    if not name or not name.strip():
+        return "Store name is required"
+    if len(name.strip()) > 255:
+        return "Store name must be 255 characters or fewer"
+    if not url or not url.strip():
+        return "Store URL is required"
+    cleaned = _normalise_store_url(url)
+    if not cleaned.startswith(("http://", "https://")):
+        return "Store URL must start with http:// or https://"
+    # Reject obviously broken URLs that survive normalisation —
+    # 'https://' alone, or hosts without a dot.
+    host_part = cleaned.split("://", 1)[1].split("/", 1)[0]
+    if not host_part or "." not in host_part:
+        return "Store URL host looks invalid (missing TLD?)"
+    return None
+
 @app.get("/api/stores")
 async def get_stores(db: Session = Depends(get_db)):
     stores = db.query(Store).order_by(Store.name).all()
@@ -287,23 +331,90 @@ async def get_stores(db: Session = Depends(get_db)):
         "last_scraped": max((p.last_scraped for p in s.products if p.is_fashion or p.subniche), default=None),
     } for s in stores]
 
-@app.post("/api/stores")
+@app.post("/api/stores", status_code=201)
 async def create_store(store: StoreCreate, db: Session = Depends(get_db)):
-    existing = db.query(Store).filter(Store.url == store.url).first()
+    """Create a new competitor store.
+
+    Returns:
+      201 + {id, name, url, niche, country, monthly_visitors} on success
+      400 with `detail` when name / url are missing or malformed
+      409 with `detail` when a store with the same normalised URL
+          already exists (the previous code returned 400 with the
+          generic message "Store already exists" which is technically
+          a Conflict, not a Bad Request — frontend was unable to
+          distinguish duplicate from validation error).
+    """
+    err = _validate_store_payload(store.name, store.url)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+
+    cleaned_url = _normalise_store_url(store.url)
+    # Match against the normalised URL on both sides so trailing-slash
+    # / scheme differences still trip the dedupe.
+    existing = next(
+        (s for s in db.query(Store).all()
+         if _normalise_store_url(s.url or "") == cleaned_url),
+        None,
+    )
     if existing:
-        raise HTTPException(status_code=400, detail="Store already exists")
-    new_store = Store(**store.model_dump())
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A store with this URL already exists "
+                f"(id={existing.id}, name={existing.name!r})"
+            ),
+        )
+
+    payload = store.model_dump()
+    payload["name"] = payload["name"].strip()
+    payload["url"] = cleaned_url
+    new_store = Store(**payload)
     db.add(new_store)
     db.commit()
     db.refresh(new_store)
-    return {"id": new_store.id, "name": new_store.name}
+    return {
+        "id": new_store.id, "name": new_store.name, "url": new_store.url,
+        "niche": new_store.niche, "country": new_store.country,
+        "monthly_visitors": new_store.monthly_visitors,
+    }
 
 @app.put("/api/stores/{store_id}")
 async def update_store(store_id: int, store: StoreUpdate, db: Session = Depends(get_db)):
     existing = db.query(Store).filter(Store.id == store_id).first()
     if not existing:
         raise HTTPException(status_code=404, detail="Store not found")
-    for key, value in store.model_dump(exclude_none=True).items():
+    payload = store.model_dump(exclude_none=True)
+    # Validate any submitted fields. A PUT can patch a single field,
+    # so only validate fields that were actually sent.
+    if "name" in payload and (not payload["name"] or not payload["name"].strip()):
+        raise HTTPException(status_code=400, detail="Store name cannot be empty")
+    if "url" in payload:
+        if not payload["url"] or not payload["url"].strip():
+            raise HTTPException(status_code=400, detail="Store URL cannot be empty")
+        # Validate URL shape against the same rules as create.
+        err = _validate_store_payload(payload.get("name") or existing.name, payload["url"])
+        if err and "url" in err.lower():
+            raise HTTPException(status_code=400, detail=err)
+        cleaned_url = _normalise_store_url(payload["url"])
+        # Conflict check — a different store already owns this URL.
+        clash = next(
+            (s for s in db.query(Store).all()
+             if s.id != store_id
+             and _normalise_store_url(s.url or "") == cleaned_url),
+            None,
+        )
+        if clash:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Another store with this URL already exists "
+                    f"(id={clash.id}, name={clash.name!r})"
+                ),
+            )
+        payload["url"] = cleaned_url
+    if "name" in payload:
+        payload["name"] = payload["name"].strip()
+    for key, value in payload.items():
         setattr(existing, key, value)
     db.commit()
     return {"success": True}
