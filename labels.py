@@ -71,6 +71,52 @@ def _parse_trust_epoch(raw: Optional[str]) -> datetime:
 TRUST_EPOCH_UTC = _parse_trust_epoch(os.getenv("TRUST_EPOCH_UTC"))
 
 
+# =====================================================================
+# DATA_START_DATE — trustworthy floor for the LabelEvent ledger.
+# =====================================================================
+# Events earlier than this date are from before the Spy Wizard 2
+# position-correctness + per-feed cap + classifier hardening rules
+# stabilised. They look like valid events to the system but reflect a
+# different underlying catalog shape, so we EXCLUDE them from every
+# read path AND prune them on startup.
+#
+# User-stated rule (2026-05-13): "only use the history if you have
+# stored any accurate data for the last 7 days, and from there on
+# move forward. Don't use any history from 30 days ago because that
+# data isn't accurate, because then the Spy Wizard 2 wasn't even
+# live yet."
+#
+# Default = 2026-05-06 (7 days before the 2026-05-13 stabilisation
+# date). Env-overridable via DATA_START_DATE (YYYY-MM-DD) so the
+# trustworthy window can be extended without a deploy as we audit
+# more historical days. The constant does NOT auto-advance — once
+# set, it's a fixed point and the trustworthy window GROWS as more
+# in-window days accumulate, up to the 30-day retention cap.
+_DEFAULT_DATA_START_DATE = datetime(2026, 5, 6, 0, 0, 0)
+
+
+def _parse_data_start_date(raw: Optional[str]) -> datetime:
+    if not raw:
+        return _DEFAULT_DATA_START_DATE
+    raw = raw.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1]
+    try:
+        parsed = datetime.fromisoformat(raw)
+        return parsed.replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None,
+        )
+    except ValueError:
+        logger.warning(
+            "DATA_START_DATE=%r is not parseable ISO 8601; falling back to %s",
+            raw, _DEFAULT_DATA_START_DATE.isoformat(),
+        )
+        return _DEFAULT_DATA_START_DATE
+
+
+DATA_START_DATE = _parse_data_start_date(os.getenv("DATA_START_DATE"))
+
+
 # Hard cap on plausible day-over-day rank movement. Anything larger is
 # almost certainly a structural reshuffle (catalog change, scrape source
 # change) rather than organic movement, so we suppress the
@@ -247,6 +293,27 @@ def compute_and_write_events(
 # =====================================================================
 # Retention.
 # =====================================================================
+def cleanup_pre_start_label_events(db: Session) -> int:
+    """One-shot DB migration: delete LabelEvent rows whose date is
+    before DATA_START_DATE. These are pre-Spy-Wizard-2 events that
+    look real but reflect a different catalog shape. Idempotent —
+    runs on every Railway redeploy.
+    """
+    deleted = (
+        db.query(LabelEvent)
+        .filter(LabelEvent.date < DATA_START_DATE)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    if deleted:
+        logger.info(
+            "cleanup_pre_start_label_events: dropped %d events with "
+            "date < DATA_START_DATE (%s)",
+            deleted, DATA_START_DATE.isoformat(),
+        )
+    return deleted
+
+
 def cleanup_label_events(
     db: Session,
     *,
@@ -296,7 +363,12 @@ def backfill_label_events(
     """
     now = now or datetime.utcnow()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Two-sided floor: retention cap, AND the trustworthy DATA_START_DATE.
+    # We never synthesise events for dates the read path would just
+    # filter out, so backfill is a no-op for pre-DATA_START days.
     cutoff = today_start - timedelta(days=retention_days)
+    if DATA_START_DATE > cutoff:
+        cutoff = DATA_START_DATE
 
     # Pull every product with at least one PositionHistory row inside
     # the window. We compute labels per (store, product) so the
@@ -359,6 +431,10 @@ def backfill_label_events(
                     # Today's events are owned by compute_and_write_events()
                     # at scrape time so the live position is fresh.
                     # Skip in backfill to avoid duplicate insert races.
+                    continue
+                if day < DATA_START_DATE:
+                    # Trustworthy floor — never synthesise events for
+                    # days before Spy Wizard 2 stabilised.
                     continue
                 prior_day = sorted_days[i - 1]
                 prior_pos = day_pos[prior_day]
@@ -429,6 +505,10 @@ def fetch_label_events_window(
         .join(Product, Product.id == LabelEvent.product_id)
         .filter(LabelEvent.label == label)
         .filter(LabelEvent.date >= cutoff)
+        # Trustworthy floor — never surface pre-DATA_START_DATE events
+        # even when the user picks a 30-day window. See the constant
+        # docstring at the top of this module.
+        .filter(LabelEvent.date >= DATA_START_DATE)
     )
     if store_id is not None:
         q = q.filter(LabelEvent.store_id == store_id)

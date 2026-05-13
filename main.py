@@ -57,11 +57,13 @@ from labels import (
     HERO_VILLAIN_DELTA_CAP,
     HERO_VILLAIN_CATALOG_FRACTION,
     LABEL_EVENT_RETENTION_DAYS,
+    DATA_START_DATE,
     today_start_utc as _today_start_utc,
     trustworthy_prior_filters as _trustworthy_prior_filters,
     delta_threshold as _delta_threshold,
     compute_and_write_events,
     cleanup_label_events,
+    cleanup_pre_start_label_events,
     backfill_label_events,
     fetch_label_events_window,
 )
@@ -185,11 +187,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"startup product_category backfill failed: {e}")
     try:
+        # Drop any pre-DATA_START_DATE events first. These are
+        # pre-Spy-Wizard-2 events that look real but reflect a
+        # different catalog shape and the user explicitly excluded
+        # them. Idempotent.
+        pre_start_pruned = cleanup_pre_start_label_events(db)
+        if pre_start_pruned:
+            logger.info(
+                f"startup pre-start cleanup: dropped {pre_start_pruned} "
+                f"events with date < {DATA_START_DATE.isoformat()}"
+            )
         # Backfill the LabelEvent ledger from existing PositionHistory.
         # User asked for 30-day retained heroes/villains; this gives the
         # UI immediate historical data instead of waiting for new
         # scrapes to populate. Idempotent — skips events that already
-        # exist for a given (product_id, date).
+        # exist for a given (product_id, date). Respects DATA_START_DATE.
         inserted = backfill_label_events(db)
         if inserted:
             logger.info(
@@ -1704,6 +1716,11 @@ async def debug_heroes(db: Session = Depends(get_db)):
     # maintained and the 7/14/30-day windows have data.
     retention_cutoff = today_start - timedelta(days=LABEL_EVENT_RETENTION_DAYS)
     total_events = db.query(func.count(LabelEvent.id)).scalar() or 0
+    pre_start_events = (
+        db.query(func.count(LabelEvent.id))
+        .filter(LabelEvent.date < DATA_START_DATE)
+        .scalar() or 0
+    )
     events_7d = (
         db.query(func.count(LabelEvent.id))
         .filter(LabelEvent.date >= today_start - timedelta(days=6))
@@ -1770,6 +1787,8 @@ async def debug_heroes(db: Session = Depends(get_db)):
             ),
             "retention_window_days": LABEL_EVENT_RETENTION_DAYS,
             "retention_cutoff": retention_cutoff.date().isoformat(),
+            "data_start_date": DATA_START_DATE.date().isoformat(),
+            "events_excluded_pre_start_count": int(pre_start_events),
             "heroes_by_day_last_30d": [
                 {"date": str(d), "n": int(n)} for d, n in heroes_by_day
             ],
@@ -1943,38 +1962,31 @@ async def debug_gemini():
     }
 
 @app.get("/api/stats")
-async def get_stats(db: Session = Depends(get_db)):
-    """Heroes/villains counted dynamically from the prior-position
-    subquery — no reliance on the deprecated Product.label column.
-    Both totals scope to the Fashion feed (is_fashion=True). Products
-    with no TRUSTWORTHY prior snapshot (i.e. dated before today UTC and
-    on/after TRUST_EPOCH_UTC) contribute to neither, and products
-    whose delta exceeds HERO_VILLAIN_DELTA_CAP are filtered out as
-    suspect (almost certainly a structural reshuffle, not movement).
+async def get_stats(
+    days: int = Query(1, ge=1, le=LABEL_EVENT_RETENTION_DAYS),
+    db: Session = Depends(get_db),
+):
+    """Top-of-page counter. Heroes / villains counts now follow the
+    `days` window so the value in the UI matches whatever 1/7/14/30
+    pill the user has selected.
+
+    Source of truth is the LabelEvent ledger (same as the feed
+    endpoints) — de-duplicated by product_id, taking the most recent
+    qualifying event per product. Pre-DATA_START_DATE events are
+    excluded by fetch_label_events_window so the numbers here always
+    match what the user sees in the hero/villain filtered grids.
     """
     total_stores = db.query(Store).count()
     total_products = db.query(Product).filter(Product.is_fashion == True).count()
-    sub = _prior_position_subquery(db)
-    heroes = (
-        db.query(Product)
-        .join(sub, sub.c.product_id == Product.id)
-        .filter(
-            Product.is_fashion == True,
-            Product.current_position < sub.c.prior_position,
-            sub.c.prior_position - Product.current_position <= HERO_VILLAIN_DELTA_CAP,
-        )
-        .count()
+    # Fashion-feed counts (the existing UI surface) windowed by `days`.
+    hero_pairs = fetch_label_events_window(
+        db, label="hero", days=days, is_fashion=True,
     )
-    villains = (
-        db.query(Product)
-        .join(sub, sub.c.product_id == Product.id)
-        .filter(
-            Product.is_fashion == True,
-            Product.current_position > sub.c.prior_position,
-            Product.current_position - sub.c.prior_position <= HERO_VILLAIN_DELTA_CAP,
-        )
-        .count()
+    villain_pairs = fetch_label_events_window(
+        db, label="villain", days=days, is_fashion=True,
     )
+    heroes = len(hero_pairs)
+    villains = len(villain_pairs)
     # Health check — flag stores whose last scrape went visibly wrong.
     # Two failure modes worth alerting on:
     #
@@ -2034,6 +2046,8 @@ async def get_stats(db: Session = Depends(get_db)):
         "products": total_products,
         "heroes": heroes,
         "villains": villains,
+        "days": days,
+        "data_start_date": DATA_START_DATE.date().isoformat(),
         "unhealthy_stores": unhealthy_stores,
     }
 

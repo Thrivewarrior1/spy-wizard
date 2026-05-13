@@ -123,8 +123,17 @@ select:focus,.search-box:focus{border-color:var(--accent)}
 
   <div class="stats-bar" id="statsBar">
     <div class="stat-card"><div class="num" id="statStores">-</div><div class="label">Stores</div></div>
-    <div class="stat-card"><div class="num" id="statHeroes" style="color:var(--green)">-</div><div class="label">🚀 Heroes</div></div>
-    <div class="stat-card"><div class="num" id="statVillains" style="color:var(--red)">-</div><div class="label">📉 Villains</div></div>
+    <div class="stat-card"><div class="num" id="statHeroes" style="color:var(--green)">-</div><div class="label">🚀 Heroes <span id="statHeroesWindow" style="color:var(--text3);font-weight:400">(today)</span></div></div>
+    <div class="stat-card"><div class="num" id="statVillains" style="color:var(--red)">-</div><div class="label">📉 Villains <span id="statVillainsWindow" style="color:var(--text3);font-weight:400">(today)</span></div></div>
+    <div class="stat-card" style="display:flex;flex-direction:column;justify-content:center;align-items:flex-start;padding:.6rem 1rem">
+      <div class="label" style="margin-bottom:.4rem">Day range — applies to Heroes / Villains everywhere</div>
+      <div class="pills" id="globalDays" style="gap:.4rem">
+        <div class="pill" onclick="setGlobalDays(1,this)" data-d="1">Today</div>
+        <div class="pill" onclick="setGlobalDays(7,this)" data-d="7">7d</div>
+        <div class="pill" onclick="setGlobalDays(14,this)" data-d="14">14d</div>
+        <div class="pill" onclick="setGlobalDays(30,this)" data-d="30">30d</div>
+      </div>
+    </div>
   </div>
 
   <div class="tabs">
@@ -148,12 +157,6 @@ select:focus,.search-box:focus{border-color:var(--accent)}
         <div class="pill villain" onclick="setFilter('villain',this)" data-f="villain">📉 Villains</div>
         <div class="pill normal" onclick="setFilter('normal',this)" data-f="normal">— Normal</div>
       </div>
-      <div class="pills" id="daysAll" title="Day range — applies to Heroes / Villains filter">
-        <div class="pill active" onclick="setDays('c',1,this)" data-d="1">Today</div>
-        <div class="pill" onclick="setDays('c',7,this)" data-d="7">7d</div>
-        <div class="pill" onclick="setDays('c',14,this)" data-d="14">14d</div>
-        <div class="pill" onclick="setDays('c',30,this)" data-d="30">30d</div>
-      </div>
     </div>
     <div class="grid" id="gridAll"><div class="loading"><div class="spinner"></div>Loading bestsellers...</div></div>
 
@@ -174,12 +177,6 @@ select:focus,.search-box:focus{border-color:var(--accent)}
         <div class="pill villain" onclick="setStoreFilter('villain',this)" data-f="villain">📉 Villains</div>
         <div class="pill normal" onclick="setStoreFilter('normal',this)" data-f="normal">— Normal</div>
       </div>
-      <div class="pills" id="daysStore" title="Day range">
-        <div class="pill active" onclick="setDays('s',1,this)" data-d="1">Today</div>
-        <div class="pill" onclick="setDays('s',7,this)" data-d="7">7d</div>
-        <div class="pill" onclick="setDays('s',14,this)" data-d="14">14d</div>
-        <div class="pill" onclick="setDays('s',30,this)" data-d="30">30d</div>
-      </div>
     </div>
     <div class="grid" id="gridStore"><div class="empty">Select a store above to view its bestsellers</div></div>
   </div>
@@ -198,12 +195,6 @@ select:focus,.search-box:focus{border-color:var(--accent)}
         <div class="pill hero" onclick="setGFilter('hero',this)" data-f="hero">🚀 Heroes</div>
         <div class="pill villain" onclick="setGFilter('villain',this)" data-f="villain">📉 Villains</div>
         <div class="pill normal" onclick="setGFilter('normal',this)" data-f="normal">— Normal</div>
-      </div>
-      <div class="pills" id="daysAllG" title="Day range">
-        <div class="pill active" onclick="setDays('g',1,this)" data-d="1">Today</div>
-        <div class="pill" onclick="setDays('g',7,this)" data-d="7">7d</div>
-        <div class="pill" onclick="setDays('g',14,this)" data-d="14">14d</div>
-        <div class="pill" onclick="setDays('g',30,this)" data-d="30">30d</div>
       </div>
     </div>
     <div class="grid" id="gridAllG"><div class="loading"><div class="spinner"></div>Loading general bestsellers...</div></div>
@@ -224,12 +215,6 @@ select:focus,.search-box:focus{border-color:var(--accent)}
         <div class="pill hero" onclick="setSGFilter('hero',this)" data-f="hero">🚀 Heroes</div>
         <div class="pill villain" onclick="setSGFilter('villain',this)" data-f="villain">📉 Villains</div>
         <div class="pill normal" onclick="setSGFilter('normal',this)" data-f="normal">— Normal</div>
-      </div>
-      <div class="pills" id="daysStoreG" title="Day range">
-        <div class="pill active" onclick="setDays('sg',1,this)" data-d="1">Today</div>
-        <div class="pill" onclick="setDays('sg',7,this)" data-d="7">7d</div>
-        <div class="pill" onclick="setDays('sg',14,this)" data-d="14">14d</div>
-        <div class="pill" onclick="setDays('sg',30,this)" data-d="30">30d</div>
       </div>
     </div>
     <div class="grid" id="gridStoreG"><div class="empty">Select a store above to view its general bestsellers</div></div>
@@ -264,15 +249,15 @@ select:focus,.search-box:focus{border-color:var(--accent)}
 <script>
 const API=location.origin+'/api';
 let cFilter='all',sFilter='all',editId=null,searchTimer=null;
-// Day-range state for hero/villain filters. Defaults to 1 (today
-// only — preserves legacy behaviour for users who never click a
-// range pill). Persisted in sessionStorage so reloads stick.
-let cDays=parseInt(sessionStorage.getItem('cDays')||'1',10);
-let sDays=parseInt(sessionStorage.getItem('sDays')||'1',10);
-let gDays=parseInt(sessionStorage.getItem('gDays')||'1',10);
-let sgDays=parseInt(sessionStorage.getItem('sgDays')||'1',10);
-// General-tab state mirrors the Fashion variables above so each tab
-// has its own filters/search without cross-talk.
+// Single global day-range state shared by the top heroes/villains
+// counter AND every hero/villain feed (combined fashion, per-store
+// fashion, combined general, per-store general). One control, one
+// source of truth — eliminates per-section drift. Persisted in
+// sessionStorage as 'globalDaysFilter'; default 1 (today).
+let globalDays=parseInt(sessionStorage.getItem('globalDaysFilter')||'1',10);
+if(![1,7,14,30].includes(globalDays))globalDays=1;
+// General-tab filter state mirrors the Fashion variables so each tab
+// has its own label filter without cross-talk.
 let gFilter='all',sgFilter='all';
 
 function doLogin(){
@@ -281,7 +266,7 @@ function doLogin(){
   .catch(()=>document.getElementById('loginErr').textContent='Invalid password');
 }
 function logout(){localStorage.removeItem('sw');location.reload()}
-function showApp(){document.getElementById('loginScreen').style.display='none';document.getElementById('app').style.display='block';_syncDaysPills();loadCombined();loadStores();loadStats()}
+function showApp(){document.getElementById('loginScreen').style.display='none';document.getElementById('app').style.display='block';_syncGlobalDaysPill();loadCombined();loadStores();loadStats()}
 if(localStorage.getItem('sw')==='1')showApp();
 
 function switchTab(t){
@@ -298,44 +283,57 @@ function setStoreFilter(f,el){sFilter=f;el.parentElement.querySelectorAll('.pill
 function setGFilter(f,el){gFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadCombinedGeneral()}
 function setSGFilter(f,el){sgFilter=f;el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');loadStoreGeneral()}
 
-// Day-range pill handler. `scope` is one of 'c' (combined fashion),
-// 's' (per-store fashion), 'g' (combined general), 'sg' (per-store
-// general). Updates the per-scope state, persists to sessionStorage,
-// re-paints the active pill, and triggers the right loader.
-function setDays(scope,d,el){
-  if(scope==='c'){cDays=d;sessionStorage.setItem('cDays',d);}
-  else if(scope==='s'){sDays=d;sessionStorage.setItem('sDays',d);}
-  else if(scope==='g'){gDays=d;sessionStorage.setItem('gDays',d);}
-  else if(scope==='sg'){sgDays=d;sessionStorage.setItem('sgDays',d);}
-  el.parentElement.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));
-  el.classList.add('active');
-  if(scope==='c')loadCombined();
-  else if(scope==='s')loadStore();
-  else if(scope==='g')loadCombinedGeneral();
-  else if(scope==='sg')loadStoreGeneral();
+// Single global day-range handler. Updates the shared state,
+// persists to sessionStorage, repaints the active pill, refreshes
+// the counter, and re-fetches every hero/villain feed so all four
+// scopes plus the top counter stay in lock-step.
+function setGlobalDays(d,el){
+  globalDays=d;
+  sessionStorage.setItem('globalDaysFilter',d);
+  _syncGlobalDaysPill();
+  loadStats();
+  loadCombined();
+  if(document.getElementById('storeSelect').value)loadStore();
+  // Refresh General feeds only if the user has loaded them.
+  if(document.getElementById('generalTab').style.display!=='none'){
+    loadCombinedGeneral();
+    if(document.getElementById('storeSelectG').value)loadStoreGeneral();
+  }
 }
 
-// Restore the persisted day-range selection on the rendered pills so
-// the active highlight matches sessionStorage after a reload.
-function _syncDaysPills(){
-  function pick(containerId,d){
-    const c=document.getElementById(containerId);
-    if(!c)return;
-    c.querySelectorAll('.pill').forEach(p=>{
-      p.classList.toggle('active', parseInt(p.dataset.d,10)===d);
-    });
-  }
-  pick('daysAll',cDays);pick('daysStore',sDays);
-  pick('daysAllG',gDays);pick('daysStoreG',sgDays);
+// Restore the persisted day-range selection on the global pill row
+// so the active highlight matches sessionStorage after a reload.
+function _syncGlobalDaysPill(){
+  const c=document.getElementById('globalDays');
+  if(!c)return;
+  c.querySelectorAll('.pill').forEach(p=>{
+    p.classList.toggle('active', parseInt(p.dataset.d,10)===globalDays);
+  });
 }
+
+// Human-readable window label for the counter spans ("(today)",
+// "(last 7 days)", etc.). Single source of truth for window phrasing.
+function _windowLabel(d){return d===1?'(today)':`(last ${d} days)`}
+
 function debounceSearch(fn){clearTimeout(searchTimer);searchTimer=setTimeout(fn,400)}
 
-function loadStats(){fetch(API+'/stats').then(r=>r.json()).then(d=>{document.getElementById('statStores').textContent=d.stores;document.getElementById('statHeroes').textContent=d.heroes;document.getElementById('statVillains').textContent=d.villains})}
+function loadStats(){
+  fetch(`${API}/stats?days=${globalDays}`).then(r=>r.json()).then(d=>{
+    document.getElementById('statStores').textContent=d.stores;
+    document.getElementById('statHeroes').textContent=d.heroes;
+    document.getElementById('statVillains').textContent=d.villains;
+    const wl=_windowLabel(globalDays);
+    const hw=document.getElementById('statHeroesWindow');
+    const vw=document.getElementById('statVillainsWindow');
+    if(hw)hw.textContent=wl;
+    if(vw)vw.textContent=wl;
+  })
+}
 
 function loadCombined(){
   const sort=document.getElementById('sortAll').value;
   const search=document.getElementById('searchAll').value;
-  let url=`${API}/bestsellers/combined?sort=${sort}&limit=300&label=${cFilter}&days=${cDays}`;
+  let url=`${API}/bestsellers/combined?sort=${sort}&limit=300&label=${cFilter}&days=${globalDays}`;
   if(search)url+=`&search=${encodeURIComponent(search)}`;
   document.getElementById('gridAll').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
   fetch(url).then(r=>r.json()).then(products=>{
@@ -348,7 +346,7 @@ function loadStore(){
   const id=document.getElementById('storeSelect').value;if(!id)return;
   const sort=document.getElementById('sortStore').value;
   const search=document.getElementById('searchStore').value;
-  let url=`${API}/bestsellers/store/${id}?sort=${sort}&limit=300&label=${sFilter}&days=${sDays}`;
+  let url=`${API}/bestsellers/store/${id}?sort=${sort}&limit=300&label=${sFilter}&days=${globalDays}`;
   if(search)url+=`&search=${encodeURIComponent(search)}`;
   document.getElementById('gridStore').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
   fetch(url).then(r=>r.json()).then(products=>{
@@ -361,7 +359,7 @@ function loadStore(){
 function loadCombinedGeneral(){
   const sort=document.getElementById('sortAllG').value;
   const search=document.getElementById('searchAllG').value;
-  let url=`${API}/general/combined?sort=${sort}&limit=100&label=${gFilter}&days=${gDays}`;
+  let url=`${API}/general/combined?sort=${sort}&limit=100&label=${gFilter}&days=${globalDays}`;
   if(search) url+=`&search=${encodeURIComponent(search)}`;
   document.getElementById('gridAllG').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
   fetch(url).then(r=>r.json()).then(products=>{
@@ -374,7 +372,7 @@ function loadStoreGeneral(){
   const id=document.getElementById('storeSelectG').value;if(!id)return;
   const sort=document.getElementById('sortStoreG').value;
   const search=document.getElementById('searchStoreG').value;
-  let url=`${API}/general/store/${id}?sort=${sort}&limit=100&label=${sgFilter}&days=${sgDays}`;
+  let url=`${API}/general/store/${id}?sort=${sort}&limit=100&label=${sgFilter}&days=${globalDays}`;
   if(search)url+=`&search=${encodeURIComponent(search)}`;
   document.getElementById('gridStoreG').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
   fetch(url).then(r=>r.json()).then(products=>{
