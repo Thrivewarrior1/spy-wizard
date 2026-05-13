@@ -47,54 +47,25 @@ PORT = int(os.getenv("PORT", "8000"))
 
 
 # =====================================================================
-# Trust epoch — heroes / villains baseline guard
+# Trust epoch + delta-cap constants live in labels.py so both the read-
+# time API and the scrape-time event writer use the SAME values. The
+# imports below re-export them at module level so the rest of main.py
+# can keep using the bare names.
 # =====================================================================
-# Snapshots in PositionHistory dated BEFORE TRUST_EPOCH_UTC are not
-# trustworthy comparators because the underlying product set differed
-# (different cap, different hard-drop regex, different fashion-only
-# filter, different schema). Bump this every time we ship a change
-# that meaningfully reshapes the catalog so day-over-day deltas don't
-# get polluted by structural reshuffles.
-#
-# Override at deploy time with the TRUST_EPOCH_UTC env var (ISO 8601).
-# Default is the most recent significant change — bump it when shipping
-# a cap change, hard-drop tightening, schema migration, etc.
-# 2026-05-04 was the day the source-position-correctness fix shipped
-# AND the day the first trustworthy snapshots landed in the DB. Setting
-# the epoch to 2026-05-04 00:00 UTC means: May 4 snapshots qualify as
-# priors for May 5 onwards. The previous bump to May 5 was wrong —
-# with both `PositionHistory.date < today_start` (today_start = May 5
-# 00:00) AND `PositionHistory.date >= TRUST_EPOCH_UTC` (May 5 00:00)
-# in force, NO row can satisfy both clauses simultaneously, so the
-# hero/villain query would silently return 0/0 forever.
-#
-# INVARIANT: TRUST_EPOCH_UTC must ALWAYS be < today's 00:00 UTC, or
-# the comparison filters become mutually exclusive. The startup check
-# below logs a loud warning if that invariant breaks so a future deploy
-# can never silently disable the labels again.
-_DEFAULT_TRUST_EPOCH = datetime(2026, 5, 4, 0, 0, 0)
-
-
-def _parse_trust_epoch(raw: Optional[str]) -> datetime:
-    if not raw:
-        return _DEFAULT_TRUST_EPOCH
-    raw = raw.strip()
-    if raw.endswith("Z"):
-        raw = raw[:-1]
-    try:
-        parsed = datetime.fromisoformat(raw)
-        # Strip tzinfo so comparisons against naive PositionHistory.date
-        # (also UTC, also naive) behave consistently.
-        return parsed.replace(tzinfo=None)
-    except ValueError:
-        logger.warning(
-            "TRUST_EPOCH_UTC=%r is not parseable ISO 8601; falling back to %s",
-            raw, _DEFAULT_TRUST_EPOCH.isoformat(),
-        )
-        return _DEFAULT_TRUST_EPOCH
-
-
-TRUST_EPOCH_UTC = _parse_trust_epoch(os.getenv("TRUST_EPOCH_UTC"))
+from labels import (
+    TRUST_EPOCH_UTC,
+    HERO_VILLAIN_DELTA_CAP,
+    HERO_VILLAIN_CATALOG_FRACTION,
+    LABEL_EVENT_RETENTION_DAYS,
+    today_start_utc as _today_start_utc,
+    trustworthy_prior_filters as _trustworthy_prior_filters,
+    delta_threshold as _delta_threshold,
+    compute_and_write_events,
+    cleanup_label_events,
+    backfill_label_events,
+    fetch_label_events_window,
+)
+from models import LabelEvent
 
 
 def _trust_epoch_invariant_check() -> Optional[str]:
@@ -104,9 +75,7 @@ def _trust_epoch_invariant_check() -> Optional[str]:
     startup and exposed on /api/debug/heroes so the failure mode is
     loud rather than a silent 0/0.
     """
-    today_start = datetime.utcnow().replace(
-        hour=0, minute=0, second=0, microsecond=0,
-    )
+    today_start = _today_start_utc()
     if TRUST_EPOCH_UTC >= today_start:
         return (
             f"TRUST_EPOCH_UTC ({TRUST_EPOCH_UTC.isoformat()}) is at or past "
@@ -117,16 +86,6 @@ def _trust_epoch_invariant_check() -> Optional[str]:
             f"Roll the epoch back to a date that is strictly before today."
         )
     return None
-
-
-# Hard cap on plausible day-over-day rank movement. Anything larger
-# is almost certainly a structural reshuffle (catalog grew/shrank,
-# cap changed, scrape source changed) rather than organic movement,
-# so we suppress the hero/villain label and call it 'normal' instead.
-# The per-store catalog-size sanity check (30% of catalog, applied in
-# _compute_label_map) further tightens this for smaller stores.
-HERO_VILLAIN_DELTA_CAP = 30
-HERO_VILLAIN_CATALOG_FRACTION = 0.30
 
 scheduler = AsyncIOScheduler()
 
@@ -225,6 +184,25 @@ async def lifespan(app: FastAPI):
         migrate_backfill_product_category(db)
     except Exception as e:
         logger.warning(f"startup product_category backfill failed: {e}")
+    try:
+        # Backfill the LabelEvent ledger from existing PositionHistory.
+        # User asked for 30-day retained heroes/villains; this gives the
+        # UI immediate historical data instead of waiting for new
+        # scrapes to populate. Idempotent — skips events that already
+        # exist for a given (product_id, date).
+        inserted = backfill_label_events(db)
+        if inserted:
+            logger.info(
+                f"startup label-event backfill: inserted {inserted} events "
+                f"from existing PositionHistory"
+            )
+        # Run retention immediately so any pre-existing >30d events get
+        # dropped on the same redeploy.
+        pruned = cleanup_label_events(db)
+        if pruned:
+            logger.info(f"startup label-event retention: pruned {pruned}")
+    except Exception as e:
+        logger.warning(f"startup label-event backfill / retention failed: {e}")
     finally:
         db.close()
     # Schedule daily scrape at 6 AM UTC
@@ -929,14 +907,94 @@ def build_ai_tag_filters(search_query: str):
             conds.append(or_(*word_or))
     return conds
 
+def _label_events_to_product_dicts(
+    pairs: list, is_fashion: bool,
+) -> list[dict]:
+    """Render (product, event) pairs from fetch_label_events_window into
+    the same dict shape `_product_dict` produces, with the event's
+    date / prior_position / position_change so the UI can show
+    "moved on May 4: 12 → 7"."""
+    out = []
+    for prod, ev in pairs:
+        d = _product_dict(prod, (ev.label, ev.position_change, ev.prior_position))
+        d["event_date"] = ev.date.date().isoformat()
+        d["is_active"] = bool(
+            (is_fashion and prod.is_fashion)
+            or ((not is_fashion) and (not prod.is_fashion) and prod.subniche)
+        )
+        out.append(d)
+    return out
+
+
 @app.get("/api/bestsellers/combined")
 async def get_combined_bestsellers(
     sort: str = Query("high-low"),
     label: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     limit: int = Query(30, ge=1, le=500),
+    days: int = Query(1, ge=1, le=LABEL_EVENT_RETENTION_DAYS),
     db: Session = Depends(get_db),
 ):
+    """Combined Fashion feed.
+
+    When `label` is 'hero' or 'villain', the result is sourced from
+    the persistent LabelEvent ledger for the last `days` UTC days
+    (default 1 = today only, preserves the legacy behaviour). Each
+    product appears at most once, paired with its MOST RECENT event
+    of the requested label inside the window. Products that have
+    since dropped from the Fashion feed are still included with
+    `is_active: false` so the UI can render them differently.
+
+    For other labels (normal / new / null) or when days==1 with no
+    LabelEvent data, falls back to the read-time _compute_label_map
+    path against PositionHistory.
+    """
+    use_events = label in ("hero", "villain")
+    if use_events:
+        pairs = fetch_label_events_window(
+            db, label=label, days=days, is_fashion=True,
+        )
+        # Apply search by filtering pairs in Python (small list).
+        if search and search.strip():
+            s = search.strip().lower()
+            from sqlalchemy import or_
+            id_set = {p.id for p, _ in pairs}
+            if not id_set:
+                return []
+            q = db.query(Product).filter(Product.id.in_(list(id_set)))
+            # Reuse the existing search builders against this subset.
+            for cond in build_ai_tag_filters(s):
+                q = q.filter(cond)
+            ai_ids = {p.id for p in q.all()}
+            if ai_ids:
+                pairs = [pair for pair in pairs if pair[0].id in ai_ids]
+            else:
+                q2 = db.query(Product).filter(Product.id.in_(list(id_set)))
+                strict, loose = build_search_filters(s)
+                for cond in strict:
+                    q2 = q2.filter(cond)
+                strict_ids = {p.id for p in q2.all()}
+                if strict_ids:
+                    pairs = [pair for pair in pairs if pair[0].id in strict_ids]
+                elif loose:
+                    q3 = db.query(Product).filter(Product.id.in_(list(id_set))).filter(or_(*loose))
+                    loose_ids = {p.id for p in q3.all()}
+                    pairs = [pair for pair in pairs if pair[0].id in loose_ids]
+                else:
+                    pairs = []
+        # Sort.
+        if sort == "volume":
+            pairs.sort(key=lambda pe: (
+                -parse_visitors(pe[0].store.monthly_visitors),
+                pe[0].current_position or 0,
+            ))
+        elif sort == "low-high":
+            pairs.sort(key=lambda pe: -(pe[0].current_position or 0))
+        else:
+            pairs.sort(key=lambda pe: pe[0].current_position or 0)
+        pairs = pairs[:limit]
+        return _label_events_to_product_dicts(pairs, is_fashion=True)
+
     query = db.query(Product).join(Store).filter(Product.is_fashion == True)
     query = _apply_label_filter(query, db, label)
 
@@ -1033,25 +1091,10 @@ async def get_store_bestsellers(
 # catalog size, whichever is smaller — is treated as a reshuffle, not
 # organic movement, and labelled "normal" instead of hero/villain.
 
-def _today_start_utc():
-    """UTC midnight of today. Boundary between 'today's snapshot' and
-    'prior snapshot' for the day-over-day delta. Same-UTC-day priors
-    do NOT count, so the boundary excludes everything from 00:00 of
-    today onward."""
-    return datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def _trustworthy_prior_filters(today_start: datetime):
-    """Two filter clauses every prior-position lookup must apply:
-    (1) prior must come from a DIFFERENT UTC calendar day (i.e. before
-        today's UTC midnight), AND
-    (2) prior must be from on or after TRUST_EPOCH_UTC, since older
-        snapshots reflect a different catalog and aren't comparable.
-    """
-    return (
-        PositionHistory.date < today_start,
-        PositionHistory.date >= TRUST_EPOCH_UTC,
-    )
+# _today_start_utc / _trustworthy_prior_filters / _delta_threshold are
+# re-exported from labels.py at the top of this module so the rest of
+# the file can use them under their existing names. Keep _prior_position_subquery
+# local — it's specific to the read-time SQL join pattern.
 
 
 def _prior_position_subquery(db: Session, today_start: Optional[datetime] = None):
@@ -1084,19 +1127,7 @@ def _prior_position_subquery(db: Session, today_start: Optional[datetime] = None
     )
 
 
-def _delta_threshold(catalog_size: int) -> int:
-    """Maximum plausible day-over-day rank delta for a store with
-    `catalog_size` tracked products. The smaller of:
-      - HERO_VILLAIN_DELTA_CAP (absolute, currently 30), and
-      - 30% of catalog_size (rounded down, floored at 1).
-    A delta exceeding this is almost certainly a structural reshuffle
-    (catalog change, cap change, scrape-source change) and gets
-    suppressed in _compute_label_map.
-    """
-    if catalog_size <= 0:
-        return HERO_VILLAIN_DELTA_CAP
-    pct = max(1, int(catalog_size * HERO_VILLAIN_CATALOG_FRACTION))
-    return min(HERO_VILLAIN_DELTA_CAP, pct)
+# _delta_threshold is imported from labels.py at the top of this module.
 
 
 def _store_catalog_sizes(db: Session, store_ids: set, *, is_fashion: bool) -> dict:
@@ -1271,14 +1302,58 @@ async def get_combined_general(
     label: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     limit: int = Query(30, ge=1, le=500),
+    days: int = Query(1, ge=1, le=LABEL_EVENT_RETENTION_DAYS),
     db: Session = Depends(get_db),
 ):
-    """Cross-store General feed. Same shape as /api/bestsellers/combined
-    but filtered to is_fashion=False with a non-empty subniche so we
-    only surface products Gemini actually labelled for this tab.
+    """Cross-store General feed. Same shape + day-range semantics as
+    /api/bestsellers/combined. With `label` ∈ {hero, villain} the
+    result is sourced from LabelEvent for the last `days` days.
     `subniche` is BACKEND-only metadata used by the search box; it is
-    never exposed as a user-facing filter parameter (see SUBNICHE_SYNONYMS).
+    never exposed as a user-facing filter parameter.
     """
+    use_events = label in ("hero", "villain")
+    if use_events:
+        pairs = fetch_label_events_window(
+            db, label=label, days=days, is_fashion=False,
+        )
+        if search and search.strip():
+            s = search.strip().lower()
+            from sqlalchemy import or_
+            id_set = {p.id for p, _ in pairs}
+            if not id_set:
+                return []
+            q = db.query(Product).filter(Product.id.in_(list(id_set)))
+            for cond in build_ai_tag_filters(s):
+                q = q.filter(cond)
+            ai_ids = {p.id for p in q.all()}
+            if ai_ids:
+                pairs = [pair for pair in pairs if pair[0].id in ai_ids]
+            else:
+                q2 = db.query(Product).filter(Product.id.in_(list(id_set)))
+                strict, loose = build_search_filters(s)
+                for cond in strict:
+                    q2 = q2.filter(cond)
+                strict_ids = {p.id for p in q2.all()}
+                if strict_ids:
+                    pairs = [pair for pair in pairs if pair[0].id in strict_ids]
+                elif loose:
+                    q3 = db.query(Product).filter(Product.id.in_(list(id_set))).filter(or_(*loose))
+                    loose_ids = {p.id for p in q3.all()}
+                    pairs = [pair for pair in pairs if pair[0].id in loose_ids]
+                else:
+                    pairs = []
+        if sort == "volume":
+            pairs.sort(key=lambda pe: (
+                -parse_visitors(pe[0].store.monthly_visitors),
+                pe[0].current_position or 0,
+            ))
+        elif sort == "low-high":
+            pairs.sort(key=lambda pe: -(pe[0].current_position or 0))
+        else:
+            pairs.sort(key=lambda pe: pe[0].current_position or 0)
+        pairs = pairs[:limit]
+        return _label_events_to_product_dicts(pairs, is_fashion=False)
+
     query = _general_base_query(db)
     query = _apply_label_filter(query, db, label)
 
@@ -1625,15 +1700,83 @@ async def debug_heroes(db: Session = Depends(get_db)):
         .scalar() or 0
     )
 
+    # Persistent LabelEvent ledger stats — verify retention is
+    # maintained and the 7/14/30-day windows have data.
+    retention_cutoff = today_start - timedelta(days=LABEL_EVENT_RETENTION_DAYS)
+    total_events = db.query(func.count(LabelEvent.id)).scalar() or 0
+    events_7d = (
+        db.query(func.count(LabelEvent.id))
+        .filter(LabelEvent.date >= today_start - timedelta(days=6))
+        .scalar() or 0
+    )
+    events_14d = (
+        db.query(func.count(LabelEvent.id))
+        .filter(LabelEvent.date >= today_start - timedelta(days=13))
+        .scalar() or 0
+    )
+    events_30d = (
+        db.query(func.count(LabelEvent.id))
+        .filter(LabelEvent.date >= today_start - timedelta(days=29))
+        .scalar() or 0
+    )
+    oldest_event = (
+        db.query(func.min(LabelEvent.date)).scalar()
+    )
+    newest_event = (
+        db.query(func.max(LabelEvent.date)).scalar()
+    )
+    heroes_by_day = (
+        db.query(
+            func.date(LabelEvent.date).label("day"),
+            func.count(LabelEvent.id).label("n"),
+        )
+        .filter(LabelEvent.label == "hero")
+        .filter(LabelEvent.date >= today_start - timedelta(days=29))
+        .group_by(func.date(LabelEvent.date))
+        .order_by(func.date(LabelEvent.date).desc())
+        .all()
+    )
+    villains_by_day = (
+        db.query(
+            func.date(LabelEvent.date).label("day"),
+            func.count(LabelEvent.id).label("n"),
+        )
+        .filter(LabelEvent.label == "villain")
+        .filter(LabelEvent.date >= today_start - timedelta(days=29))
+        .group_by(func.date(LabelEvent.date))
+        .order_by(func.date(LabelEvent.date).desc())
+        .all()
+    )
+
     return {
         "trust_epoch_utc": TRUST_EPOCH_UTC.isoformat(),
         "today_start_utc": today_start.isoformat(),
         "invariant_violation": invariant,
         "snapshots_per_store_last_5_days": histogram,
         "delta_summary": delta_summary,
-        "fashion_heroes_count": int(heroes_q),
-        "fashion_villains_count": int(villains_q),
+        "fashion_heroes_count_today": int(heroes_q),
+        "fashion_villains_count_today": int(villains_q),
         "sample_fashion_movers": fashion_movers,
+        "label_event_ledger": {
+            "total_events": int(total_events),
+            "events_in_last_7d": int(events_7d),
+            "events_in_last_14d": int(events_14d),
+            "events_in_last_30d": int(events_30d),
+            "oldest_event_date": (
+                oldest_event.date().isoformat() if oldest_event else None
+            ),
+            "newest_event_date": (
+                newest_event.date().isoformat() if newest_event else None
+            ),
+            "retention_window_days": LABEL_EVENT_RETENTION_DAYS,
+            "retention_cutoff": retention_cutoff.date().isoformat(),
+            "heroes_by_day_last_30d": [
+                {"date": str(d), "n": int(n)} for d, n in heroes_by_day
+            ],
+            "villains_by_day_last_30d": [
+                {"date": str(d), "n": int(n)} for d, n in villains_by_day
+            ],
+        },
     }
 
 

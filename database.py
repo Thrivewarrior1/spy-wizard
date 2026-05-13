@@ -72,6 +72,14 @@ def widen_text_columns():
         # the next scrape cycle.
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS product_category VARCHAR(64) DEFAULT ''",
         "CREATE INDEX IF NOT EXISTS ix_products_product_category ON products(product_category)",
+        # Persistent hero/villain event log. Table created via
+        # Base.metadata.create_all on first boot; these statements are
+        # idempotent guards for the indexes the model declares so
+        # existing deployments pick them up after the schema change
+        # without needing a separate Alembic migration.
+        "CREATE INDEX IF NOT EXISTS ix_label_events_store_date ON label_events(store_id, date)",
+        "CREATE INDEX IF NOT EXISTS ix_label_events_product_date ON label_events(product_id, date)",
+        "CREATE INDEX IF NOT EXISTS ix_label_events_label_date ON label_events(label, date)",
     ]
     with engine.connect() as conn:
         for stmt in statements:

@@ -39,9 +39,14 @@ from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from models import Store, Product, PositionHistory
+from models import Store, Product, PositionHistory, LabelEvent
 from classifier import classify_products_batch
 from categories import assign_product_category
+from labels import (
+    compute_and_write_events,
+    cleanup_label_events,
+    LABEL_EVENT_RETENTION_DAYS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1715,6 +1720,21 @@ def update_products_in_db(
         + (f" (promoted {forced_promoted} apparel)" if forced_promoted else "")
     )
 
+    # Persist hero/villain events for today's scrape so the 7/14/30-day
+    # filter on the API has data. Runs AFTER the per-product commits
+    # so prior_position lookups see fresh PositionHistory.
+    try:
+        heroes_written, villains_written = compute_and_write_events(db, store)
+        if heroes_written or villains_written:
+            logger.info(
+                f"  label events: {heroes_written} heroes + "
+                f"{villains_written} villains for {store.name}"
+            )
+    except Exception as e:
+        logger.warning(
+            f"compute_and_write_events failed for {store.name}: {e}"
+        )
+
 
 def migrate_wearables_to_fashion(db: Session) -> int:
     """One-shot DB migration: any existing row stored as
@@ -2030,6 +2050,15 @@ async def scrape_all_stores(db: Session) -> dict:
         cleanup_old_history(db)
     except Exception as e:
         logger.error(f"History cleanup failed: {e}")
+    try:
+        # Retention sweep for the persistent hero/villain ledger.
+        # 30-day window — anything older drops out so the diagnostic
+        # endpoint and the API never serve stale events.
+        pruned = cleanup_label_events(db)
+        if pruned:
+            logger.info(f"  label-event retention: pruned {pruned} >30d")
+    except Exception as e:
+        logger.error(f"Label-event cleanup failed: {e}")
 
     logger.info(
         f"Scrape complete: {results['total_products']} fashion + "

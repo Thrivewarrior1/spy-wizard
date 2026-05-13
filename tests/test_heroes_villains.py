@@ -207,6 +207,10 @@ def test_pre_epoch_snapshot_ignored(db, store, monkeypatch):
     # Trust epoch = a few hours ago; YESTERDAY's snapshot is well
     # before the epoch and must not count.
     epoch = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    # The SQL filter reads labels.TRUST_EPOCH_UTC; main re-exports it
+    # but the actual lookup happens inside labels._trustworthy_prior_filters.
+    import labels as labels_mod
+    monkeypatch.setattr(labels_mod, "TRUST_EPOCH_UTC", epoch)
     monkeypatch.setattr(main, "TRUST_EPOCH_UTC", epoch)
     p = _add_product(db, store, "pre-epoch", [(YESTERDAY, 5)], current_pos=2)
     label, change, prior = _label(db, p)
@@ -253,6 +257,8 @@ def test_no_trustworthy_prior_means_new_or_normal(db, store, monkeypatch):
     MUST be 0/0 until tomorrow's daily scrape produces a clean
     prior-day baseline.' This test pins that combined behaviour."""
     epoch = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    import labels as labels_mod
+    monkeypatch.setattr(labels_mod, "TRUST_EPOCH_UTC", epoch)
     monkeypatch.setattr(main, "TRUST_EPOCH_UTC", epoch)
 
     today_now = datetime.utcnow()

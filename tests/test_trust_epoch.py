@@ -316,10 +316,12 @@ def test_trust_epoch_invariant_catches_epoch_eq_today_start():
     today = datetime(2026, 5, 5, 12, 0, 0)
     today_start = today.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Epoch == today_start → invariant violated.
+    # Epoch == today_start → invariant violated. The check now uses
+    # _today_start_utc() imported from labels — patch that to anchor
+    # 'today' deterministically. TRUST_EPOCH_UTC also lives on main
+    # (re-exported from labels), so patch the main-side binding.
     with patch("main.TRUST_EPOCH_UTC", today_start), \
-         patch("main.datetime") as mock_dt:
-        mock_dt.utcnow.return_value = today
+         patch("main._today_start_utc", return_value=today_start):
         from main import _trust_epoch_invariant_check
         msg = _trust_epoch_invariant_check()
     assert msg is not None
@@ -329,11 +331,11 @@ def test_trust_epoch_invariant_catches_epoch_eq_today_start():
 def test_trust_epoch_invariant_catches_epoch_after_today():
     """Epoch > today_start is even worse. Must also flag."""
     today = datetime(2026, 5, 5, 12, 0, 0)
+    today_start = today.replace(hour=0, minute=0, second=0, microsecond=0)
     epoch_future = datetime(2026, 5, 6, 0, 0, 0)
 
     with patch("main.TRUST_EPOCH_UTC", epoch_future), \
-         patch("main.datetime") as mock_dt:
-        mock_dt.utcnow.return_value = today
+         patch("main._today_start_utc", return_value=today_start):
         from main import _trust_epoch_invariant_check
         msg = _trust_epoch_invariant_check()
     assert msg is not None
@@ -343,21 +345,21 @@ def test_trust_epoch_invariant_passes_when_epoch_is_yesterday():
     """The good case — epoch one day before today is the user's spec
     and the system's intended steady state."""
     today = datetime(2026, 5, 5, 12, 0, 0)
+    today_start = today.replace(hour=0, minute=0, second=0, microsecond=0)
     epoch_yesterday = datetime(2026, 5, 4, 0, 0, 0)
 
     with patch("main.TRUST_EPOCH_UTC", epoch_yesterday), \
-         patch("main.datetime") as mock_dt:
-        mock_dt.utcnow.return_value = today
+         patch("main._today_start_utc", return_value=today_start):
         from main import _trust_epoch_invariant_check
         msg = _trust_epoch_invariant_check()
     assert msg is None
 
 
 def test_default_trust_epoch_is_2026_05_04():
-    """The constant must be 2026-05-04 (yesterday relative to the
-    user's spec date 2026-05-05). If a future deploy bumps this to a
-    date that isn't strictly before the deploy date, the silent
-    0/0 regression returns. Pin the invariant here so any such bump
-    fails CI before it can silently break live."""
-    from main import _DEFAULT_TRUST_EPOCH
+    """The constant must be 2026-05-04. If a future deploy bumps this
+    to a date that isn't strictly before the deploy date, the silent
+    0/0 regression returns. Pin the invariant on the canonical labels
+    module (main re-exports it; the source of truth is labels.py
+    after the constants refactor)."""
+    from labels import _DEFAULT_TRUST_EPOCH
     assert _DEFAULT_TRUST_EPOCH == datetime(2026, 5, 4, 0, 0, 0)

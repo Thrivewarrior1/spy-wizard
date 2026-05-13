@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum as SQLEnum, Text, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum as SQLEnum, Text, Boolean, Index
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
 import enum
@@ -92,3 +92,47 @@ class PositionHistory(Base):
     date = Column(DateTime, default=datetime.utcnow)
 
     product = relationship("Product", back_populates="history")
+
+
+class LabelEvent(Base):
+    """Persistent hero/villain event log.
+
+    Whenever a scrape completes for a store, AFTER the position history
+    is written, `labels.compute_and_write_events()` emits one LabelEvent
+    row per product whose day-over-day rank delta qualifies as hero
+    (moved up, within the 30-rank cap) or villain (moved down, same).
+    Default retention is 30 days — `labels.cleanup_label_events()`
+    runs at the tail of every scrape_all_stores().
+
+    Querying by `(label, date)` for the day-range filter on the
+    Fashion / General tabs; `(store_id, date)` for per-store views;
+    `(product_id, date)` for the inline "moved on May 4" badge.
+    """
+    __tablename__ = "label_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    store_id = Column(
+        Integer, ForeignKey("stores.id", ondelete="CASCADE"), nullable=False,
+    )
+    product_id = Column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), nullable=False,
+    )
+    # UTC midnight of the day the event was recorded — pinned to
+    # today_start_utc() at write time so retention math is
+    # straightforward and the (product_id, date) uniqueness check
+    # below is consistent across same-day re-scrapes.
+    date = Column(DateTime, nullable=False)
+    label = Column(String(20), nullable=False)            # 'hero' | 'villain'
+    prior_position = Column(Integer, nullable=False)
+    current_position = Column(Integer, nullable=False)
+    position_change = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_label_events_store_date", "store_id", "date"),
+        Index("ix_label_events_product_date", "product_id", "date"),
+        Index("ix_label_events_label_date", "label", "date"),
+    )
+
+    store = relationship("Store")
+    product = relationship("Product")
