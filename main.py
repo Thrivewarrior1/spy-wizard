@@ -1964,11 +1964,18 @@ async def debug_gemini():
 @app.get("/api/stats")
 async def get_stats(
     days: int = Query(1, ge=1, le=LABEL_EVENT_RETENTION_DAYS),
+    feed: Optional[str] = Query(None, pattern="^(fashion|general)$"),
     db: Session = Depends(get_db),
 ):
-    """Top-of-page counter. Heroes / villains counts now follow the
-    `days` window so the value in the UI matches whatever 1/7/14/30
-    pill the user has selected.
+    """Top-of-page counter. Heroes / villains counts follow the
+    `days` window AND the active tab — Fashion tab counts only
+    fashion-feed events; General tab counts only general-feed events.
+
+    `feed` query param:
+      - "fashion"  → is_fashion=True
+      - "general"  → is_fashion=False
+      - omitted    → BOTH feeds combined (backward-compat for older
+                     clients; new UI always sends explicit feed)
 
     Source of truth is the LabelEvent ledger (same as the feed
     endpoints) — de-duplicated by product_id, taking the most recent
@@ -1978,12 +1985,21 @@ async def get_stats(
     """
     total_stores = db.query(Store).count()
     total_products = db.query(Product).filter(Product.is_fashion == True).count()
-    # Fashion-feed counts (the existing UI surface) windowed by `days`.
+    # Resolve `feed` to the is_fashion arg fetch_label_events_window expects:
+    #   "fashion"  -> True  (only is_fashion=True products)
+    #   "general"  -> False (only is_fashion=False products WITH subniche)
+    #   None       -> None  (no filter, both feeds counted)
+    if feed == "fashion":
+        is_fashion_arg = True
+    elif feed == "general":
+        is_fashion_arg = False
+    else:
+        is_fashion_arg = None
     hero_pairs = fetch_label_events_window(
-        db, label="hero", days=days, is_fashion=True,
+        db, label="hero", days=days, is_fashion=is_fashion_arg,
     )
     villain_pairs = fetch_label_events_window(
-        db, label="villain", days=days, is_fashion=True,
+        db, label="villain", days=days, is_fashion=is_fashion_arg,
     )
     heroes = len(hero_pairs)
     villains = len(villain_pairs)
@@ -2047,6 +2063,7 @@ async def get_stats(
         "heroes": heroes,
         "villains": villains,
         "days": days,
+        "feed": feed,
         "data_start_date": DATA_START_DATE.date().isoformat(),
         "unhealthy_stores": unhealthy_stores,
     }

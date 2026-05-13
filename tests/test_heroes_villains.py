@@ -31,11 +31,17 @@ def db():
 
 @pytest.fixture(autouse=True)
 def lenient_trust_epoch(monkeypatch):
-    """Default tests to a far-past trust epoch so existing date-based
-    fixtures (YESTERDAY etc.) aren't accidentally filtered out by the
-    production default. Tests that specifically exercise the trust
-    epoch override TRUST_EPOCH_UTC inside the test body."""
-    monkeypatch.setattr(main, "TRUST_EPOCH_UTC", datetime(2000, 1, 1))
+    """Default tests to a far-past trust epoch AND data_start_date so
+    existing date-based fixtures (YESTERDAY etc.) aren't accidentally
+    filtered out by the production defaults. Tests that specifically
+    exercise either floor override the relevant constant inside the
+    test body."""
+    far_past = datetime(2000, 1, 1)
+    import labels as labels_mod
+    monkeypatch.setattr(main, "TRUST_EPOCH_UTC", far_past)
+    monkeypatch.setattr(labels_mod, "TRUST_EPOCH_UTC", far_past)
+    monkeypatch.setattr(main, "DATA_START_DATE", far_past)
+    monkeypatch.setattr(labels_mod, "DATA_START_DATE", far_past)
     yield
 
 

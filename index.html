@@ -260,6 +260,15 @@ if(![1,7,14,30].includes(globalDays))globalDays=1;
 // has its own label filter without cross-talk.
 let gFilter='all',sgFilter='all';
 
+// Current tab — drives the top heroes/villains counter feed.
+// 'fashion' → /api/stats?feed=fashion; 'general' → feed=general.
+// The 'stores' tab keeps whichever feed was active before — the
+// counter is product-centric and doesn't apply to the stores view.
+let currentTab=sessionStorage.getItem('currentTab')||'fashion';
+function _feedForCounter(){
+  return currentTab==='general' ? 'general' : 'fashion';
+}
+
 function doLogin(){
   fetch(API+'/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})})
   .then(r=>{if(!r.ok)throw 0;return r.json()}).then(()=>{localStorage.setItem('sw','1');showApp()})
@@ -275,6 +284,13 @@ function switchTab(t){
   document.getElementById('fashionTab').style.display=t==='fashion'?'block':'none';
   document.getElementById('generalTab').style.display=t==='general'?'block':'none';
   document.getElementById('storesTab').style.display=t==='stores'?'block':'none';
+  // Persist + refresh counter so it reflects the new feed's heroes/villains.
+  // 'stores' tab leaves the counter on whatever the prior product tab was.
+  if(t==='fashion'||t==='general'){
+    currentTab=t;
+    sessionStorage.setItem('currentTab',t);
+    loadStats();
+  }
   if(t==='stores')loadStores();
   if(t==='general'){loadCombinedGeneral();loadStoresG();}
 }
@@ -318,15 +334,17 @@ function _windowLabel(d){return d===1?'(today)':`(last ${d} days)`}
 function debounceSearch(fn){clearTimeout(searchTimer);searchTimer=setTimeout(fn,400)}
 
 function loadStats(){
-  fetch(`${API}/stats?days=${globalDays}`).then(r=>r.json()).then(d=>{
+  const feed=_feedForCounter();
+  fetch(`${API}/stats?days=${globalDays}&feed=${feed}`).then(r=>r.json()).then(d=>{
     document.getElementById('statStores').textContent=d.stores;
     document.getElementById('statHeroes').textContent=d.heroes;
     document.getElementById('statVillains').textContent=d.villains;
     const wl=_windowLabel(globalDays);
+    const feedLabel=feed==='general'?' · general':' · fashion';
     const hw=document.getElementById('statHeroesWindow');
     const vw=document.getElementById('statVillainsWindow');
-    if(hw)hw.textContent=wl;
-    if(vw)vw.textContent=wl;
+    if(hw)hw.textContent=`${wl}${feedLabel}`;
+    if(vw)vw.textContent=`${wl}${feedLabel}`;
   })
 }
 

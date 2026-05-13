@@ -44,6 +44,20 @@ from labels import (
 )
 
 
+@pytest.fixture(autouse=True)
+def lenient_data_start_date(monkeypatch):
+    """Default tests to a far-past DATA_START_DATE so the legacy
+    fixtures (which date events relative to early-May 2026) aren't
+    accidentally filtered by the production default (which pins the
+    floor to today=2026-05-13). Tests that specifically exercise
+    the new floor override DATA_START_DATE inside the test body.
+    """
+    floor = datetime(2026, 5, 1, 0, 0, 0)
+    monkeypatch.setattr(labels_mod, "DATA_START_DATE", floor)
+    monkeypatch.setattr(main_mod, "DATA_START_DATE", floor)
+    yield
+
+
 @pytest.fixture
 def db():
     eng = create_engine(
@@ -518,18 +532,34 @@ def test_trust_epoch_invariant_holds_on_today():
 # live yet." These tests pin the floor across read, backfill, and
 # cleanup, plus the /api/stats?days endpoint contract.
 # =====================================================================
-def test_data_start_date_default_is_may_6_2026():
-    """Default trustworthy floor is 2026-05-06 (7 days before the
-    2026-05-13 stabilisation conversation). Env-overridable but the
-    default is the load-bearing invariant."""
-    assert DATA_START_DATE == datetime(2026, 5, 6, 0, 0, 0)
+def test_data_start_date_default_is_may_13_2026():
+    """Default trustworthy floor is 2026-05-13 — the day the user
+    invoked '100,000% accuracy, no assumptions' after diagnosing
+    that the previous 2026-05-06 floor allowed phantom events
+    synthesised from PositionHistory written under inconsistent
+    scraper configs across 2026-05-06..2026-05-12. Env-overridable
+    via DATA_START_DATE=YYYY-MM-DD; the module-level default is
+    the load-bearing invariant."""
+    # Test the module's _DEFAULT_DATA_START_DATE directly — the
+    # autouse lenient_data_start_date fixture rebinds DATA_START_DATE
+    # for the test session, so we can't read the live constant here.
+    assert labels_mod._DEFAULT_DATA_START_DATE == datetime(2026, 5, 13, 0, 0, 0)
 
 
-def test_fetch_window_excludes_event_before_data_start_date(db, store):
+def _pin_floor(monkeypatch, value):
+    """Pin DATA_START_DATE on both labels and main for the duration
+    of a test. The autouse fixture sets a permissive default; these
+    floor-exercising tests need an explicit value they own."""
+    monkeypatch.setattr(labels_mod, "DATA_START_DATE", value)
+    monkeypatch.setattr(main_mod, "DATA_START_DATE", value)
+
+
+def test_fetch_window_excludes_event_before_data_start_date(db, store, monkeypatch):
     """An event dated BEFORE DATA_START_DATE must never surface, even
     if the day-range window would otherwise include it."""
+    floor = datetime(2026, 5, 6, 0, 0, 0)
+    _pin_floor(monkeypatch, floor)
     now = datetime(2026, 5, 12, 12, 0, 0)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     p = _make_product(db, store, handle="pre-cutoff", position=5)
     # 2026-05-05 — one day BEFORE the 2026-05-06 floor.
@@ -545,14 +575,16 @@ def test_fetch_window_excludes_event_before_data_start_date(db, store):
     assert p.id not in {pr.id for pr, _ in pairs}
 
 
-def test_fetch_window_includes_event_on_data_start_date_boundary(db, store):
+def test_fetch_window_includes_event_on_data_start_date_boundary(db, store, monkeypatch):
     """An event dated EXACTLY at DATA_START_DATE is trustworthy and
     must surface. The floor uses '>=' not '>'."""
+    floor = datetime(2026, 5, 6, 0, 0, 0)
+    _pin_floor(monkeypatch, floor)
     now = datetime(2026, 5, 12, 12, 0, 0)
 
     p = _make_product(db, store, handle="boundary", position=5)
     db.add(LabelEvent(
-        store_id=store.id, product_id=p.id, date=DATA_START_DATE,
+        store_id=store.id, product_id=p.id, date=floor,
         label="hero", prior_position=20, current_position=5,
         position_change=15,
     ))
@@ -562,10 +594,12 @@ def test_fetch_window_includes_event_on_data_start_date_boundary(db, store):
     assert p.id in {pr.id for pr, _ in pairs}
 
 
-def test_fetch_window_30d_still_floored_by_data_start_date(db, store):
+def test_fetch_window_30d_still_floored_by_data_start_date(db, store, monkeypatch):
     """User asks for the full 30-day window. The day-range cutoff is
     way earlier than DATA_START_DATE, so the floor — not the window —
     is the binding constraint. Pre-floor events stay invisible."""
+    floor = datetime(2026, 5, 6, 0, 0, 0)
+    _pin_floor(monkeypatch, floor)
     now = datetime(2026, 5, 12, 12, 0, 0)
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -593,15 +627,16 @@ def test_fetch_window_30d_still_floored_by_data_start_date(db, store):
     assert pre_floor.id not in ids
 
 
-def test_backfill_skips_days_before_data_start_date(db, store):
+def test_backfill_skips_days_before_data_start_date(db, store, monkeypatch):
     """Backfill must not synthesise events for dates < DATA_START_DATE,
     even when consecutive PositionHistory snapshots exist there. The
     floor is enforced both at the SQL filter and the per-day loop."""
+    floor = datetime(2026, 5, 6, 0, 0, 0)
+    _pin_floor(monkeypatch, floor)
     now = datetime(2026, 5, 12, 12, 0, 0)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Trust epoch is 2026-05-04, DATA_START_DATE is 2026-05-06. The
-    # gap (2026-05-04 → 2026-05-05) is trustworthy by epoch but PRE
-    # DATA_START_DATE — those days must NOT get backfilled events.
+    # Trust epoch is 2026-05-04, DATA_START_DATE pinned to 2026-05-06.
+    # The gap (2026-05-04 → 2026-05-05) is trustworthy by epoch but
+    # PRE DATA_START_DATE — those days must NOT get backfilled events.
     pre_a = datetime(2026, 5, 4, 14, 0, 0)
     pre_b = datetime(2026, 5, 5, 14, 0, 0)
     in_a = datetime(2026, 5, 6, 14, 0, 0)
@@ -627,10 +662,12 @@ def test_backfill_skips_days_before_data_start_date(db, store):
     assert datetime(2026, 5, 7).date() in event_dates
 
 
-def test_cleanup_pre_start_label_events_deletes_pre_cutoff_rows(db, store):
+def test_cleanup_pre_start_label_events_deletes_pre_cutoff_rows(db, store, monkeypatch):
     """Seed three pre-floor events + two post-floor events. Cleanup
     must drop only the pre-floor ones and leave the post-floor ones
     untouched."""
+    floor = datetime(2026, 5, 6, 0, 0, 0)
+    _pin_floor(monkeypatch, floor)
     p = _make_product(db, store, handle="x", position=5)
     pre_dates = [
         datetime(2026, 4, 28, 0, 0, 0),
@@ -638,8 +675,8 @@ def test_cleanup_pre_start_label_events_deletes_pre_cutoff_rows(db, store):
         datetime(2026, 5, 5, 0, 0, 0),
     ]
     post_dates = [
-        DATA_START_DATE,                              # boundary keeps
-        DATA_START_DATE + timedelta(days=2),          # safely inside
+        floor,                              # boundary keeps
+        floor + timedelta(days=2),          # safely inside
     ]
     for d in pre_dates + post_dates:
         db.add(LabelEvent(
@@ -657,10 +694,12 @@ def test_cleanup_pre_start_label_events_deletes_pre_cutoff_rows(db, store):
     assert remaining_dates == set(post_dates)
 
 
-def test_cleanup_pre_start_label_events_is_idempotent(db, store):
+def test_cleanup_pre_start_label_events_is_idempotent(db, store, monkeypatch):
     """Running the migration twice must not double-delete or error.
     Second call returns 0 because the first call already cleared
     everything below the floor."""
+    floor = datetime(2026, 5, 6, 0, 0, 0)
+    _pin_floor(monkeypatch, floor)
     p = _make_product(db, store, handle="x", position=5)
     db.add(LabelEvent(
         store_id=store.id, product_id=p.id,
@@ -673,13 +712,15 @@ def test_cleanup_pre_start_label_events_is_idempotent(db, store):
     assert cleanup_pre_start_label_events(db) == 0
 
 
-def test_cleanup_pre_start_label_events_keeps_boundary_row(db, store):
+def test_cleanup_pre_start_label_events_keeps_boundary_row(db, store, monkeypatch):
     """A row dated EXACTLY at DATA_START_DATE is in-floor and must
     NOT be deleted. The filter is `date < DATA_START_DATE` (strict),
     not `<=`."""
+    floor = datetime(2026, 5, 6, 0, 0, 0)
+    _pin_floor(monkeypatch, floor)
     p = _make_product(db, store, handle="x", position=5)
     db.add(LabelEvent(
-        store_id=store.id, product_id=p.id, date=DATA_START_DATE,
+        store_id=store.id, product_id=p.id, date=floor,
         label="hero", prior_position=10, current_position=5,
         position_change=5,
     ))
@@ -711,12 +752,15 @@ def stats_client(db):
 
 def test_stats_endpoint_returns_data_start_date_field(stats_client):
     """Top-of-page response must expose DATA_START_DATE so the UI can
-    show 'data trustworthy since 2026-05-06' if it wants to."""
+    show 'data trustworthy since <date>' if it wants to."""
     r = stats_client.get("/api/stats")
     assert r.status_code == 200
     body = r.json()
-    assert body["data_start_date"] == DATA_START_DATE.date().isoformat()
+    # Compare against the live module value (the autouse fixture
+    # rebinds it for the test session).
+    assert body["data_start_date"] == main_mod.DATA_START_DATE.date().isoformat()
     assert body["days"] == 1  # default
+    assert body["feed"] is None  # default = combined
 
 
 def test_stats_endpoint_uses_days_window_for_counts(stats_client, db, store):
@@ -822,3 +866,207 @@ def test_stats_endpoint_excludes_pre_start_events_even_when_requested(
     body = r.json()
     # Only post_p counts — pre_p is below the trustworthy floor.
     assert body["heroes"] == 1
+
+
+# =====================================================================
+# /api/stats?feed=fashion|general — tab-aware counter.
+# Spec: when user is on the Fashion tab the top counter must show
+# fashion-only heroes/villains; on General tab it must show
+# general-only counts. Same DATA_START_DATE + day-window apply.
+# =====================================================================
+def _seed_hero(db, store, product, *, today_anchor, days_ago=0):
+    db.add(LabelEvent(
+        store_id=store.id, product_id=product.id,
+        date=today_anchor - timedelta(days=days_ago),
+        label="hero", prior_position=20, current_position=5,
+        position_change=15,
+    ))
+
+
+def test_stats_feed_fashion_counts_only_fashion_events(
+    stats_client, db, store,
+):
+    """feed=fashion → is_fashion=True products only. General-feed
+    events seeded in the same window must not leak into the count."""
+    today = today_start_utc()
+    f1 = _make_product(db, store, handle="f1", position=5, is_fashion=True)
+    f2 = _make_product(db, store, handle="f2", position=6, is_fashion=True)
+    g1 = _make_product(
+        db, store, handle="g1", position=5,
+        is_fashion=False, subniche="home",
+    )
+    _seed_hero(db, store, f1, today_anchor=today)
+    _seed_hero(db, store, f2, today_anchor=today, days_ago=1)
+    _seed_hero(db, store, g1, today_anchor=today)
+    db.commit()
+
+    r = stats_client.get("/api/stats?days=7&feed=fashion")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["heroes"] == 2
+    assert body["feed"] == "fashion"
+
+
+def test_stats_feed_general_counts_only_general_events(
+    stats_client, db, store,
+):
+    """feed=general → is_fashion=False AND subniche != '' only. Fashion
+    events seeded in the same window must not leak into the count."""
+    today = today_start_utc()
+    f1 = _make_product(db, store, handle="f1", position=5, is_fashion=True)
+    g1 = _make_product(
+        db, store, handle="g1", position=5,
+        is_fashion=False, subniche="home",
+    )
+    g2 = _make_product(
+        db, store, handle="g2", position=6,
+        is_fashion=False, subniche="home",
+    )
+    _seed_hero(db, store, f1, today_anchor=today)
+    _seed_hero(db, store, g1, today_anchor=today)
+    _seed_hero(db, store, g2, today_anchor=today, days_ago=2)
+    db.commit()
+
+    r = stats_client.get("/api/stats?days=7&feed=general")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["heroes"] == 2
+    assert body["feed"] == "general"
+
+
+def test_stats_feed_omitted_returns_combined(stats_client, db, store):
+    """Omitting the `feed` query param means BOTH feeds — backward-compat
+    behaviour for older clients. New UI always sends explicit feed."""
+    today = today_start_utc()
+    f1 = _make_product(db, store, handle="f1", position=5, is_fashion=True)
+    g1 = _make_product(
+        db, store, handle="g1", position=5,
+        is_fashion=False, subniche="home",
+    )
+    _seed_hero(db, store, f1, today_anchor=today)
+    _seed_hero(db, store, g1, today_anchor=today)
+    db.commit()
+
+    r = stats_client.get("/api/stats?days=7")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["heroes"] == 2  # both
+    assert body["feed"] is None
+
+
+def test_stats_feed_sum_equals_combined(stats_client, db, store):
+    """Invariant: heroes(fashion) + heroes(general) == heroes(combined).
+    No event should be double-counted or missed across the split."""
+    today = today_start_utc()
+    fashion = [
+        _make_product(db, store, handle=f"f{i}", position=i+1, is_fashion=True)
+        for i in range(3)
+    ]
+    general = [
+        _make_product(
+            db, store, handle=f"g{i}", position=i+1,
+            is_fashion=False, subniche="home",
+        )
+        for i in range(2)
+    ]
+    for p in fashion + general:
+        _seed_hero(db, store, p, today_anchor=today)
+    db.commit()
+
+    h_f = stats_client.get("/api/stats?days=7&feed=fashion").json()["heroes"]
+    h_g = stats_client.get("/api/stats?days=7&feed=general").json()["heroes"]
+    h_c = stats_client.get("/api/stats?days=7").json()["heroes"]
+    assert h_f + h_g == h_c
+    assert h_f == 3
+    assert h_g == 2
+    assert h_c == 5
+
+
+def test_stats_feed_invalid_value_rejected(stats_client):
+    """The regex on the feed param must reject unexpected values so
+    the contract doesn't quietly drift."""
+    r = stats_client.get("/api/stats?feed=bogus")
+    assert r.status_code == 422
+
+
+def test_stats_feed_general_does_not_include_subniche_empty(
+    stats_client, db, store,
+):
+    """A product with is_fashion=False AND subniche='' is in NEITHER
+    feed (it's a dropped product or unclassified). Counting it under
+    feed=general would inflate the number."""
+    today = today_start_utc()
+    orphan = _make_product(
+        db, store, handle="orphan", position=5,
+        is_fashion=False, subniche="",
+    )
+    real_general = _make_product(
+        db, store, handle="real", position=5,
+        is_fashion=False, subniche="home",
+    )
+    _seed_hero(db, store, orphan, today_anchor=today)
+    _seed_hero(db, store, real_general, today_anchor=today)
+    db.commit()
+
+    r = stats_client.get("/api/stats?days=7&feed=general")
+    assert r.status_code == 200
+    assert r.json()["heroes"] == 1
+
+
+# =====================================================================
+# trustworthy_prior_filters now enforces DATA_START_DATE.
+# Reset history (2026-05-13): the scrape-time prior must come from a
+# PositionHistory snapshot dated >= DATA_START_DATE. PositionHistory
+# rows written under inconsistent earlier configs are NOT trustworthy
+# priors even when trust_epoch would otherwise admit them.
+# =====================================================================
+def test_compute_and_write_skips_when_prior_is_before_data_start_date(
+    db, store, monkeypatch,
+):
+    """Pin DATA_START_DATE to today. A PositionHistory snapshot from
+    yesterday (under an older, inconsistent config) must NOT qualify
+    as a prior, so compute_and_write_events writes zero events.
+    This is the day-0 wipe behaviour: the first scrape after the
+    floor lands shows 0 heroes / 0 villains by design."""
+    now = datetime(2026, 5, 13, 12, 0, 0)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today - timedelta(hours=10)
+    _pin_floor(monkeypatch, today)  # floor == today
+
+    p = _make_product(db, store, handle="mover", position=5)
+    db.add(PositionHistory(product_id=p.id, position=30, date=yesterday))
+    db.add(PositionHistory(product_id=p.id, position=5, date=now))
+    db.commit()
+    _pad_catalog(db, store)
+
+    heroes, villains = compute_and_write_events(db, store, now=now)
+    assert heroes == 0
+    assert villains == 0
+    assert db.query(LabelEvent).filter(LabelEvent.product_id == p.id).count() == 0
+
+
+def test_compute_and_write_uses_prior_on_or_after_data_start_date(
+    db, store, monkeypatch,
+):
+    """Day 2: DATA_START_DATE is yesterday, today_start is today.
+    Yesterday's snapshot IS >= DATA_START_DATE and < today_start →
+    qualifies as a trustworthy prior. Today's scrape can now write
+    real events comparing yesterday (trustworthy) vs today."""
+    floor = datetime(2026, 5, 13, 0, 0, 0)
+    _pin_floor(monkeypatch, floor)
+    now = datetime(2026, 5, 14, 12, 0, 0)  # day 2
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today - timedelta(hours=10)  # 2026-05-13 14:00 — >= floor
+
+    p = _make_product(db, store, handle="mover", position=5)
+    db.add(PositionHistory(product_id=p.id, position=30, date=yesterday))
+    db.add(PositionHistory(product_id=p.id, position=5, date=now))
+    db.commit()
+    _pad_catalog(db, store)
+
+    heroes, villains = compute_and_write_events(db, store, now=now)
+    assert heroes >= 1
+    ev = db.query(LabelEvent).filter(LabelEvent.product_id == p.id).one()
+    assert ev.label == "hero"
+    assert ev.prior_position == 30
+    assert ev.current_position == 5

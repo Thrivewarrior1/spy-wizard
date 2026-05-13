@@ -36,6 +36,20 @@ from sqlalchemy.orm import sessionmaker
 from models import Base, Store, Product, PositionHistory
 
 
+@pytest.fixture(autouse=True)
+def lenient_data_start_date(monkeypatch):
+    """These tests pre-date DATA_START_DATE. They exercise the trust
+    epoch with dates around 2026-05-04..05, which are pre-floor under
+    the production default (2026-05-13). Drop the DATA_START_DATE
+    floor to far-past so the trust-epoch behaviour under test is
+    isolated from the floor."""
+    import labels as labels_mod, main as main_mod
+    far_past = datetime(2000, 1, 1)
+    monkeypatch.setattr(labels_mod, "DATA_START_DATE", far_past)
+    monkeypatch.setattr(main_mod, "DATA_START_DATE", far_past)
+    yield
+
+
 @pytest.fixture
 def db():
     eng = create_engine("sqlite:///:memory:")

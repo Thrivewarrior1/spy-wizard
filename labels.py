@@ -72,27 +72,45 @@ TRUST_EPOCH_UTC = _parse_trust_epoch(os.getenv("TRUST_EPOCH_UTC"))
 
 
 # =====================================================================
-# DATA_START_DATE — trustworthy floor for the LabelEvent ledger.
+# DATA_START_DATE — trustworthy floor for the LabelEvent ledger AND
+# for the prior-position filter at scrape time.
 # =====================================================================
-# Events earlier than this date are from before the Spy Wizard 2
-# position-correctness + per-feed cap + classifier hardening rules
-# stabilised. They look like valid events to the system but reflect a
-# different underlying catalog shape, so we EXCLUDE them from every
-# read path AND prune them on startup.
+# Events / PositionHistory snapshots dated BEFORE this floor are from
+# a period when scraper rules (filter regexes, force-general /
+# force-fashion logic, per-feed cap, lighting classification,
+# position-renumbering) were still moving. Treating those snapshots
+# as comparators for day-over-day deltas produces PHANTOM heroes /
+# villains: products appear to move because items above them were
+# filtered in or out under a different config, not because their
+# actual rank changed organically.
 #
-# User-stated rule (2026-05-13): "only use the history if you have
-# stored any accurate data for the last 7 days, and from there on
-# move forward. Don't use any history from 30 days ago because that
-# data isn't accurate, because then the Spy Wizard 2 wasn't even
-# live yet."
+# Reset history (2026-05-13): the previous 2026-05-06 floor still
+# allowed backfill to synthesise events from PositionHistory written
+# under inconsistent configs across 2026-05-06..2026-05-12 — the
+# resulting ledger had 5929 events across 7 days (~21% of catalog
+# labeled per day), wildly inconsistent with real organic movement
+# (~1–3% / day). User invoked "100,000% accuracy, no assumptions"
+# and asked for a clean reset: wipe the table, pin the floor at
+# today, accumulate fresh events under the now-stable config from
+# tomorrow onward.
 #
-# Default = 2026-05-06 (7 days before the 2026-05-13 stabilisation
-# date). Env-overridable via DATA_START_DATE (YYYY-MM-DD) so the
-# trustworthy window can be extended without a deploy as we audit
-# more historical days. The constant does NOT auto-advance — once
-# set, it's a fixed point and the trustworthy window GROWS as more
-# in-window days accumulate, up to the 30-day retention cap.
-_DEFAULT_DATA_START_DATE = datetime(2026, 5, 6, 0, 0, 0)
+# Behaviour:
+#   * Read paths (fetch_label_events_window) filter LabelEvent.date
+#     >= DATA_START_DATE. Existing pre-floor rows are deleted by
+#     cleanup_pre_start_label_events on every startup (idempotent).
+#   * Write path (compute_and_write_events) requires
+#     PositionHistory.date >= DATA_START_DATE for the prior — see
+#     trustworthy_prior_filters below. On day 1 (today == floor) no
+#     prior qualifies, so the scrape writes 0 events and the UI
+#     shows 0 heroes / 0 villains. Day 2 onward: yesterday's snapshot
+#     under the locked config IS a trustworthy prior.
+#   * Backfill respects DATA_START_DATE on both PositionHistory query
+#     and per-day emit guard.
+#
+# Default = 2026-05-13. Env-overridable via DATA_START_DATE
+# (YYYY-MM-DD) for forensic re-runs. Constant does NOT auto-advance;
+# the trustworthy window grows from this fixed point.
+_DEFAULT_DATA_START_DATE = datetime(2026, 5, 13, 0, 0, 0)
 
 
 def _parse_data_start_date(raw: Optional[str]) -> datetime:
@@ -144,14 +162,23 @@ def today_start_utc() -> datetime:
 
 
 def trustworthy_prior_filters(today_start: datetime):
-    """Two filter clauses every prior-position lookup must apply:
+    """Three filter clauses every prior-position lookup must apply:
     (1) prior must come from a DIFFERENT UTC calendar day (i.e. before
         today_start), AND
-    (2) prior must be from on or after TRUST_EPOCH_UTC.
+    (2) prior must be from on or after TRUST_EPOCH_UTC (legacy schema
+        guard — bumped on any schema-shaped catalog change), AND
+    (3) prior must be from on or after DATA_START_DATE (scraper-config
+        guard — pins to the day the current ruleset locked in, see
+        the DATA_START_DATE docstring above).
+
+    Both (2) and (3) are floors. In practice DATA_START_DATE is the
+    tighter one — TRUST_EPOCH is a coarse legacy guard kept around
+    so we don't lose the historical schema check.
     """
     return (
         PositionHistory.date < today_start,
         PositionHistory.date >= TRUST_EPOCH_UTC,
+        PositionHistory.date >= DATA_START_DATE,
     )
 
 
