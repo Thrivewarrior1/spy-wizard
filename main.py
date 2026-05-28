@@ -13,7 +13,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel
 from typing import Optional
 
-from database import get_db, engine, SessionLocal, widen_text_columns
+from database import (
+    get_db, engine, SessionLocal,
+    widen_text_columns,
+    enforce_fk_cascade,
+    cleanup_orphans,
+)
 from models import Base, Store, Product, PositionHistory
 from scraper import (
     scrape_all_stores,
@@ -133,6 +138,16 @@ async def _background_scrape_all():
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     widen_text_columns()
+    # Upgrade legacy foreign-key constraints to ON DELETE CASCADE so
+    # deleting a Store actually wipes its Products / PositionHistory /
+    # LabelEvent rows at the DB layer — without this, the user's
+    # delete leaks orphan rows that continue to show in the dashboard.
+    # Idempotent: a no-op after the first successful upgrade.
+    enforce_fk_cascade()
+    # Belt-and-braces: even after CASCADE is in place, mop up any
+    # orphans that pre-date the migration so the dashboard stops
+    # surfacing products from already-deleted stores.
+    cleanup_orphans()
     seed_stores()
     # One-shot DB-wide junk sweep on every redeploy. Idempotent —
     # purges any product whose title/product_type matches the
@@ -370,6 +385,15 @@ async def create_store(store: StoreCreate, db: Session = Depends(get_db)):
 
 @app.put("/api/stores/{store_id}")
 async def update_store(store_id: int, store: StoreUpdate, db: Session = Depends(get_db)):
+    """Update a store's metadata. Every submitted (non-None) field is
+    persisted. URL is re-normalised on save so trailing-slash /
+    scheme drift can't accumulate.
+
+    Returns the FULL updated row so the frontend can refresh its
+    cache without an extra round-trip — and `loadCombined` /
+    `loadCombinedGeneral` pick up the new store_name / store_url
+    on the next render of any product card.
+    """
     existing = db.query(Store).filter(Store.id == store_id).first()
     if not existing:
         raise HTTPException(status_code=404, detail="Store not found")
@@ -407,16 +431,71 @@ async def update_store(store_id: int, store: StoreUpdate, db: Session = Depends(
     for key, value in payload.items():
         setattr(existing, key, value)
     db.commit()
-    return {"success": True}
+    db.refresh(existing)
+    logger.info(
+        "update_store: id=%d name=%r url=%r niche=%r country=%r visitors=%r",
+        existing.id, existing.name, existing.url, existing.niche,
+        existing.country, existing.monthly_visitors,
+    )
+    return {
+        "success": True,
+        "id": existing.id,
+        "name": existing.name,
+        "url": existing.url,
+        "monthly_visitors": existing.monthly_visitors,
+        "niche": existing.niche,
+        "country": existing.country,
+    }
 
 @app.delete("/api/stores/{store_id}")
 async def delete_store(store_id: int, db: Session = Depends(get_db)):
+    """Delete a store AND every row that referenced it.
+
+    Explicit cascade rather than relying solely on the DB-level
+    ON DELETE CASCADE — that constraint is upgraded by the startup
+    `enforce_fk_cascade()` migration, but if for any reason it
+    didn't fire (table didn't exist yet, permission error, etc.)
+    we still want the delete to wipe the whole tree.
+
+    Response includes per-table delete counts so the UI can show
+    the user exactly what was removed.
+    """
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
+    name_before = store.name
+    # Snapshot the product ids so the explicit child deletes hit a
+    # stable set (the DB-level cascade may or may not have already
+    # purged them by the time we run these queries).
+    product_ids = [pid for (pid,) in db.query(Product.id).filter(
+        Product.store_id == store_id,
+    ).all()]
+    counts = {"store": 0, "products": 0, "position_history": 0, "label_events": 0}
+    if product_ids:
+        counts["label_events"] = db.query(LabelEvent).filter(
+            LabelEvent.product_id.in_(product_ids)
+        ).delete(synchronize_session=False)
+        counts["position_history"] = db.query(PositionHistory).filter(
+            PositionHistory.product_id.in_(product_ids)
+        ).delete(synchronize_session=False)
+        counts["products"] = db.query(Product).filter(
+            Product.id.in_(product_ids)
+        ).delete(synchronize_session=False)
+    # Also purge any LabelEvent rows tied to the store directly that
+    # weren't covered above (shouldn't exist, but defensive).
+    counts["label_events"] += db.query(LabelEvent).filter(
+        LabelEvent.store_id == store_id
+    ).delete(synchronize_session=False)
     db.delete(store)
     db.commit()
-    return {"success": True}
+    counts["store"] = 1
+    logger.info(
+        "delete_store: removed %r (id=%d) + %d products / %d history / "
+        "%d label_events",
+        name_before, store_id,
+        counts["products"], counts["position_history"], counts["label_events"],
+    )
+    return {"success": True, "deleted": counts}
 
 # --- Bestsellers ---
 def parse_visitors(v: str) -> int:

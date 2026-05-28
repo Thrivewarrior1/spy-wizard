@@ -514,10 +514,64 @@ function submitStore(){
       try{const j=await r.json();if(j&&j.detail){detail=j.detail}}catch(e){}
       throw new Error(detail);
     })
-    .then(()=>{closeModal();loadStores()})
+    .then(()=>{closeModal();_fullRefreshAfterStoreChange()})
     .catch(err=>alert('Save failed: '+(err&&err.message?err.message:'unknown error')));
 }
-function delStore(id,n){if(!confirm(`Delete "${n}"?`))return;fetch(`${API}/stores/${id}`,{method:'DELETE'}).then(()=>{loadStores();loadStats()})}
+function delStore(id,n){
+  if(!confirm(`Delete "${n}"?\n\nThis removes the store AND every product, position-history row, and hero/villain event tied to it. The deletion is permanent.`))return;
+  fetch(`${API}/stores/${id}`,{method:'DELETE'})
+    .then(async r=>{
+      if(r.ok)return r.json();
+      let detail='HTTP '+r.status;
+      try{const j=await r.json();if(j&&j.detail){detail=j.detail}}catch(e){}
+      throw new Error(detail);
+    })
+    .then(body=>{
+      // Clear any per-store grid that was pointing at the now-deleted
+      // store so the user doesn't keep seeing its products.
+      const selF=document.getElementById('storeSelect');
+      if(selF && String(selF.value)===String(id)){
+        selF.value='';
+        const g=document.getElementById('gridStore');
+        if(g)g.innerHTML='<div class="empty">Select a store above to view its bestsellers</div>';
+      }
+      const selG=document.getElementById('storeSelectG');
+      if(selG && String(selG.value)===String(id)){
+        selG.value='';
+        const g=document.getElementById('gridStoreG');
+        if(g)g.innerHTML='<div class="empty">Select a store above to view its general bestsellers</div>';
+      }
+      _fullRefreshAfterStoreChange();
+      // Optional: surface the cascade counts so the user sees what
+      // actually got removed (catches the "delete looked silent"
+      // case where the row vanished from the table but the products
+      // were still in the grid).
+      const d=body&&body.deleted;
+      if(d){
+        console.log(`Deleted store "${n}": ${d.products||0} products, ${d.position_history||0} history rows, ${d.label_events||0} hero/villain events`);
+      }
+    })
+    .catch(err=>alert('Delete failed: '+(err&&err.message?err.message:'unknown error')));
+}
+
+// After a store add / edit / delete, every UI surface that may show
+// store-derived data has to refresh — otherwise the user sees the
+// old name on product cards, the deleted store's products in the
+// combined feeds, the stale dropdown options, etc. One helper so
+// the three callsites stay in sync.
+function _fullRefreshAfterStoreChange(){
+  loadStores();                  // Fashion-tab store dropdown + Stores-tab table
+  if(typeof loadStoresG==='function')loadStoresG(); // General-tab store dropdown
+  loadStats();                   // Top counter (store count + hero/villain count)
+  loadCombined();                // Fashion combined feed (store_name on every card)
+  if(document.getElementById('storeSelect').value)loadStore();
+  // Only re-fetch general feeds if the user has actually loaded that
+  // tab — saves a round-trip on the common Fashion-only flow.
+  if(document.getElementById('generalTab').style.display!=='none'){
+    loadCombinedGeneral();
+    if(document.getElementById('storeSelectG').value)loadStoreGeneral();
+  }
+}
 </script>
 </body>
 </html>

@@ -49,6 +49,157 @@ def get_db():
         db.close()
 
 
+def enforce_fk_cascade():
+    """Idempotent migration: ensure every foreign key that the ORM
+    declares with `ondelete='CASCADE'` actually has `ON DELETE CASCADE`
+    enforced at the Postgres level.
+
+    Without this, the DB was created at a time when the ORM models
+    didn't yet declare CASCADE; SQLAlchemy's `Base.metadata.create_all`
+    only creates missing tables and never re-issues FK constraints
+    against existing tables. Result: deleting a Store left orphan
+    Products / PositionHistory / LabelEvent rows behind, which
+    continued to show in the dashboard and counted toward stats.
+
+    This migration:
+      1. Queries pg_constraint to find each FK on the four relevant
+         columns and the actual `confdeltype` ('c' = CASCADE).
+      2. For any FK whose deltype != 'c', DROPs and recreates it with
+         ON DELETE CASCADE.
+      3. Logs each fix so the Railway log shows exactly what changed.
+
+    Skipped on SQLite (we already do `PRAGMA foreign_keys = ON` in the
+    connect hook, and SQLite re-creates tables on every test run).
+    """
+    if not DATABASE_URL.startswith(("postgresql://", "postgres://")):
+        return
+    # (child_table, child_column, parent_table) — every FK we want to
+    # be ON DELETE CASCADE. Order doesn't matter for the migration
+    # itself but is grouped by parent for readability.
+    cascades = [
+        ("products", "store_id", "stores"),
+        ("position_history", "product_id", "products"),
+        ("label_events", "store_id", "stores"),
+        ("label_events", "product_id", "products"),
+    ]
+    with engine.connect() as conn:
+        for child_table, child_column, parent_table in cascades:
+            try:
+                # Find the existing constraint name + cascade type.
+                row = conn.execute(text("""
+                    SELECT conname, confdeltype
+                    FROM pg_constraint
+                    WHERE conrelid = (
+                        SELECT oid FROM pg_class
+                        WHERE relname = :child AND relnamespace = (
+                            SELECT oid FROM pg_namespace WHERE nspname = current_schema()
+                        )
+                    )
+                    AND contype = 'f'
+                    AND conkey = (
+                        SELECT array_agg(attnum ORDER BY attnum)
+                        FROM pg_attribute
+                        WHERE attrelid = (
+                            SELECT oid FROM pg_class WHERE relname = :child
+                        )
+                        AND attname = :col
+                    )
+                """), {"child": child_table, "col": child_column}).fetchone()
+                if not row:
+                    logger.info(
+                        "enforce_fk_cascade: no FK found on %s.%s yet "
+                        "(table may not exist; skipping)",
+                        child_table, child_column,
+                    )
+                    continue
+                conname, deltype = row
+                if deltype == "c":
+                    logger.info(
+                        "enforce_fk_cascade: %s.%s already CASCADE",
+                        child_table, child_column,
+                    )
+                    continue
+                # Drop + recreate with CASCADE.
+                conn.execute(text(
+                    f'ALTER TABLE {child_table} '
+                    f'DROP CONSTRAINT "{conname}"'
+                ))
+                conn.execute(text(
+                    f'ALTER TABLE {child_table} '
+                    f'ADD CONSTRAINT "{conname}" '
+                    f'FOREIGN KEY ({child_column}) '
+                    f'REFERENCES {parent_table}(id) ON DELETE CASCADE'
+                ))
+                conn.commit()
+                logger.info(
+                    "enforce_fk_cascade: switched %s.%s -> %s "
+                    "to ON DELETE CASCADE (was '%s')",
+                    child_table, child_column, parent_table, deltype,
+                )
+            except Exception as e:
+                # Don't crash startup over a single FK that wasn't there
+                # yet (e.g. label_events on first deploy before the
+                # table is created). Log and move on; next deploy will
+                # retry once the table exists.
+                logger.warning(
+                    "enforce_fk_cascade: skipped %s.%s -> %s: %s",
+                    child_table, child_column, parent_table, e,
+                )
+
+
+def cleanup_orphans():
+    """One-shot, idempotent: delete any Product / PositionHistory /
+    LabelEvent row whose parent FK no longer points at a real row.
+
+    This belt-and-braces complement to enforce_fk_cascade catches
+    rows that slipped through before the FK was upgraded — without
+    it the user keeps seeing stale products from stores they
+    deleted weeks ago. After enforce_fk_cascade has run once, this
+    function returns 0 on every subsequent boot.
+
+    Skipped on SQLite (the test suite re-creates tables each run).
+    """
+    if not DATABASE_URL.startswith(("postgresql://", "postgres://")):
+        return {"products": 0, "position_history": 0, "label_events": 0}
+    counts = {"products": 0, "position_history": 0, "label_events": 0}
+    statements = [
+        # PositionHistory orphaned by a missing Product.
+        ("position_history", """
+            DELETE FROM position_history
+            WHERE product_id NOT IN (SELECT id FROM products)
+        """),
+        # LabelEvent orphaned by a missing Store OR a missing Product.
+        # Run before products cleanup so we don't double-count rows
+        # the next cascade step would have removed.
+        ("label_events", """
+            DELETE FROM label_events
+            WHERE store_id NOT IN (SELECT id FROM stores)
+               OR product_id NOT IN (SELECT id FROM products)
+        """),
+        # Product orphaned by a missing Store.
+        ("products", """
+            DELETE FROM products
+            WHERE store_id NOT IN (SELECT id FROM stores)
+        """),
+    ]
+    with engine.connect() as conn:
+        for label, stmt in statements:
+            try:
+                result = conn.execute(text(stmt))
+                conn.commit()
+                counts[label] = result.rowcount or 0
+                if counts[label]:
+                    logger.info(
+                        "cleanup_orphans: deleted %d orphan %s rows",
+                        counts[label], label,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "cleanup_orphans: skipped %s cleanup: %s", label, e,
+                )
+    return counts
+
+
 def widen_text_columns():
     """Idempotent migration: convert handle/shopify_id/title columns from
     fixed-length VARCHAR to TEXT on existing Postgres deployments. Without
