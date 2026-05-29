@@ -1,0 +1,58 @@
+# Render Blueprint — Spy Wizard 2.
+#
+# One file = the entire infrastructure: a Dockerised web service for
+# the FastAPI app + a managed Postgres instance. Render auto-links
+# the DB connection string into DATABASE_URL on the service, so a
+# fresh deploy from this repo needs only the secret values
+# (APP_PASSWORD, GEMINI_API_KEY) filled in via the Render UI.
+#
+# Migration history: replaces the old Railway deploy. The previous
+# Postgres data (LabelEvent ledger, PositionHistory, custom store
+# edits) was not recoverable — first scrape after deploy will
+# repopulate stores from seed.py and rebuild the ledger from today
+# under the locked scraper config (DATA_START_DATE default = today).
+
+databases:
+  - name: spy-wizard-db
+    plan: free                # Free tier OK to start; bump to starter when you outgrow it.
+    databaseName: spy_wizard
+    user: spy_wizard
+
+services:
+  - type: web
+    name: spy-wizard
+    env: docker
+    plan: starter             # Free tier sleeps after 15 min idle, which breaks the daily scheduler. Starter stays warm.
+    region: frankfurt         # EU host — matches the German fashion-store userbase.
+    branch: main
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/stats
+    envVars:
+      # DB connection auto-wired from the spy-wizard-db block above.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: spy-wizard-db
+          property: connectionString
+
+      # PORT is injected by Render automatically — the Dockerfile CMD
+      # reads ${PORT} so no override needed here.
+
+      # App auth — login password for the dashboard. Set in the Render
+      # UI (Secret) so it's not in source.
+      - key: APP_PASSWORD
+        sync: false           # User must fill in via Render UI on first deploy.
+
+      # Optional — Gemini classifier API key. The classifier degrades
+      # gracefully when missing (products land with empty subniche and
+      # don't surface on the General tab until the key is set).
+      - key: GEMINI_API_KEY
+        sync: false
+
+      # Trust epoch + data-start floor have safe defaults in labels.py
+      # (2026-05-04 and 2026-05-13 respectively). Override here only
+      # if you need to roll either forward without a code deploy.
+      # - key: TRUST_EPOCH_UTC
+      #   value: "2026-05-04T00:00:00"
+      # - key: DATA_START_DATE
+      #   value: "2026-05-13"
