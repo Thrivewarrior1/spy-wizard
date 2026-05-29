@@ -1560,6 +1560,36 @@ async def scrape_status():
         "result": _scrape_state["result"],
     }
 
+
+@app.post("/api/admin/reset-products")
+async def admin_reset_products(db: Session = Depends(get_db)):
+    """One-shot wipe of the products / history / event tables.
+
+    Needed after the Railway → Render migration: the first scrape ran
+    in degraded mode (no GEMINI_API_KEY) which routed EVERY product
+    into the Fashion feed with subniche='fashion'. After the key was
+    set, only currently-bestselling products got re-classified by
+    re-scrape; previously-seen products that dropped from the
+    bestseller list kept their stale degraded-mode classification,
+    polluting the Fashion tab with non-fashion items (smartwatches,
+    drum mats, blood pressure monitors, etc.).
+
+    This endpoint clears the slate so the next /api/scrape produces
+    a 100% Gemini-classified catalog. Stores are NOT touched. The
+    DATA_START_DATE floor already wiped the LabelEvent ledger on
+    boot; this just makes that the visible-products state too.
+    """
+    counts = {}
+    counts["label_events"] = db.query(LabelEvent).delete(synchronize_session=False)
+    counts["position_history"] = db.query(PositionHistory).delete(synchronize_session=False)
+    counts["products"] = db.query(Product).delete(synchronize_session=False)
+    db.commit()
+    logger.warning(
+        "admin_reset_products: wiped %d products, %d history rows, %d label_events",
+        counts["products"], counts["position_history"], counts["label_events"],
+    )
+    return {"success": True, "deleted": counts}
+
 @app.post("/api/reset-labels")
 async def trigger_reset_labels(db: Session = Depends(get_db)):
     count = reset_all_labels(db)
