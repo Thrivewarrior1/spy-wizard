@@ -17,13 +17,14 @@ databases:
     plan: free                # Free tier OK to start; bump to starter when you outgrow it.
     databaseName: spy_wizard
     user: spy_wizard
+    region: oregon            # Free Postgres is Oregon-only; web service pinned here too to keep internal-DNS resolution working.
 
 services:
   - type: web
     name: spy-wizard
     env: docker
     plan: starter             # Free tier sleeps after 15 min idle, which breaks the daily scheduler. Starter stays warm.
-    region: frankfurt         # EU host — matches the German fashion-store userbase.
+    region: oregon            # Must match the DB region — Render's short DB hostname (dpg-xxxxx-a) only resolves in the same region. Cross-region deploys fail with "Name or service not known".
     branch: main
     autoDeploy: true
     dockerfilePath: ./Dockerfile
