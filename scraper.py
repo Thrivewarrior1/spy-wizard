@@ -1993,9 +1993,24 @@ def _per_store_warning(niche: str, fashion_n: int, general_n: int) -> str | None
 
 async def scrape_all_stores(db: Session) -> dict:
     """Scrape all stores. Returns a per-store summary so the API can
-    surface real success/failure (counts, errors) to the user."""
-    stores = db.query(Store).all()
-    logger.info(f"Starting scrape of {len(stores)} stores...")
+    surface real success/failure (counts, errors) to the user.
+
+    Race-safe against concurrent edits: instead of holding a list of
+    ORM instances across the loop (which become stale after every
+    commit and raise ObjectDeletedError if a Store row gets deleted
+    mid-scrape), we snapshot just the IDs up front and re-fetch each
+    Store by id at the top of every iteration. A store the user
+    deleted while the scrape was in flight is skipped with a
+    warning — the rest of the scrape continues cleanly.
+    """
+    # Snapshot the store ids ONLY. Don't keep ORM references across
+    # the per-store commits inside update_products_in_db (those
+    # commits expire every other instance in the session, and the
+    # next iteration's attribute access would re-query the DB → raise
+    # ObjectDeletedError for any store the user dropped via the UI
+    # while we were iterating).
+    store_ids = [sid for (sid,) in db.query(Store.id).order_by(Store.id).all()]
+    logger.info(f"Starting scrape of {len(store_ids)} stores...")
 
     results = {
         "stores": [],
@@ -2005,16 +2020,34 @@ async def scrape_all_stores(db: Session) -> dict:
         "stores_failed": 0,
     }
 
-    for store in stores:
+    for sid in store_ids:
+        # Re-fetch the live Store row for this iteration. If the user
+        # deleted it mid-scrape, this returns None and we skip
+        # gracefully without aborting the whole run.
+        store = db.query(Store).filter(Store.id == sid).first()
+        if store is None:
+            logger.info(
+                f"  ~ store id={sid} disappeared mid-scrape (user delete?), skipping"
+            )
+            continue
+
+        # Read every Store attribute we need into plain locals NOW,
+        # before any commit can expire the instance. Subsequent code
+        # uses only these locals — touching `store` again later would
+        # re-trigger the stale-instance race.
+        s_name = store.name
+        s_url = store.url
+        s_niche = store.niche or ""
+
         store_result = {
-            "id": store.id, "name": store.name,
-            "niche": store.niche or "",
+            "id": sid, "name": s_name,
+            "niche": s_niche,
             "products": 0, "general": 0,
             "warning": None, "errors": [],
         }
-        logger.info(f"Scraping {store.name} ({store.url})...")
+        logger.info(f"Scraping {s_name} ({s_url})...")
         try:
-            fashion, general, errors = await scrape_store_bestsellers(store.url)
+            fashion, general, errors = await scrape_store_bestsellers(s_url)
             store_result["errors"] = errors
             if fashion or general:
                 update_products_in_db(db, store, fashion, general)
@@ -2025,23 +2058,23 @@ async def scrape_all_stores(db: Session) -> dict:
                 results["stores_with_products"] += 1
                 logger.info(
                     f"  ✓ {len(fashion)} fashion + {len(general)} general "
-                    f"for {store.name}"
+                    f"for {s_name}"
                 )
                 store_result["warning"] = _per_store_warning(
-                    store.niche or "", len(fashion), len(general),
+                    s_niche, len(fashion), len(general),
                 )
             else:
                 results["stores_failed"] += 1
                 store_result["warning"] = _per_store_warning(
-                    store.niche or "", 0, 0,
+                    s_niche, 0, 0,
                 )
                 logger.warning(
-                    f"  ✗ No products for {store.name} — errors: {errors}"
+                    f"  ✗ No products for {s_name} — errors: {errors}"
                 )
         except Exception as e:
             store_result["errors"].append(f"unhandled: {e}")
             results["stores_failed"] += 1
-            logger.exception(f"Failed to scrape {store.name}")
+            logger.exception(f"Failed to scrape {s_name}")
 
         results["stores"].append(store_result)
         await asyncio.sleep(5 + random.uniform(0, 3))
