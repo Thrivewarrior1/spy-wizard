@@ -516,12 +516,18 @@ async def expand_query(q: str) -> ExpansionResult:
         allowed=set(_INTENT_TYPE_KEYWORDS.keys()),
         cap=4,
     )
-    # Safety net: if Gemini returned no intent_types but the query
-    # clearly mentions a known product noun ("shoes", "dress"), fall
-    # back to the keyword-based inference. Prevents accidental
-    # gate-disabling when Gemini hallucinates an empty list.
-    if not intent_types:
-        intent_types = _infer_intent_types_from_query(qn)
+    # ALWAYS union with keyword-inferred intent — if the user typed
+    # "table lamp", Gemini may have returned ["electronics"] but the
+    # query unambiguously also implies "home" (because "lamp" is in
+    # home's keyword set). Pre-deploy bug: a "table lamp" search
+    # returned a belt product because Gemini's intent_types alone
+    # didn't include "home", disabling the home-keyword filter.
+    inferred = _infer_intent_types_from_query(qn)
+    seen = set(intent_types)
+    for t in inferred:
+        if t not in seen:
+            seen.add(t)
+            intent_types.append(t)
 
     exp = ExpansionResult(
         original=qn,
