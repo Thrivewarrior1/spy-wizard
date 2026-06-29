@@ -1066,28 +1066,28 @@ async def hybrid_search(
     # 1. Query expansion (cached, ~500ms first call, <1ms cached)
     exp = await expand_query(s)
 
-    # 2. Build the OR-of-OR SQL prefilter. Every term gets a loose
-    #    LIKE clause against every searchable column. Postgres handles
-    #    this fine for our catalog size (~5-10k products).
-    all_terms = exp.all_terms()
-    if not all_terms:
-        return base_query.all()[:limit]
+    # 2. SQL prefilter. KEY CHANGE: only OR-match against title and
+    #    ai_tags — NOT product_category / subniche / product_type /
+    #    handle. Those weaker columns frequently contain shared common
+    #    tokens (e.g. subniche='fashion', product_category='dress')
+    #    and ORing %term% against them turned the prefilter into a
+    #    near-full-table scan that returned irrelevant cross-category
+    #    candidates. Title and ai_tags are curated per-product
+    #    signals; weaker columns get used in Python scoring only.
+    strong_terms = exp.strong_signal_terms()
+    if not strong_terms:
+        return []
 
-    columns = (
-        Product.title, Product.ai_tags, Product.product_category,
-        Product.subniche, Product.product_type, Product.handle,
-    )
     or_clauses = []
-    for term in all_terms:
-        # Bare 2-char terms cause massive false-positive blowup; skip.
+    for term in strong_terms:
         if len(term) < 3:
             continue
         like_pat = f"%{term}%"
-        for col in columns:
-            or_clauses.append(col.ilike(like_pat))
+        or_clauses.append(Product.title.ilike(like_pat))
+        or_clauses.append(Product.ai_tags.ilike(like_pat))
 
     if not or_clauses:
-        return base_query.all()[:limit]
+        return []
 
     candidate_query = base_query.filter(or_(*or_clauses)).limit(limit * 5)
     candidates = candidate_query.all()
@@ -1095,7 +1095,31 @@ async def hybrid_search(
     if not candidates:
         return []
 
-    # 3. Python-side scoring. Pure functions, no I/O.
+    # 3. HARD CATEGORY GATE. If the expander committed to one or more
+    #    intent_types (e.g. "dress", "shoes", "bag"), every returned
+    #    product MUST contain at least one keyword for one of those
+    #    types in its title or ai_tags. This is what stops "Mini Dress"
+    #    from polluting a shoe search and "Derby Dress Shoes" from
+    #    polluting a dress search. Open-ended queries (intent_types
+    #    is empty) skip this gate.
+    intent_kws = exp.intent_keywords()
+    if intent_kws:
+        gated = []
+        for p in candidates:
+            haystack = (
+                (p.title or "").lower()
+                + " "
+                + (p.ai_tags or "").lower()
+            )
+            # Word-ish containment — accept exact substring (catches
+            # "shoes" in "high heel shoes" AND "schuh" in "schuhe").
+            if any(kw in haystack for kw in intent_kws):
+                gated.append(p)
+        candidates = gated
+        if not candidates:
+            return []
+
+    # 4. Python-side scoring. Pure functions, no I/O.
     scored = []
     for p in candidates:
         score = score_product_against_expansion(
@@ -1107,18 +1131,26 @@ async def hybrid_search(
             handle=p.handle or "",
             exp=exp,
         )
-        if score > 0:
+        # Min-score threshold: a product needs at least one real
+        # signal (not just an accidental category/handle token hit).
+        # Raised from 0 to 4 to cut the long tail of "barely matches"
+        # results the user complained about. With Gemini expansion
+        # active in production, tagged-relevant products score 20+
+        # easily; this threshold only filters the noise tier.
+        if score >= 4:
             scored.append((score, p))
 
     if not scored:
         return []
 
-    # 4. Sort by score desc, then by current_position asc (tie-break
+    # 5. Sort by score desc, then by current_position asc (tie-break
     #    on bestseller rank — lower is better).
     scored.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
 
-    # 5. Optional Gemini re-rank on the top 50 (only if rerank=True
-    #    and we have enough candidates to make it worth a Gemini call).
+    # 6. Gemini re-rank on the top 50 (default on, set
+    #    SEARCH_RERANK=0 to disable). The rerank prompt now defaults
+    #    to dropping anything < 50 (was < 20) which prunes the
+    #    "tangentially relevant" tail aggressively.
     rerank_enabled = (
         rerank
         and os.getenv("SEARCH_RERANK", "1") != "0"
@@ -1142,21 +1174,25 @@ async def hybrid_search(
             logger.warning("hybrid_search: rerank failed: %s — keeping hybrid order", e)
             ranking = [{"idx": i, "score": 50.0, "drop": False} for i in range(top_n)]
 
-        # Map idx → (rerank_score, drop) and reorder the top N
+        # Map idx → (rerank_score, drop). Tighter cutoff: drop anything
+        # rerank scored < 40 (in addition to Gemini's own drop=true).
         rerank_by_idx = {r["idx"]: (r["score"], r["drop"]) for r in ranking}
         reranked_top = []
         for i, (orig_score, p) in enumerate(scored[:top_n]):
             r_score, r_drop = rerank_by_idx.get(i, (50.0, False))
-            if r_drop:
+            if r_drop or r_score < 40:
                 continue
-            # Combine hybrid score + rerank score so a strong hybrid
-            # match isn't completely overridden by a slightly cooler
-            # rerank score.
-            final = orig_score + r_score
+            # Final score weights rerank more heavily than the hybrid
+            # prior so the AI's judgment dominates while ties break to
+            # higher hybrid relevance.
+            final = orig_score + (r_score * 2)
             reranked_top.append((final, p))
         reranked_top.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
-        # Append the un-reranked tail (positions 51+) below
-        scored = reranked_top + scored[top_n:]
+        # Append the un-reranked tail (positions 51+) below — but only
+        # the ones above the higher hybrid threshold so the tail isn't
+        # full of barely-matching products.
+        tail = [(s, p) for s, p in scored[top_n:] if s >= 10]
+        scored = reranked_top + tail
 
     return [p for _, p in scored[:limit]]
 

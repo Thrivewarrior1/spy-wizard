@@ -340,6 +340,73 @@ def test_search_results_ranked_by_relevance(client, seeded):
             f"literal {literal_positions} should beat tagged {tagged_positions}"
 
 
+def test_intent_gate_drops_cross_category_pollution(client, db_eng):
+    """User complaint 2026-06-29: searching 'shoes' surfaces dresses
+    because Gemini expansion includes 'dress shoes' as a phrase and
+    the SQL prefilter ORs every term. The intent gate (intent_types=
+    ['shoes'] requires title/ai_tags to contain a shoe keyword) is
+    the fix. This test seeds a dress + a shoe + a bag and verifies
+    that searching 'shoes' returns ONLY the shoe, even though the
+    dress + bag have tangentially-related tokens in their tags."""
+    from sqlalchemy.orm import sessionmaker
+    Session = sessionmaker(bind=db_eng, autoflush=False, autocommit=False)
+    db = Session()
+    s = Store(
+        name="Mixed", url="https://mixed.example",
+        monthly_visitors="1K", niche="Fashion", country="US",
+    )
+    db.add(s); db.commit(); db.refresh(s)
+    products = [
+        ("a-real-shoe", "Black Leather Oxford Shoe for Men",
+         "shoe, oxford, leather, men, formal, dress", "shoe"),
+        ("a-dress",     "Elegant Cocktail Mini Dress",
+         "dress, cocktail, mini, evening, formal, women", "dress"),
+        ("a-bag",       "Vintage Leather Handbag",
+         "bag, handbag, leather, vintage, women, formal", "bag"),
+        # A "dress shoe" — semantically AT the intersection. The
+        # intent gate should let this through for both "shoes" and
+        # "dress" queries because both keywords are in the title.
+        ("dress-shoe",  "Men's Formal Dress Shoe in Brown Leather",
+         "shoe, dress shoe, formal, men, brown, leather, oxford", "shoe"),
+    ]
+    for i, (handle, title, tags, cat) in enumerate(products):
+        db.add(Product(
+            store_id=s.id, shopify_id=handle, title=title, handle=handle,
+            current_position=i + 1, previous_position=0, label="",
+            is_fashion=True, subniche="fashion", ai_tags=tags,
+            last_scraped=datetime.utcnow(), product_category=cat,
+            product_type="", price="",
+        ))
+    db.commit()
+    db.close()
+
+    # Shoes search must NOT include the bag or the standalone dress.
+    r = client.get("/api/bestsellers/combined?search=shoes&limit=20&label=all&days=1")
+    titles = {p["title"] for p in r.json()}
+    assert "Black Leather Oxford Shoe for Men" in titles
+    assert "Men's Formal Dress Shoe in Brown Leather" in titles
+    assert "Elegant Cocktail Mini Dress" not in titles, \
+        "shoe search must NOT return a dress"
+    assert "Vintage Leather Handbag" not in titles, \
+        "shoe search must NOT return a bag"
+
+    # Bag search must NOT include the shoes or dress.
+    r = client.get("/api/bestsellers/combined?search=bag&limit=20&label=all&days=1")
+    titles = {p["title"] for p in r.json()}
+    assert "Vintage Leather Handbag" in titles
+    assert "Black Leather Oxford Shoe for Men" not in titles
+    assert "Men's Formal Dress Shoe in Brown Leather" not in titles
+    assert "Elegant Cocktail Mini Dress" not in titles
+
+    # Dress search includes the standalone dress AND the dress-shoe
+    # (because "dress" keyword is in its title — semantically a real
+    # dress shopper might also be interested). Bag + shoe are dropped.
+    r = client.get("/api/bestsellers/combined?search=dress&limit=20&label=all&days=1")
+    titles = {p["title"] for p in r.json()}
+    assert "Elegant Cocktail Mini Dress" in titles
+    assert "Vintage Leather Handbag" not in titles
+
+
 def test_multilingual_query_routes_to_english_tags(client, seeded):
     """A German query "Abendkleid" should find the German-titled
     product AND the English-tagged "evening" products. Without an

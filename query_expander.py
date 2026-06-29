@@ -104,6 +104,98 @@ _COLOR_TAGS = {
 }
 
 
+# Canonical product TYPES the expander can declare a query "wants".
+# Used as a HARD GATE in hybrid_search — when the expansion says
+# `intent_types=["dress"]`, products whose title/ai_tags don't contain
+# any dress-keyword are dropped before scoring. This is the difference
+# between "shoes" returning shoe products only vs returning anything
+# tangentially related (the old behaviour where dresses with "dress
+# shoes" in tags polluted shoe results).
+_INTENT_TYPE_KEYWORDS = {
+    "dress": {
+        "dress", "gown", "frock", "kleid", "robe", "vestido", "abito",
+        "jurk", "sukienka", "dirndl",
+    },
+    "skirt": {"skirt", "rock", "jupe", "falda", "gonna"},
+    "top": {
+        "top", "shirt", "blouse", "tee", "t-shirt", "tshirt",
+        "tank", "bodysuit", "camisole",
+        "hemd", "bluse", "chemise", "chemisier", "camisa", "camicia",
+    },
+    "sweater": {
+        "sweater", "cardigan", "pullover", "hoodie", "jumper", "knit",
+        "strickjacke",
+    },
+    "outerwear": {
+        "jacket", "coat", "blazer", "vest", "poncho", "trench", "parka",
+        "mantel", "jacke", "manteau", "veste", "abrigo", "chaqueta",
+        "giacca", "cappotto",
+    },
+    "pants": {
+        "pant", "pants", "trouser", "trousers", "jean", "jeans", "short",
+        "shorts", "legging", "leggings", "jogger", "chino",
+        "hose", "pantalon", "pantalones",
+    },
+    "jumpsuit": {"jumpsuit", "romper", "playsuit", "overall", "onesie"},
+    "swimwear": {"swimsuit", "bikini", "swimwear", "one-piece", "trunks", "rashguard"},
+    "intimates": {
+        "underwear", "bra", "panty", "panties", "thong", "lingerie",
+        "shapewear", "boxer", "brief",
+        "unterhose", "unterwasche", "bh",
+    },
+    "sleepwear": {
+        "pajama", "pyjama", "nightgown", "robe", "bathrobe", "loungewear",
+        "sleepwear", "bademantel",
+    },
+    "shoes": {
+        "shoe", "shoes", "sneaker", "boot", "sandal", "heel", "loafer",
+        "pump", "slipper", "flat", "oxford", "derby", "espadrille",
+        "mule", "clog", "footwear", "moccasin", "mary-jane",
+        "schuh", "schuhe", "stiefel", "chaussure", "bottes", "zapato",
+        "scarpe", "schoenen",
+    },
+    "bag": {
+        "bag", "tote", "clutch", "wallet", "backpack", "purse",
+        "satchel", "crossbody", "handbag", "messenger", "pouch",
+        "tasche", "sac", "bolso", "borsa",
+    },
+    "jewelry": {
+        "necklace", "earring", "ring", "bracelet", "pendant", "anklet",
+        "choker", "brooch", "chain", "jewel", "jewelry",
+    },
+    "watch": {"watch", "smartwatch", "wristwatch", "timepiece"},
+    "accessory": {
+        "hat", "cap", "beanie", "scarf", "belt", "glove", "tie",
+        "sunglass", "sunglasses", "glass", "glasses", "eyewear",
+        "umbrella", "wallet",
+        "hut", "mutze", "schal", "gurtel", "brille",
+    },
+    "electronics": {
+        "smartwatch", "tracker", "earbud", "headphone", "phone", "case",
+        "charger", "speaker", "tablet", "laptop", "camera", "tv",
+        "monitor", "ssd", "drive", "router", "cable",
+    },
+    "home": {
+        "lamp", "chandelier", "sconce", "candle", "vase", "rug", "curtain",
+        "pillow", "blanket", "bedding", "mug", "plate", "bowl", "knife",
+        "furniture", "decor", "kitchen", "shelf",
+    },
+    "beauty": {
+        "skincare", "serum", "moisturiser", "moisturizer", "cleanser",
+        "makeup", "lipstick", "mascara", "perfume", "fragrance",
+        "hair", "shampoo",
+    },
+    "health": {
+        "supplement", "vitamin", "brace", "support", "massage", "orthopedic",
+        "compression", "monitor", "blood-pressure", "ekg", "cpap",
+    },
+    "toys-books": {
+        "toy", "game", "book", "puzzle", "doll", "lego",
+    },
+    "pet": {"pet", "dog", "cat", "puppy", "kitten"},
+}
+
+
 @dataclass
 class ExpansionResult:
     """Structured query expansion. Empty lists are valid (means
@@ -117,6 +209,7 @@ class ExpansionResult:
     color_tags: list[str] = field(default_factory=list)
     multilingual_nouns: list[str] = field(default_factory=list)
     semantic_phrases: list[str] = field(default_factory=list)
+    intent_types: list[str] = field(default_factory=list)  # keys from _INTENT_TYPE_KEYWORDS
     cached: bool = False
     expander_used: str = "none"  # 'gemini' | 'fallback' | 'cache'
 
@@ -135,6 +228,44 @@ class ExpansionResult:
                     out.add(t.strip().lower())
         out.update(self.original.lower().split())
         out.discard("")
+        return out
+
+    def strong_signal_terms(self) -> set[str]:
+        """The SUBSET of all_terms used for the SQL prefilter. These
+        are the terms that, if found in product title or ai_tags,
+        legitimately suggest relevance — i.e. the controlled-vocab
+        tag tokens plus canonical English type-nouns plus multilingual
+        nouns plus the original query tokens. NOT semantic_phrases
+        (which may decompose into common words like "dress shoes" →
+        false-matching "dress" elsewhere)."""
+        out: set[str] = set()
+        for lst in (
+            self.canonical_terms,
+            self.occasion_tags, self.style_tags,
+            self.material_tags, self.color_tags,
+            self.multilingual_nouns,
+        ):
+            for t in lst:
+                if t and isinstance(t, str):
+                    v = t.strip().lower()
+                    if v:
+                        out.add(v)
+        out.update(self.original.lower().split())
+        out.discard("")
+        return out
+
+    def intent_keywords(self) -> set[str]:
+        """Flattened union of every keyword belonging to any
+        intent_type the expander declared. Used as the HARD GATE
+        in hybrid_search — every returned product must contain at
+        least one of these in title or ai_tags. Empty when the
+        expander declined to commit to a type (open-ended query) —
+        in which case the gate is disabled."""
+        out: set[str] = set()
+        for t in self.intent_types:
+            kws = _INTENT_TYPE_KEYWORDS.get((t or "").strip().lower())
+            if kws:
+                out.update(kws)
         return out
 
     def tag_terms(self) -> set[str]:
@@ -182,14 +313,43 @@ def _cache_put(qh: str, exp: ExpansionResult) -> None:
 # ---------------------------------------------------------------------
 # Identity / regex fallback (no Gemini available).
 # ---------------------------------------------------------------------
+def _infer_intent_types_from_query(q: str) -> list[str]:
+    """Heuristic identity-mode intent inference: scan the query for
+    any keyword that matches our intent type vocabulary. Used when
+    Gemini is unavailable; correctly handles common cases like
+    'prom dress' -> ['dress'], 'shoes' -> ['shoes'], 'leather bag' ->
+    ['bag']. Open-ended queries with no recognised type keyword
+    return [] (gate disabled)."""
+    q_tokens = set(re.split(r"[\s\-_/]+", q.lower()))
+    matched: list[str] = []
+    # Order matters — match more specific types first so 'wedding bag'
+    # picks 'bag' not 'dress'. Iterate the intent map and check if
+    # ANY of its keywords appears in the query tokens.
+    for type_name, keywords in _INTENT_TYPE_KEYWORDS.items():
+        if q_tokens & keywords:
+            matched.append(type_name)
+    return matched
+
+
 def _identity_expansion(q: str) -> ExpansionResult:
-    """When Gemini is unavailable or fails, return JUST the original
-    tokens. The scorer will still find direct keyword matches; this is
-    strictly worse than a Gemini expansion but never returns zero
-    results when the old search would have found something."""
+    """When Gemini is unavailable or fails, return the original tokens
+    PLUS every keyword from any inferred intent type as a canonical
+    synonym. This gives the scorer enough signal to surface tagged-
+    relevant products (e.g. "prom dress" → also matches "gown",
+    "Abendkleid", "robe", "vestido") even without a Gemini call —
+    important so unit tests + degraded-mode deploys stay useful."""
+    intent_types = _infer_intent_types_from_query(q)
+    canonical = [w for w in re.split(r"\s+", q.lower()) if w]
+    seen = set(canonical)
+    for t in intent_types:
+        for kw in sorted(_INTENT_TYPE_KEYWORDS.get(t, set())):
+            if kw not in seen:
+                seen.add(kw)
+                canonical.append(kw)
     return ExpansionResult(
         original=q,
-        canonical_terms=[w for w in re.split(r"\s+", q.lower()) if w],
+        canonical_terms=canonical,
+        intent_types=intent_types,
         expander_used="fallback",
     )
 
@@ -211,22 +371,36 @@ MATERIAL: silk, satin, lace, chiffon, sequin, velvet, tulle, cotton, linen, deni
 
 COLOR: black, white, red, blue, navy, green, pink, beige, ivory, champagne, gold, silver, brown, cream, burgundy, emerald, floral, striped, animal-print, metallic, pastel, neutral
 
-Produce a JSON expansion of the query. Be GENEROUS — better to over-expand than under-expand. The goal is for a shopper typing this query to see EVERY product across the catalog that a competent human would consider relevant.
+INTENT TYPES (CRITICAL — this is the HARD CATEGORY GATE — use the exact lowercase keys):
+  dress, skirt, top, sweater, outerwear, pants, jumpsuit, swimwear,
+  intimates, sleepwear, shoes, bag, jewelry, watch, accessory,
+  electronics, home, beauty, health, toys-books, pet
+
+Produce a JSON expansion of the query. Be GENEROUS on the synonym vocabularies; be STRICT on intent_types — only emit the type the user actually wants, never tangentially-related types.
 
 Return JSON:
 {{
-  "canonical_terms": ["..."],         // 5-15 English synonyms / near-synonyms of the query
+  "intent_types":    ["..."],         // CRITICAL: the product type(s) the user wants. For "prom dress" -> ["dress"] ONLY. For "shoes" -> ["shoes"] ONLY. For "wedding bag" -> ["bag"] ONLY. NEVER include "shoes" in a dress query or "dress" in a shoes query, even though "dress shoes" is a noun phrase. If the query is open-ended ("party outfit", "luxury gifts") return an empty list to disable the gate.
+  "canonical_terms": ["..."],         // 5-15 English synonyms / near-synonyms of the query — but stay WITHIN the intent type (don't add "shoes" synonyms to a dress query)
   "occasion_tags":   ["..."],         // tokens from OCCASION above that apply
   "style_tags":      ["..."],         // tokens from STYLE above
   "material_tags":   ["..."],         // tokens from MATERIAL above
   "color_tags":      ["..."],         // tokens from COLOR above (often empty unless the query names a color)
-  "multilingual_nouns": ["..."],      // 6-15 nouns covering the same concept in German, French, Italian, Spanish, Dutch, Polish (e.g. Abendkleid, Robe de soiree, Vestido de gala, Abito da sera, Jurk, Sukienka)
+  "multilingual_nouns": ["..."],      // 6-15 nouns covering the same concept in German, French, Italian, Spanish, Dutch, Polish (e.g. Abendkleid, Robe de soiree, Vestido de gala, Abito da sera, Jurk, Sukienka) — again STAY WITHIN the intent type
   "semantic_phrases": ["..."]         // 3-5 short phrases a product title would actually use (e.g. "evening gown", "formal dress", "floor-length gown")
 }}
 
+CRITICAL RULES:
+1. intent_types is a HARD GATE — products of other types will be DROPPED entirely. Be precise.
+2. "prom dress" -> intent_types=["dress"], NOT ["dress","shoes"]. Even though "prom shoes" exist, the query asked for a DRESS.
+3. "shoes" -> intent_types=["shoes"]. Even though "dress shoes" is a phrase, "dress" must NOT appear in canonical_terms or multilingual_nouns or you'll false-match every dress in the catalog.
+4. "cocktail party outfit" -> intent_types=[] (open-ended). The gate is disabled and broad matching applies.
+5. "smartwatch" -> intent_types=["watch","electronics"], apparel vocabularies are empty.
+6. "lamp" -> intent_types=["home"], lean on canonical_terms + multilingual_nouns ("Lampe","lampe","lampada").
+
 Only return tokens that GENUINELY apply. If the query is "wedding guest dress" the occasion_tags include wedding-guest AND wedding AND cocktail AND formal AND evening — all four are plausible. If the query is "athletic shorts" the material_tags are probably empty and the occasion_tags reduce to athletic, gym, casual.
 
-For non-fashion queries (e.g. "smartwatch", "table lamp", "blood pressure monitor"), the apparel vocabularies are mostly empty; lean on canonical_terms + multilingual_nouns + semantic_phrases. Output the JSON only, no markdown fences or commentary."""
+Output the JSON only, no markdown fences or commentary."""
 
 
 async def _call_gemini_expand(q: str, api_key: str) -> Optional[dict]:
@@ -320,6 +494,7 @@ async def expand_query(q: str) -> ExpansionResult:
             color_tags=list(cached.color_tags),
             multilingual_nouns=list(cached.multilingual_nouns),
             semantic_phrases=list(cached.semantic_phrases),
+            intent_types=list(cached.intent_types),
             cached=True,
             expander_used=cached.expander_used,
         )
@@ -336,6 +511,18 @@ async def expand_query(q: str) -> ExpansionResult:
         # Don't cache fallback expansions — next call might succeed
         return exp
 
+    intent_types = _normalise_list(
+        parsed.get("intent_types"),
+        allowed=set(_INTENT_TYPE_KEYWORDS.keys()),
+        cap=4,
+    )
+    # Safety net: if Gemini returned no intent_types but the query
+    # clearly mentions a known product noun ("shoes", "dress"), fall
+    # back to the keyword-based inference. Prevents accidental
+    # gate-disabling when Gemini hallucinates an empty list.
+    if not intent_types:
+        intent_types = _infer_intent_types_from_query(qn)
+
     exp = ExpansionResult(
         original=qn,
         canonical_terms=_normalise_list(parsed.get("canonical_terms"), cap=20),
@@ -345,6 +532,7 @@ async def expand_query(q: str) -> ExpansionResult:
         color_tags=_normalise_list(parsed.get("color_tags"), allowed=_COLOR_TAGS),
         multilingual_nouns=_normalise_list(parsed.get("multilingual_nouns"), cap=25),
         semantic_phrases=_normalise_list(parsed.get("semantic_phrases"), cap=10),
+        intent_types=intent_types,
         expander_used="gemini",
     )
     _cache_put(qh, exp)
@@ -646,6 +834,7 @@ def score_product_against_expansion(
 def expansion_to_dict(exp: ExpansionResult) -> dict:
     return {
         "original": exp.original,
+        "intent_types": exp.intent_types,
         "canonical_terms": exp.canonical_terms,
         "occasion_tags": exp.occasion_tags,
         "style_tags": exp.style_tags,
