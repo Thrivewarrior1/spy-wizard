@@ -1304,10 +1304,33 @@ async def scrape_store_bestsellers(
                     ok, classifier_errors = await _classify_or_fail(gemini_input)
                     errors.extend(classifier_errors)
                     if not ok:
-                        # Hard fail — without classification we cannot
-                        # split fashion vs general reliably, so stop
-                        # rather than corrupt the feeds.
-                        break
+                        # Classifier wiped out the whole batch (auth/quota
+                        # error, schema rejection, or Gemini returned
+                        # nothing usable). We used to `break` here, which
+                        # silently killed the entire merchant's scrape on
+                        # any Gemini hiccup — 8 stores were stuck on 0
+                        # products because of this (2026-06-29). The
+                        # classifier docstring is explicit that it's
+                        # best-effort enrichment, NOT a feed gate.
+                        #
+                        # New behaviour: mark every unclassified item as
+                        # `_excluded` so distribution drops it WITHOUT
+                        # advancing source_position drift, log a warning,
+                        # and CONTINUE paginating. Subsequent pages may
+                        # succeed (transient 503s) and accumulate real
+                        # products. If every page in the loop hits this,
+                        # we end up with 0 products + a real error
+                        # message in the per-store result — same UX as
+                        # before, but a single bad page no longer
+                        # destroys the whole scrape.
+                        logger.warning(
+                            "[%s] page %d: classifier returned ok=False, "
+                            "dropping %d unclassified items and continuing",
+                            base_url, page, len(gemini_input),
+                        )
+                        for p in gemini_input:
+                            if p.get("is_fashion") is None:
+                                p["_excluded"] = True
                 elif not has_gemini:
                     # Degraded path: route everything that survived the
                     # hard-exclude pass into fashion so the main feed

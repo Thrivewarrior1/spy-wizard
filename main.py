@@ -1011,6 +1011,156 @@ def build_ai_tag_filters(search_query: str):
             conds.append(or_(*word_or))
     return conds
 
+async def hybrid_search(
+    db: Session,
+    base_query,
+    search_text: str,
+    *,
+    limit: int = 300,
+    rerank: bool = True,
+) -> list:
+    """AI-powered search: query expansion + OR-merged keyword
+    prefilter + Python scoring + optional Gemini re-rank.
+
+    Replaces the old 3-stage AND-then-OR short-circuit (formerly in
+    every feed endpoint) which dropped users into a "0 results" hole
+    whenever ANY query word was unknown to the keyword index. The new
+    pipeline:
+
+      1. expand_query(search_text) — Gemini turns "prom dress" into
+         occasion/style/material tags + multilingual synonyms +
+         catalog phrases. Cached aggressively.
+      2. SQL prefilter — a single OR-of-OR query against
+         (title | ai_tags | product_category | subniche |
+         product_type | handle) using every expansion term. NO AND
+         across query words: each one independently widens the
+         candidate set. Capped at 5x the user's display limit so
+         the Python scoring stage stays fast.
+      3. Python scoring — score_product_against_expansion(...) gives
+         each candidate a weighted relevance score (exact-phrase title
+         match > tag overlap > free-token overlap).
+      4. Drop score==0 (no signal at all), sort by score desc.
+      5. Optional Gemini re-rank of the top 50 (env-flag
+         SEARCH_RERANK=1 by default) — gives Gemini the user query
+         plus the top candidates and asks it to drop irrelevant ones.
+
+    Args:
+      base_query: SQLAlchemy query already scoped by is_fashion + label.
+      search_text: raw user input. Trailing/leading whitespace ignored.
+      limit: max products to return.
+      rerank: whether to invoke Gemini re-rank on the top N. Off for
+        unit tests; on by default in production.
+
+    Returns: list of Product ORM instances in relevance order.
+    """
+    from query_expander import (
+        expand_query,
+        rerank_with_gemini,
+        score_product_against_expansion,
+    )
+
+    s = (search_text or "").strip()
+    if not s:
+        return base_query.all()[:limit]
+
+    # 1. Query expansion (cached, ~500ms first call, <1ms cached)
+    exp = await expand_query(s)
+
+    # 2. Build the OR-of-OR SQL prefilter. Every term gets a loose
+    #    LIKE clause against every searchable column. Postgres handles
+    #    this fine for our catalog size (~5-10k products).
+    all_terms = exp.all_terms()
+    if not all_terms:
+        return base_query.all()[:limit]
+
+    columns = (
+        Product.title, Product.ai_tags, Product.product_category,
+        Product.subniche, Product.product_type, Product.handle,
+    )
+    or_clauses = []
+    for term in all_terms:
+        # Bare 2-char terms cause massive false-positive blowup; skip.
+        if len(term) < 3:
+            continue
+        like_pat = f"%{term}%"
+        for col in columns:
+            or_clauses.append(col.ilike(like_pat))
+
+    if not or_clauses:
+        return base_query.all()[:limit]
+
+    candidate_query = base_query.filter(or_(*or_clauses)).limit(limit * 5)
+    candidates = candidate_query.all()
+
+    if not candidates:
+        return []
+
+    # 3. Python-side scoring. Pure functions, no I/O.
+    scored = []
+    for p in candidates:
+        score = score_product_against_expansion(
+            title=p.title or "",
+            ai_tags=p.ai_tags or "",
+            product_category=p.product_category or "",
+            subniche=p.subniche or "",
+            product_type=p.product_type or "",
+            handle=p.handle or "",
+            exp=exp,
+        )
+        if score > 0:
+            scored.append((score, p))
+
+    if not scored:
+        return []
+
+    # 4. Sort by score desc, then by current_position asc (tie-break
+    #    on bestseller rank — lower is better).
+    scored.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
+
+    # 5. Optional Gemini re-rank on the top 50 (only if rerank=True
+    #    and we have enough candidates to make it worth a Gemini call).
+    rerank_enabled = (
+        rerank
+        and os.getenv("SEARCH_RERANK", "1") != "0"
+        and len(scored) >= 5
+    )
+    if rerank_enabled:
+        top_n = min(50, len(scored))
+        top_candidates = [
+            {
+                "id": p.id,
+                "title": p.title or "",
+                "ai_tags": p.ai_tags or "",
+                "product_type": p.product_type or "",
+                "subniche": p.subniche or "",
+            }
+            for _, p in scored[:top_n]
+        ]
+        try:
+            ranking = await rerank_with_gemini(s, top_candidates)
+        except Exception as e:
+            logger.warning("hybrid_search: rerank failed: %s — keeping hybrid order", e)
+            ranking = [{"idx": i, "score": 50.0, "drop": False} for i in range(top_n)]
+
+        # Map idx → (rerank_score, drop) and reorder the top N
+        rerank_by_idx = {r["idx"]: (r["score"], r["drop"]) for r in ranking}
+        reranked_top = []
+        for i, (orig_score, p) in enumerate(scored[:top_n]):
+            r_score, r_drop = rerank_by_idx.get(i, (50.0, False))
+            if r_drop:
+                continue
+            # Combine hybrid score + rerank score so a strong hybrid
+            # match isn't completely overridden by a slightly cooler
+            # rerank score.
+            final = orig_score + r_score
+            reranked_top.append((final, p))
+        reranked_top.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
+        # Append the un-reranked tail (positions 51+) below
+        scored = reranked_top + scored[top_n:]
+
+    return [p for _, p in scored[:limit]]
+
+
 def _label_events_to_product_dicts(
     pairs: list, is_fashion: bool,
 ) -> list[dict]:
@@ -1058,34 +1208,18 @@ async def get_combined_bestsellers(
         pairs = fetch_label_events_window(
             db, label=label, days=days, is_fashion=True,
         )
-        # Apply search by filtering pairs in Python (small list).
+        # Apply search via the AI-powered hybrid_search restricted to
+        # this hero/villain candidate set. The expander+rerank give us
+        # the same multilingual / occasion-tag superpowers here that
+        # the no-events path gets.
         if search and search.strip():
-            s = search.strip().lower()
-            from sqlalchemy import or_
             id_set = {p.id for p, _ in pairs}
             if not id_set:
                 return []
-            q = db.query(Product).filter(Product.id.in_(list(id_set)))
-            # Reuse the existing search builders against this subset.
-            for cond in build_ai_tag_filters(s):
-                q = q.filter(cond)
-            ai_ids = {p.id for p in q.all()}
-            if ai_ids:
-                pairs = [pair for pair in pairs if pair[0].id in ai_ids]
-            else:
-                q2 = db.query(Product).filter(Product.id.in_(list(id_set)))
-                strict, loose = build_search_filters(s)
-                for cond in strict:
-                    q2 = q2.filter(cond)
-                strict_ids = {p.id for p in q2.all()}
-                if strict_ids:
-                    pairs = [pair for pair in pairs if pair[0].id in strict_ids]
-                elif loose:
-                    q3 = db.query(Product).filter(Product.id.in_(list(id_set))).filter(or_(*loose))
-                    loose_ids = {p.id for p in q3.all()}
-                    pairs = [pair for pair in pairs if pair[0].id in loose_ids]
-                else:
-                    pairs = []
+            scoped = db.query(Product).filter(Product.id.in_(list(id_set)))
+            ranked = await hybrid_search(db, scoped, search.strip(), limit=limit * 3)
+            ranked_ids = {p.id for p in ranked}
+            pairs = [pair for pair in pairs if pair[0].id in ranked_ids]
         # Sort.
         if sort == "volume":
             pairs.sort(key=lambda pe: (
@@ -1103,23 +1237,10 @@ async def get_combined_bestsellers(
     query = _apply_label_filter(query, db, label)
 
     if search and search.strip():
-        s = search.strip()
-        ai_query = query
-        for cond in build_ai_tag_filters(s):
-            ai_query = ai_query.filter(cond)
-        ai_results = ai_query.all()
-        if ai_results:
-            products = ai_results
-        else:
-            strict, loose = build_search_filters(s)
-            strict_query = query
-            for cond in strict:
-                strict_query = strict_query.filter(cond)
-            strict_results = strict_query.all()
-            if strict_results:
-                products = strict_results
-            else:
-                products = query.filter(or_(*loose)).all() if loose else []
+        # AI-powered search: Gemini query expansion + OR-merged
+        # prefilter + Python scoring + Gemini re-rank top 50. See
+        # hybrid_search() docstring for the full pipeline.
+        products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
     else:
         products = query.all()
 
@@ -1127,8 +1248,10 @@ async def get_combined_bestsellers(
         products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position))
     elif sort == "low-high":
         products.sort(key=lambda p: (-p.current_position,))
-    else:
+    elif sort == "high-low":
         products.sort(key=lambda p: p.current_position)
+    # else: leave hybrid_search's relevance order intact when search
+    # is active (no explicit secondary sort).
 
     label_map = _compute_label_map(db, products)
     products = _filter_products_by_computed_label(products, label_map, label)
@@ -1151,25 +1274,7 @@ async def get_store_bestsellers(
     query = db.query(Product).filter(Product.store_id == store_id, Product.is_fashion == True)
     query = _apply_label_filter(query, db, label)
     if search and search.strip():
-        s = search.strip()
-        ai_query = query
-        for cond in build_ai_tag_filters(s):
-            ai_query = ai_query.filter(cond)
-        ai_results = ai_query.order_by(Product.current_position).all()
-        if ai_results:
-            products = ai_results
-        else:
-            strict, loose = build_search_filters(s)
-            strict_query = query
-            for cond in strict:
-                strict_query = strict_query.filter(cond)
-            strict_results = strict_query.order_by(Product.current_position).all()
-            if strict_results:
-                products = strict_results
-            elif loose:
-                products = query.filter(or_(*loose)).order_by(Product.current_position).all()
-            else:
-                products = []
+        products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
     else:
         products = query.order_by(Product.current_position).all()
     label_map = _compute_label_map(db, products)
@@ -1421,31 +1526,13 @@ async def get_combined_general(
             db, label=label, days=days, is_fashion=False,
         )
         if search and search.strip():
-            s = search.strip().lower()
-            from sqlalchemy import or_
             id_set = {p.id for p, _ in pairs}
             if not id_set:
                 return []
-            q = db.query(Product).filter(Product.id.in_(list(id_set)))
-            for cond in build_ai_tag_filters(s):
-                q = q.filter(cond)
-            ai_ids = {p.id for p in q.all()}
-            if ai_ids:
-                pairs = [pair for pair in pairs if pair[0].id in ai_ids]
-            else:
-                q2 = db.query(Product).filter(Product.id.in_(list(id_set)))
-                strict, loose = build_search_filters(s)
-                for cond in strict:
-                    q2 = q2.filter(cond)
-                strict_ids = {p.id for p in q2.all()}
-                if strict_ids:
-                    pairs = [pair for pair in pairs if pair[0].id in strict_ids]
-                elif loose:
-                    q3 = db.query(Product).filter(Product.id.in_(list(id_set))).filter(or_(*loose))
-                    loose_ids = {p.id for p in q3.all()}
-                    pairs = [pair for pair in pairs if pair[0].id in loose_ids]
-                else:
-                    pairs = []
+            scoped = db.query(Product).filter(Product.id.in_(list(id_set)))
+            ranked = await hybrid_search(db, scoped, search.strip(), limit=limit * 3)
+            ranked_ids = {p.id for p in ranked}
+            pairs = [pair for pair in pairs if pair[0].id in ranked_ids]
         if sort == "volume":
             pairs.sort(key=lambda pe: (
                 -parse_visitors(pe[0].store.monthly_visitors),
@@ -1462,23 +1549,7 @@ async def get_combined_general(
     query = _apply_label_filter(query, db, label)
 
     if search and search.strip():
-        s = search.strip()
-        ai_query = query
-        for cond in build_ai_tag_filters(s):
-            ai_query = ai_query.filter(cond)
-        ai_results = ai_query.all()
-        if ai_results:
-            products = ai_results
-        else:
-            strict, loose = build_search_filters(s)
-            strict_query = query
-            for cond in strict:
-                strict_query = strict_query.filter(cond)
-            strict_results = strict_query.all()
-            if strict_results:
-                products = strict_results
-            else:
-                products = query.filter(or_(*loose)).all() if loose else []
+        products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
     else:
         products = query.all()
 
@@ -1486,8 +1557,9 @@ async def get_combined_general(
         products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position))
     elif sort == "low-high":
         products.sort(key=lambda p: (-p.current_position,))
-    else:
+    elif sort == "high-low":
         products.sort(key=lambda p: p.current_position)
+    # else: leave hybrid_search relevance order intact
 
     label_map = _compute_label_map(db, products)
     products = _filter_products_by_computed_label(products, label_map, label)
@@ -1510,25 +1582,7 @@ async def get_store_general(
     query = _general_base_query(db, store_id=store_id)
     query = _apply_label_filter(query, db, label)
     if search and search.strip():
-        s = search.strip()
-        ai_query = query
-        for cond in build_ai_tag_filters(s):
-            ai_query = ai_query.filter(cond)
-        ai_results = ai_query.order_by(Product.current_position).all()
-        if ai_results:
-            products = ai_results
-        else:
-            strict, loose = build_search_filters(s)
-            strict_query = query
-            for cond in strict:
-                strict_query = strict_query.filter(cond)
-            strict_results = strict_query.order_by(Product.current_position).all()
-            if strict_results:
-                products = strict_results
-            elif loose:
-                products = query.filter(or_(*loose)).order_by(Product.current_position).all()
-            else:
-                products = []
+        products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
     else:
         products = query.order_by(Product.current_position).all()
     label_map = _compute_label_map(db, products)
