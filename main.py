@@ -1102,8 +1102,26 @@ async def hybrid_search(
     #    from polluting a shoe search and "Derby Dress Shoes" from
     #    polluting a dress search. Open-ended queries (intent_types
     #    is empty) skip this gate.
+    #
+    #    CRITICAL: use word-boundary matching, NOT substring. Plain
+    #    substring caused "ring" (in jewelry kws) to match "spring"
+    #    (in a dress title), polluting earrings search with dresses.
+    #    Same for "lamp" matching "lamp" but NOT "blamp" / "lampoon"
+    #    / "Klampenstein". Compile pattern once per call so the
+    #    regex cost is constant per query.
     intent_kws = exp.intent_keywords()
     if intent_kws:
+        # Build a single alternation pattern for cheap N-product
+        # match against every intent keyword at once.
+        escaped = [_re.escape(kw) for kw in intent_kws if kw]
+        # \b is the standard Python word-boundary which handles
+        # multilingual unicode word characters via re.UNICODE.
+        # For hyphenated kws (mary-jane, faux-leather) \b on the
+        # outside works because the hyphen IS a word boundary.
+        gate_re = _re.compile(
+            r"\b(?:" + "|".join(escaped) + r")\b",
+            _re.IGNORECASE | _re.UNICODE,
+        )
         gated = []
         for p in candidates:
             haystack = (
@@ -1111,9 +1129,7 @@ async def hybrid_search(
                 + " "
                 + (p.ai_tags or "").lower()
             )
-            # Word-ish containment — accept exact substring (catches
-            # "shoes" in "high heel shoes" AND "schuh" in "schuhe").
-            if any(kw in haystack for kw in intent_kws):
+            if gate_re.search(haystack):
                 gated.append(p)
         candidates = gated
         if not candidates:
@@ -1692,6 +1708,93 @@ async def admin_reset_products(db: Session = Depends(get_db)):
         counts["products"], counts["position_history"], counts["label_events"],
     )
     return {"success": True, "deleted": counts}
+
+@app.get("/api/debug/search")
+async def debug_search(q: str, db: Session = Depends(get_db)):
+    """Diagnostic: show the live Gemini expansion + per-candidate
+    score breakdown for a given query, so we can see exactly why a
+    "shoes" search surfaced a dress (or didn't).
+
+    Returns:
+      - expansion: every field the expander produced (intent_types,
+        canonical_terms, occasion/style/material/color tags,
+        multilingual_nouns, semantic_phrases, expander_used, cached)
+      - intent_keywords: the union the gate was checking against
+      - candidates: top 15 results post-gate post-scoring with their
+        title + ai_tags + final score, so we can see which signals
+        fired and which didn't
+    """
+    from query_expander import (
+        expand_query, expansion_to_dict,
+        score_product_against_expansion,
+    )
+    s = (q or "").strip()
+    if not s:
+        return {"error": "missing q"}
+
+    exp = await expand_query(s)
+    intent_kws = exp.intent_keywords()
+
+    # Run the same prefilter the real search uses
+    strong_terms = exp.strong_signal_terms()
+    or_clauses = []
+    for term in strong_terms:
+        if len(term) < 3:
+            continue
+        like_pat = f"%{term}%"
+        or_clauses.append(Product.title.ilike(like_pat))
+        or_clauses.append(Product.ai_tags.ilike(like_pat))
+
+    base_query = db.query(Product).filter(Product.is_fashion == True)
+    candidates = base_query.filter(or_(*or_clauses)).limit(150).all() if or_clauses else []
+
+    # Apply the same gate the real search uses
+    gated = []
+    if intent_kws:
+        escaped = [_re.escape(kw) for kw in intent_kws if kw]
+        gate_re = _re.compile(
+            r"\b(?:" + "|".join(escaped) + r")\b",
+            _re.IGNORECASE | _re.UNICODE,
+        )
+        for p in candidates:
+            haystack = (p.title or "").lower() + " " + (p.ai_tags or "").lower()
+            if gate_re.search(haystack):
+                gated.append(p)
+    else:
+        gated = candidates
+
+    # Score
+    scored = []
+    for p in gated:
+        score = score_product_against_expansion(
+            title=p.title or "", ai_tags=p.ai_tags or "",
+            product_category=p.product_category or "",
+            subniche=p.subniche or "", product_type=p.product_type or "",
+            handle=p.handle or "", exp=exp,
+        )
+        scored.append((score, p))
+    scored.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
+
+    return {
+        "query": s,
+        "expansion": expansion_to_dict(exp),
+        "intent_keywords": sorted(intent_kws),
+        "candidates_after_prefilter": len(candidates),
+        "candidates_after_gate": len(gated),
+        "top_15_scored": [
+            {
+                "score": s,
+                "id": p.id,
+                "title": p.title,
+                "ai_tags": p.ai_tags,
+                "product_category": p.product_category,
+                "subniche": p.subniche,
+                "store_id": p.store_id,
+            }
+            for s, p in scored[:15]
+        ],
+    }
+
 
 @app.post("/api/reset-labels")
 async def trigger_reset_labels(db: Session = Depends(get_db)):
