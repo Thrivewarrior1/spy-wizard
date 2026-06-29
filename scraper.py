@@ -1363,10 +1363,23 @@ async def scrape_store_bestsellers(
 async def _classify_or_fail(batch: list):
     """Run Gemini classification on a batch. Returns (ok, errors).
 
-    Errors include the Gemini HTTP body / exception text propagated up from
-    classifier.py so we can see the real cause (auth, quota, model-not-
-    found, schema rejection) instead of a generic "did not classify"
-    summary that hides the root failure.
+    Tolerant of partial failures: if Gemini classifies most products
+    but misses a few, those few get marked `_excluded` and the rest
+    move through the pipeline. Previously any unclassified product
+    returned ok=False which aborted the WHOLE store scrape and the
+    user saw "0 products" — a Gemini hiccup on one weird title
+    shouldn't take down a whole merchant's scrape.
+
+    Two cases still return ok=False (genuinely unrecoverable):
+      * Gemini raised an exception (auth/quota/network) — no point
+        retrying the next page since the API itself is down.
+      * EVERY product in the batch is unclassified — Gemini either
+        rejected the prompt structure or returned empty; treat as
+        a hard error so the caller surfaces it.
+
+    Partial-miss case (some classified, some not):
+      ok=True, the misses are dropped via `_excluded`, scrape
+      continues with the products that did classify.
     """
     if not batch:
         return True, []
@@ -1391,12 +1404,29 @@ async def _classify_or_fail(batch: list):
             if len(errors) >= 3:
                 break
 
-    missing = [p["handle"] for p in batch if p.get("is_fashion") is None]
+    missing = [p for p in batch if p.get("is_fashion") is None]
     if missing:
-        sample = ", ".join(missing[:5])
+        sample = ", ".join(p["handle"] for p in missing[:5])
         more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
-        errors.append(f"Gemini did not classify {len(missing)} items: {sample}{more}")
-        return False, errors
+        if len(missing) == len(batch):
+            # Total wipeout — likely a structural Gemini failure (bad
+            # prompt, blocked, rate-limited start of stream). Hard error
+            # so the loop breaks and the user sees the real cause.
+            errors.append(
+                f"Gemini did not classify ANY of {len(batch)} items: "
+                f"{sample}{more}"
+            )
+            return False, errors
+        # Partial miss — drop the unclassified ones (they get
+        # _excluded so _distribute_page_to_feeds skips them but still
+        # increments source_position) and let the classified ones
+        # flow through.
+        for p in missing:
+            p["_excluded"] = True
+        errors.append(
+            f"Gemini classified {len(batch) - len(missing)}/{len(batch)} "
+            f"items; dropped {len(missing)} unclassified: {sample}{more}"
+        )
 
     return True, errors
 
