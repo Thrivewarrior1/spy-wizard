@@ -102,9 +102,45 @@ def db_session_factory(_test_db):
     ("http://x.example",       "http://x.example"),
     ("",                       ""),
     ("   ",                    ""),
+    # Path stripping — the scraper always appends its own
+    # /collections/all?sort_by=best-selling URL, so anything beyond
+    # the host is a 404 trap. Live regression: Oliva Mode came in as
+    # https://olivamode.com/collections/bags and the scraper built
+    # https://olivamode.com/collections/bags/collections/all?... (404).
+    ("https://olivamode.com/collections/bags",
+        "https://olivamode.com"),
+    ("https://shop.example/collections/all",
+        "https://shop.example"),
+    ("https://shop.example/collections/bags/products/x?foo=bar#hash",
+        "https://shop.example"),
+    ("https://shop.example/",
+        "https://shop.example"),
 ])
 def test_normalise_store_url(raw, expected):
     assert _normalise_store_url(raw) == expected
+
+
+# Sanity: per-store scrape endpoint is non-blocking (returns immediately,
+# kicks the actual work into a background task). Previously it ran
+# synchronously and was killed by Render's 60s HTTP timeout, surfacing
+# to the user as "Scraped 0 products. page 1 HTTP error:" — but the
+# scrape had never actually finished.
+def test_per_store_scrape_returns_immediately(client):
+    cr = client.post("/api/stores", json={
+        "name": "FastEnd", "url": "https://fastend.example/",
+    }).json()
+    # POST /api/scrape/{id} must return before scrape work would
+    # plausibly finish — proves it's queued, not run inline.
+    import time
+    t0 = time.monotonic()
+    r = client.post(f"/api/scrape/{cr['id']}")
+    elapsed = time.monotonic() - t0
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("started") is True or body.get("running") is True
+    # If this assertion ever fails, the endpoint went back to running
+    # inline and will start 502-ing on long-tail merchants again.
+    assert elapsed < 2.0, f"per-store scrape returned in {elapsed:.2f}s — should be <2s if truly async"
 
 
 # =====================================================================

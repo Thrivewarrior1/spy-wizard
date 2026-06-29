@@ -281,10 +281,14 @@ def _normalise_store_url(raw: str) -> str:
     """Make slight differences hash to the same store.
 
       - strip leading/trailing whitespace
-      - lowercase the host portion only (paths stay case-sensitive
-        for stores that use case-significant slugs — none we know of
-        but kept conservative)
       - prepend https:// when no scheme is given
+      - **strip the URL path entirely** so we always end up with the
+        bare origin (https://shop.example), never a per-collection
+        URL like https://shop.example/collections/bags. The scraper
+        appends `/collections/<slug>?sort_by=best-selling&page=N` on
+        top of whatever's stored, so a path here turns into
+        `/collections/bags/collections/all?...` which 404s. We treat
+        the path as junk the user copy-pasted, not as authoritative.
       - strip a trailing slash so 'novigood.com/' and 'novigood.com'
         collide on the unique-URL check
     """
@@ -295,6 +299,15 @@ def _normalise_store_url(raw: str) -> str:
         return ""
     if not u.startswith(("http://", "https://")):
         u = "https://" + u
+    # Strip everything after the host: path, query, fragment. The
+    # scraper builds its own /collections/all?sort_by=best-selling URL
+    # from this origin so anything beyond the host is noise (and a
+    # bug magnet — see Oliva Mode 2026-05-30: the user pasted
+    # https://olivamode.com/collections/bags and the scraper turned
+    # it into a 404).
+    scheme, rest = u.split("://", 1)
+    host = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    u = f"{scheme}://{host}"
     if u.endswith("/"):
         u = u[:-1]
     return u
@@ -1595,19 +1608,92 @@ async def trigger_reset_labels(db: Session = Depends(get_db)):
     count = reset_all_labels(db)
     return {"success": True, "products_reset": count}
 
+async def _background_scrape_one(store_id: int):
+    """Run a single-store scrape in the background. Mirrors
+    _background_scrape_all so the API can return immediately and the
+    user can poll for the result without hitting Render's 60-second
+    request timeout (which used to kill long per-store scrapes mid-
+    flight and surface as a misleading "page 1 HTTP error:" alert).
+    """
+    db = SessionLocal()
+    try:
+        store = db.query(Store).filter(Store.id == store_id).first()
+        if not store:
+            _scrape_state["result"] = {
+                "stores": [], "total_products": 0, "total_general": 0,
+                "stores_with_products": 0, "stores_failed": 1,
+                "error": f"Store id={store_id} not found",
+            }
+            return
+        s_name, s_url, s_niche = store.name, store.url, (store.niche or "")
+        try:
+            fashion, general, errors = await scrape_store_bestsellers(s_url)
+            if fashion or general:
+                update_products_in_db(db, store, fashion, general)
+            _scrape_state["result"] = {
+                "stores": [{
+                    "id": store_id, "name": s_name, "niche": s_niche,
+                    "products": len(fashion), "general": len(general),
+                    "errors": errors, "warning": None,
+                }],
+                "total_products": len(fashion),
+                "total_general": len(general),
+                "stores_with_products": 1 if (fashion or general) else 0,
+                "stores_failed": 0 if (fashion or general) else 1,
+            }
+        except Exception as e:
+            _scrape_state["result"] = {
+                "stores": [{
+                    "id": store_id, "name": s_name, "niche": s_niche,
+                    "products": 0, "general": 0,
+                    "errors": [f"unhandled: {e}"], "warning": None,
+                }],
+                "total_products": 0, "total_general": 0,
+                "stores_with_products": 0, "stores_failed": 1,
+                "error": str(e),
+            }
+            logger.exception(f"Background single-store scrape failed for {s_name}")
+    finally:
+        db.close()
+
+
 @app.post("/api/scrape/{store_id}")
 async def trigger_store_scrape(store_id: int, db: Session = Depends(get_db)):
+    """Kick off a single-store scrape in the background and return
+    immediately. The frontend polls /api/scrape/status for the result.
+
+    Previously this endpoint was synchronous — Render kills any HTTP
+    request that runs longer than 60s, so any merchant whose scrape
+    took longer (Shopify pagination + Gemini classification commonly
+    takes 60-300s) returned a 502 to the browser. The frontend then
+    rendered the 502 HTML as the API response and the user saw a
+    misleading "Scraped 0 products. page 1 HTTP error:" alert.
+    """
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
-    fashion, general, errors = await scrape_store_bestsellers(store.url)
-    if fashion or general:
-        update_products_in_db(db, store, fashion, general)
+    if _scrape_state["running"]:
+        return {
+            "started": False, "running": True,
+            "started_at": _scrape_state["started_at"],
+            "message": "Another scrape is already in progress",
+        }
+    _scrape_state["running"] = True
+    _scrape_state["started_at"] = datetime.utcnow().isoformat()
+    _scrape_state["result"] = None
+
+    async def _runner():
+        try:
+            await _background_scrape_one(store_id)
+        finally:
+            _scrape_state["running"] = False
+
+    asyncio.create_task(_runner())
     return {
-        "success": (len(fashion) + len(general)) > 0,
-        "products_found": len(fashion),
-        "general_found": len(general),
-        "errors": errors,
+        "started": True, "running": True,
+        "store_id": store_id,
+        "started_at": _scrape_state["started_at"],
+        "message": "Per-store scrape started in background. Poll /api/scrape/status for progress.",
     }
 
 
