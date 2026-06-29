@@ -160,8 +160,14 @@ _INTENT_TYPE_KEYWORDS = {
         "tasche", "sac", "bolso", "borsa",
     },
     "jewelry": {
-        "necklace", "earring", "ring", "bracelet", "pendant", "anklet",
-        "choker", "brooch", "chain", "jewel", "jewelry",
+        # NOTE: "chain" and "ring" intentionally excluded — too
+        # generic, false-match "chain detail sandal" and "ring spun
+        # cotton" / "ring of color". Keep specific jewelry nouns
+        # only. A query for "chain necklace" still gates correctly
+        # via "necklace"; "engagement ring" via "engagement" + ring
+        # is not a thing we can cleanly resolve without ambiguity.
+        "necklace", "earring", "earrings", "bracelet", "pendant",
+        "anklet", "choker", "brooch", "jewelry",
     },
     "watch": {"watch", "smartwatch", "wristwatch", "timepiece"},
     "accessory": {
