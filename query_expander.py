@@ -559,34 +559,52 @@ _RERANK_CACHE_ORDER: list[tuple] = []
 _RERANK_CACHE_MAX = 256
 
 
-_RERANK_PROMPT_TEMPLATE = """You are re-ranking product search results.
+_RERANK_PROMPT_TEMPLATE = """You are the STRICT MATCH JUDGE for a product search.
 
 The user searched: {query!r}
 
-Below are {n} candidate products from a multilingual catalog. For EACH product, decide how well it satisfies the user's intent and whether it should be dropped from the results.
+For EACH of the {n} candidate products below, decide if it EXACTLY matches every constraint in the user's query. Be RUTHLESSLY STRICT. The user explicitly prefers ZERO results over inaccurate results.
 
-Scoring rubric (0-100):
-  100  perfect match — a shopper looking for this exact thing would buy this product
-   80  strong match — clearly relevant
-   60  reasonable match — relevant but not the best example
-   40  weak match — tangentially relevant
-   20  poor match — only loosely related
-    0  irrelevant — would frustrate the user
+DROP a product (match=false) if ANY constraint is wrong:
 
-drop=true for anything with score < 20 (the product is clearly off-topic).
+  TYPE / SUB-TYPE
+    - Query "knee-high boots"  -> drop ankle boots, sneakers, sandals, regular boots, mid-calf
+    - Query "puffer jacket"    -> drop blazers, bomber jackets, denim jackets, leather jackets, trench coats
+    - Query "cocktail dress"   -> drop maxi gowns (unless explicitly cocktail), casual dresses, wedding gowns, t-shirt dresses
+    - Query "lederhosen"       -> drop modern pants, jeans, leggings — ONLY traditional Bavarian leather shorts/pants count
+    - Query "tracksuit"        -> drop separate joggers/hoodies UNLESS sold as a matching set, drop blazers, drop dresses
+    - Query "wedding dress"    -> drop wedding-guest dresses, cocktail dresses, anything for the GUEST not the BRIDE
+    - Query "midi skirt"       -> drop maxi or mini skirts
 
-For "{query}" specifically: prioritize products whose TITLE or AI_TAGS make the intent explicit (the right occasion / style / material / category). Penalize products whose category is wrong (e.g. an accessory when the user wants a dress, a smartwatch when the user wants a classic watch).
+  GENDER (CRITICAL — never let this slip)
+    - Query "for women" / "woman" / "ladies" / "femme" / "damen" -> drop men's products
+    - Query "for men" / "man" / "homme" / "herren" -> drop women's products
+    - Query "kids" -> drop adult products
 
-Products (JSON):
+  COLOR (when explicitly named)
+    - Query "red dress" -> drop blue/black/floral dresses
+
+  MATERIAL (when explicitly named)
+    - Query "silk blouse" -> drop cotton/polyester blouses
+    - Query "leather jacket" -> drop denim/cotton/faux-leather jackets (unless leather IS the explicit material)
+
+  OCCASION (when explicitly named)
+    - Query "prom dress" -> drop casual / work / lounge dresses; keep evening/formal/cocktail
+    - Query "office wear" -> drop party / clubwear
+
+Match=true ONLY when the product unambiguously fits the user's intent. When the title is unclear and the tags don't confirm it, choose match=false (be conservative — empty results are FINE).
+
+Products (JSON, lowercase title for ease of matching):
 {items}
 
-Respond with a JSON array. Exactly one object per product, in input order:
+Reply with a JSON array, exactly one object per product, in input order:
 [
-  {{"idx": 0, "score": 87, "drop": false}},
+  {{"idx": 0, "match": true,  "reason": "knee-high boot, women"}},
+  {{"idx": 1, "match": false, "reason": "ankle boot, not knee-high"}},
   ...
 ]
 
-Output ONLY the JSON array. No markdown, no commentary."""
+The "reason" field is for diagnostics; keep it under 80 chars. Output ONLY the JSON array — no markdown fences, no commentary, no preamble."""
 
 
 def _rerank_cache_key(query: str, candidate_ids: list[int]) -> tuple:
@@ -613,26 +631,39 @@ async def rerank_with_gemini(
     query: str,
     candidates: list[dict],
     *,
-    timeout_seconds: float = 5.0,
+    timeout_seconds: float = 12.0,
 ) -> list[dict]:
-    """Re-rank `candidates` (each dict needs at minimum {idx, title,
-    ai_tags, product_type}) using a single Gemini call.
+    """STRICT MATCH JUDGE — for each candidate, decide if it EXACTLY
+    matches every constraint in the user's query (type, sub-type,
+    gender, color, material, occasion). Returns
+    `[{idx, match: bool, reason: str}, ...]`.
 
-    Returns a list of `{idx, score, drop}` dicts. On any failure
-    (no API key, Gemini error, timeout, JSON parse) returns the
-    identity ranking [{idx: i, score: 50, drop: False} ...] so the
-    caller can keep the upstream hybrid order.
+    The match=true subset is what the caller surfaces to the user.
+    match=false items are HARD-DROPPED — never shown — because the
+    user explicitly demanded "100% accuracy, never below that, prefer
+    zero results over inaccurate results".
+
+    On any failure (no API key, Gemini error, timeout, parse fail)
+    returns "match=true" for everything (fail-open). The caller's
+    hybrid score still ranks them; the strict filter just doesn't
+    contribute. This is intentionally less strict than the strict
+    mode itself — we don't want to dump the whole result set on a
+    transient Gemini hiccup.
+
+    timeout_seconds raised to 12 (was 5) because the strict prompt
+    is longer and Flash routinely takes 4-8s for a 50-product batch.
     """
     if not candidates:
         return []
 
-    identity = [
-        {"idx": i, "score": 50, "drop": False} for i in range(len(candidates))
+    fail_open = [
+        {"idx": i, "match": True, "reason": "no judge"}
+        for i in range(len(candidates))
     ]
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return identity
+        return fail_open
 
     candidate_ids = [c.get("id") for c in candidates if c.get("id") is not None]
     if candidate_ids:
@@ -643,14 +674,12 @@ async def rerank_with_gemini(
     else:
         cache_key = None
 
-    # Trim each candidate dict to just the fields Gemini needs — keeps
-    # the prompt small and avoids leaking unrelated DB columns.
+    # Trim each candidate dict to just the fields the judge needs.
     items_for_prompt = [
         {
             "idx": i,
             "title": (c.get("title") or "")[:200],
             "ai_tags": (c.get("ai_tags") or "")[:300],
-            "product_type": (c.get("product_type") or "")[:80],
             "subniche": (c.get("subniche") or "")[:30],
         }
         for i, c in enumerate(candidates)
@@ -699,7 +728,6 @@ async def rerank_with_gemini(
                     continue
             if not isinstance(parsed, list):
                 continue
-            # Validate + repair: ensure every input index is represented
             seen_indices = set()
             out: list[dict] = []
             for entry in parsed:
@@ -711,16 +739,27 @@ async def rerank_with_gemini(
                 if idx < 0 or idx >= len(candidates):
                     continue
                 seen_indices.add(idx)
-                score = entry.get("score", 50)
-                if not isinstance(score, (int, float)):
-                    score = 50
-                drop = bool(entry.get("drop", False))
-                out.append({"idx": idx, "score": float(score), "drop": drop})
-            # Fill in any missing indices with neutral scores so the
-            # caller never loses a candidate to a Gemini bug.
+                # Accept either the new {match: bool} shape OR a
+                # legacy {score: float, drop: bool} shape; coerce to
+                # match. Anything < 70 / drop=true / match=false is a
+                # drop.
+                if "match" in entry:
+                    match = bool(entry.get("match"))
+                else:
+                    drop = bool(entry.get("drop", False))
+                    score = entry.get("score", 50)
+                    if not isinstance(score, (int, float)):
+                        score = 50
+                    match = (not drop) and float(score) >= 70.0
+                reason = entry.get("reason") or ""
+                if not isinstance(reason, str):
+                    reason = ""
+                out.append({"idx": idx, "match": match, "reason": reason[:120]})
+            # Any index Gemini didn't return for defaults to DROP
+            # (strict mode — be conservative).
             for i in range(len(candidates)):
                 if i not in seen_indices:
-                    out.append({"idx": i, "score": 50.0, "drop": False})
+                    out.append({"idx": i, "match": False, "reason": "no verdict"})
             if cache_key is not None:
                 _rerank_cache_put(cache_key, out)
             return out
@@ -728,7 +767,7 @@ async def rerank_with_gemini(
             logger.warning("rerank_with_gemini: %s exception %s", model, e)
             continue
 
-    return identity
+    return fail_open
 
 
 # ---------------------------------------------------------------------

@@ -340,6 +340,34 @@ def test_search_results_ranked_by_relevance(client, seeded):
             f"literal {literal_positions} should beat tagged {tagged_positions}"
 
 
+def test_rerank_returns_match_shape_not_score():
+    """User demanded "100% accuracy, prefer zero results over
+    inaccurate results". The judge now returns match=true|false
+    (binary), not a 0-100 score. Match=false items are HARD-DROPPED
+    by hybrid_search. The legacy {idx, score, drop} shape was a
+    soft re-rank that let tangentially-related items through; the
+    new shape is a strict yes/no verdict."""
+    import asyncio
+    candidates = [
+        {"id": 1, "title": "Knee-High Black Leather Boots",
+         "ai_tags": "boot, knee-high, leather, women"},
+        {"id": 2, "title": "Ankle Boots Suede",
+         "ai_tags": "boot, ankle, suede, women"},
+    ]
+    # No GEMINI_API_KEY → fail_open. Every candidate gets match=True
+    # so the caller can continue with the hybrid order. This is
+    # intentional: a transient Gemini outage shouldn't blank the page.
+    verdicts = asyncio.run(query_expander.rerank_with_gemini("knee-high boots", candidates))
+    assert len(verdicts) == 2
+    for v in verdicts:
+        assert "idx" in v
+        assert "match" in v
+        assert isinstance(v["match"], bool)
+        # Legacy fields must not appear
+        assert "score" not in v
+        assert "drop" not in v
+
+
 def test_intent_gate_drops_cross_category_pollution(client, db_eng):
     """User complaint 2026-06-29: searching 'shoes' surfaces dresses
     because Gemini expansion includes 'dress shoes' as a phrase and

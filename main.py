@@ -1163,52 +1163,54 @@ async def hybrid_search(
     #    on bestseller rank — lower is better).
     scored.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
 
-    # 6. Gemini re-rank on the top 50 (default on, set
-    #    SEARCH_RERANK=0 to disable). The rerank prompt now defaults
-    #    to dropping anything < 50 (was < 20) which prunes the
-    #    "tangentially relevant" tail aggressively.
-    rerank_enabled = (
+    # 6. STRICT MATCH JUDGE (Gemini). For every candidate, Gemini
+    #    decides match=true|false against the user's full query
+    #    (every constraint — type, sub-type, gender, color, material,
+    #    occasion). match=false items are HARD-DROPPED and never
+    #    shown. The user explicitly demanded "100% accuracy" and
+    #    "prefer zero results over inaccurate results" — this honors
+    #    that promise.
+    #
+    #    Up to 100 candidates go to the judge (was 50 for the old
+    #    soft rerank). Anything beyond 100 isn't shown — we'd rather
+    #    cap visible results than show un-judged ones. Common queries
+    #    cache after the first call so repeat searches are O(1).
+    judge_enabled = (
         rerank
         and os.getenv("SEARCH_RERANK", "1") != "0"
-        and len(scored) >= 5
+        and len(scored) >= 1
     )
-    if rerank_enabled:
-        top_n = min(50, len(scored))
-        top_candidates = [
+    if judge_enabled:
+        top_n = min(100, len(scored))
+        judge_candidates = [
             {
                 "id": p.id,
                 "title": p.title or "",
                 "ai_tags": p.ai_tags or "",
-                "product_type": p.product_type or "",
                 "subniche": p.subniche or "",
             }
             for _, p in scored[:top_n]
         ]
         try:
-            ranking = await rerank_with_gemini(s, top_candidates)
+            verdicts = await rerank_with_gemini(s, judge_candidates)
         except Exception as e:
-            logger.warning("hybrid_search: rerank failed: %s — keeping hybrid order", e)
-            ranking = [{"idx": i, "score": 50.0, "drop": False} for i in range(top_n)]
-
-        # Map idx → (rerank_score, drop). Tighter cutoff: drop anything
-        # rerank scored < 40 (in addition to Gemini's own drop=true).
-        rerank_by_idx = {r["idx"]: (r["score"], r["drop"]) for r in ranking}
-        reranked_top = []
+            logger.warning(
+                "hybrid_search: strict judge failed: %s — falling back to hybrid order",
+                e,
+            )
+            verdicts = [
+                {"idx": i, "match": True, "reason": "judge errored"}
+                for i in range(top_n)
+            ]
+        match_by_idx = {v["idx"]: v["match"] for v in verdicts}
+        kept = []
         for i, (orig_score, p) in enumerate(scored[:top_n]):
-            r_score, r_drop = rerank_by_idx.get(i, (50.0, False))
-            if r_drop or r_score < 40:
-                continue
-            # Final score weights rerank more heavily than the hybrid
-            # prior so the AI's judgment dominates while ties break to
-            # higher hybrid relevance.
-            final = orig_score + (r_score * 2)
-            reranked_top.append((final, p))
-        reranked_top.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
-        # Append the un-reranked tail (positions 51+) below — but only
-        # the ones above the higher hybrid threshold so the tail isn't
-        # full of barely-matching products.
-        tail = [(s, p) for s, p in scored[top_n:] if s >= 10]
-        scored = reranked_top + tail
+            if match_by_idx.get(i, False):
+                kept.append((orig_score, p))
+        kept.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
+        # NO tail. Strict mode means: only items the judge approved.
+        # Anything in scored[top_n:] wasn't judged → not shown.
+        scored = kept
 
     return [p for _, p in scored[:limit]]
 
