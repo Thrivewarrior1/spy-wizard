@@ -65,14 +65,13 @@ logger = logging.getLogger(__name__)
 _MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 _FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-flash-latest"]
 
-# The strict-match JUDGE benefits from a stronger model than the
-# rest of the pipeline — Flash-lite frequently misses gender ("Homme"
-# leaking into a "for women" query) and fine sub-type distinctions
-# (ankle-boot passing as knee-high). Upgrade to gemini-2.5-flash by
-# default and fall back to flash-lite only if it's unavailable.
-# Override via env: SEARCH_JUDGE_MODEL.
-_JUDGE_MODEL = os.getenv("SEARCH_JUDGE_MODEL", "gemini-2.5-flash")
-_JUDGE_FALLBACK_MODELS = ["gemini-2.5-flash-lite", "gemini-flash-latest"]
+# The strict-match JUDGE. Kept on flash-lite by default — flash
+# (regular) is slower and ran into timeouts under prod load,
+# causing fail-open and a 20-random-pants result for "lederhosen".
+# Flash-lite + the worked-example prompt is a better cost/latency
+# tradeoff for our scale.
+_JUDGE_MODEL = os.getenv("SEARCH_JUDGE_MODEL", "gemini-2.5-flash-lite")
+_JUDGE_FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-flash-latest"]
 
 
 def _gemini_url(model: str) -> str:
@@ -699,27 +698,40 @@ async def rerank_with_gemini(
     user explicitly demanded "100% accuracy, never below that, prefer
     zero results over inaccurate results".
 
-    On any failure (no API key, Gemini error, timeout, parse fail)
-    returns "match=true" for everything (fail-open). The caller's
-    hybrid score still ranks them; the strict filter just doesn't
-    contribute. This is intentionally less strict than the strict
-    mode itself — we don't want to dump the whole result set on a
-    transient Gemini hiccup.
+    FAIL-CLOSED on judge failure (no API key, Gemini error, timeout,
+    parse fail): returns "match=false" for everything. The user
+    explicitly said "prefer zero results over inaccurate results";
+    fail-open (the old behavior) blew up live as "lederhosen"
+    returning 20 random pants when the judge timed out. With
+    fail-closed, the worst case is "lederhosen" returns 0 results
+    which is correct anyway. ONLY exception: when there's no Gemini
+    API key at all (tests + degraded mode), fail-open with a
+    "no-key" flag so the test suite (which intentionally runs
+    without a key) doesn't blank every search.
 
     timeout_seconds raised to 12 (was 5) because the strict prompt
-    is longer and Flash routinely takes 4-8s for a 50-product batch.
+    is longer and Flash-lite takes 3-8s for a 100-product batch.
     """
     if not candidates:
         return []
 
-    fail_open = [
-        {"idx": i, "match": True, "reason": "no judge"}
+    # Distinct fallback shapes for the two failure modes.
+    fail_open_no_key = [
+        {"idx": i, "match": True, "reason": "no key"}
+        for i in range(len(candidates))
+    ]
+    fail_closed = [
+        {"idx": i, "match": False, "reason": "judge unreachable"}
         for i in range(len(candidates))
     ]
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return fail_open
+        # No key at all = degraded mode (local dev / tests). Pass
+        # through so the upstream hybrid_search still returns
+        # something — the score threshold + intent gate are the only
+        # defense in this path.
+        return fail_open_no_key
 
     candidate_ids = [c.get("id") for c in candidates if c.get("id") is not None]
     if candidate_ids:
@@ -823,7 +835,13 @@ async def rerank_with_gemini(
             logger.warning("rerank_with_gemini: %s exception %s", model, e)
             continue
 
-    return fail_open
+    # ALL models failed (timeout, network, 5xx). Fail CLOSED —
+    # better to return zero than to return garbage.
+    logger.warning(
+        "rerank_with_gemini: all models failed for query=%r, returning fail-closed (%d items dropped)",
+        query[:60], len(candidates),
+    )
+    return fail_closed
 
 
 # ---------------------------------------------------------------------
