@@ -248,24 +248,44 @@ class ExpansionResult:
     def strong_signal_terms(self) -> set[str]:
         """The SUBSET of all_terms used for the SQL prefilter. These
         are the terms that, if found in product title or ai_tags,
-        legitimately suggest relevance — i.e. the controlled-vocab
-        tag tokens plus canonical English type-nouns plus multilingual
-        nouns plus the original query tokens. NOT semantic_phrases
-        (which may decompose into common words like "dress shoes" →
-        false-matching "dress" elsewhere)."""
+        legitimately suggest relevance.
+
+        CRITICAL: original query tokens are NOT included here when
+        the Gemini expansion produced canonical_terms or
+        multilingual_nouns. Reason: a query like "puffer jacket
+        woman" has the raw token "jacket" which matches every
+        blazer/coat/sweater via %jacket%, blowing up the candidate
+        pool. The canonical_terms ("puffer jacket", "quilted
+        jacket", "down jacket") and multilingual_nouns
+        ("pufferjacke", "doudoune", "piumino") are already specific
+        enough to find the right products. Original tokens are only
+        added when the expansion is empty (fail-fallback mode).
+        """
         out: set[str] = set()
-        for lst in (
-            self.canonical_terms,
-            self.occasion_tags, self.style_tags,
-            self.material_tags, self.color_tags,
-            self.multilingual_nouns,
-        ):
+        specific_filled = False
+        for lst in (self.canonical_terms, self.multilingual_nouns):
             for t in lst:
                 if t and isinstance(t, str):
                     v = t.strip().lower()
                     if v:
                         out.add(v)
-        out.update(self.original.lower().split())
+                        specific_filled = True
+        # Tag fields contribute too — they're specific by construction
+        # (controlled-vocab). e.g. a query "evening" expansion gives
+        # occasion_tags=["evening","formal","gala","ball"] which catches
+        # the right products even without canonical_terms.
+        for lst in (self.occasion_tags, self.style_tags,
+                    self.material_tags, self.color_tags):
+            for t in lst:
+                if t and isinstance(t, str):
+                    v = t.strip().lower()
+                    if v:
+                        out.add(v)
+                        specific_filled = True
+        # Fallback ONLY when the expansion gave us nothing specific —
+        # add original tokens so a degraded-mode search still works.
+        if not specific_filled:
+            out.update(self.original.lower().split())
         out.discard("")
         return out
 
