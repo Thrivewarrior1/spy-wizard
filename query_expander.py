@@ -259,16 +259,33 @@ class ExpansionResult:
         ("pufferjacke", "doudoune", "piumino") are already specific
         enough to find the right products. Original tokens are only
         added when the expansion is empty (fail-fallback mode).
+
+        ALSO: overly-generic short tokens like "set", "top", "fit",
+        "new", "wear", "cut" are filtered out — they false-match
+        "Linen Set" / "Tailored Fit" / "Summer Set" titles for
+        unrelated tracksuit / dress / blazer queries. Catalog noise
+        not signal.
         """
+        GENERIC_DENY = {
+            # Overly-broad words that appear in nearly every fashion
+            # title and produce noise in the SQL prefilter. Each one
+            # is here because of a real live-search false-positive.
+            "set", "sets", "top", "tops", "fit", "new", "wear",
+            "cut", "all", "any", "the", "for", "and", "with",
+        }
         out: set[str] = set()
         specific_filled = False
+        def _add(v: str) -> None:
+            nonlocal specific_filled
+            v = (v or "").strip().lower()
+            if not v or v in GENERIC_DENY:
+                return
+            out.add(v)
+            specific_filled = True
         for lst in (self.canonical_terms, self.multilingual_nouns):
             for t in lst:
-                if t and isinstance(t, str):
-                    v = t.strip().lower()
-                    if v:
-                        out.add(v)
-                        specific_filled = True
+                if isinstance(t, str):
+                    _add(t)
         # Tag fields contribute too — they're specific by construction
         # (controlled-vocab). e.g. a query "evening" expansion gives
         # occasion_tags=["evening","formal","gala","ball"] which catches
@@ -276,15 +293,14 @@ class ExpansionResult:
         for lst in (self.occasion_tags, self.style_tags,
                     self.material_tags, self.color_tags):
             for t in lst:
-                if t and isinstance(t, str):
-                    v = t.strip().lower()
-                    if v:
-                        out.add(v)
-                        specific_filled = True
+                if isinstance(t, str):
+                    _add(t)
         # Fallback ONLY when the expansion gave us nothing specific —
         # add original tokens so a degraded-mode search still works.
         if not specific_filled:
-            out.update(self.original.lower().split())
+            for tok in self.original.lower().split():
+                if tok and tok not in GENERIC_DENY:
+                    out.add(tok)
         out.discard("")
         return out
 
@@ -613,6 +629,18 @@ DROP a product (match=false) if ANY constraint is wrong:
         title "Stiefeletten" (de)                     -> match=false  (Stiefeletten = ankle boots)
         title "Stiefel Damen Kniehoch"                -> match=true   (Kniehoch = knee-high)
         title "Hiking Boots Waterproof"               -> match=false  (hiking style, not fashion knee-high)
+    - WORKED EXAMPLE for "tracksuit" (CRITICAL — keeps slipping in non-tracksuit two-piece sets):
+        title "Trainingsanzug Herren mit Reissverschluss"   -> match=true   (German: literal tracksuit)
+        title "Reynold Survetement Homme Elegant"            -> match=true   (French: Survetement = tracksuit)
+        title "Tuta Sportiva da Uomo"                        -> match=true   (Italian: Tuta sportiva = tracksuit)
+        title "NOVA Athletic Track Set Men's Zip Hoodie"     -> match=true   (athletic two-piece zip+joggers)
+        title "Lassiges Herren Leinen-Set Hemd & Hose"       -> match=false  (linen casual set, NOT athletic)
+        title "Herren Sommer Set Kurzarmhemd & Shorts"       -> match=false  (summer set, NOT athletic)
+        title "Men's Two-Piece Linen Outfit"                 -> match=false  (linen casual outfit, NOT tracksuit)
+        title "Tailored Suit Set Men's Blazer & Trouser"     -> match=false  (formal suit, NOT athletic)
+        title "Cargo Trousers Men"                           -> match=false  (single pants, not a tracksuit set)
+        title "Men's Joggers Only (no top)"                  -> match=false  (joggers alone aren't a tracksuit)
+      A TRACKSUIT MUST be ATHLETIC SPORTSWEAR — typically a matching ZIP-UP HOODIE/JACKET + JOGGER PANTS sold together, in athletic materials (jersey, polyester, fleece). Casual two-piece sets, linen sets, summer sets, suits, single items are NOT tracksuits.
 
   GENDER (CRITICAL — NEVER let this slip)
     - Query mentions "women" / "woman" / "ladies" / "for her" /
