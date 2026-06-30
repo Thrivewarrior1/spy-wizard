@@ -1135,6 +1135,53 @@ async def hybrid_search(
         if not candidates:
             return []
 
+    # 3b. DETERMINISTIC GENDER FILTER. Gemini Flash-lite is
+    #     unreliable on this specific axis — a "puffer jacket for
+    #     women" query kept leaking "Doudoune Homme" because Flash
+    #     ignored the explicit gender constraint. This filter is a
+    #     mechanical safety net: detect the gender of the query and
+    #     drop products whose title clearly indicates the opposite
+    #     gender. Multilingual: men = men/man/men's/homme/herren/
+    #     hombre/uomo/heren/man, women = women/woman/ladies/femme/
+    #     dame/damen/dama/mujer/donna/dames.
+    _MEN_TOKENS = (
+        r"\bmen\b", r"\bman\b", r"\bmen's\b", r"\bmens\b",
+        r"\bhomme\b", r"\bhommes\b",
+        r"\bherren\b", r"\bherr\b",
+        r"\bhombre\b", r"\bhombres\b",
+        r"\buomo\b", r"\buomini\b",
+        r"\bheren\b",
+    )
+    _WOMEN_TOKENS = (
+        r"\bwomen\b", r"\bwoman\b", r"\bwomen's\b", r"\bwomens\b",
+        r"\bladies\b", r"\blady\b",
+        r"\bfemme\b", r"\bfemmes\b",
+        r"\bdame\b", r"\bdamen\b",
+        r"\bdama\b", r"\bmujer\b", r"\bmujeres\b",
+        r"\bdonna\b", r"\bdonne\b",
+        r"\bdames\b",
+    )
+    _MEN_RE = _re.compile("|".join(_MEN_TOKENS), _re.IGNORECASE | _re.UNICODE)
+    _WOMEN_RE = _re.compile("|".join(_WOMEN_TOKENS), _re.IGNORECASE | _re.UNICODE)
+    s_lower = s.lower()
+    query_wants_men = bool(_MEN_RE.search(s_lower))
+    query_wants_women = bool(_WOMEN_RE.search(s_lower))
+    if query_wants_men or query_wants_women:
+        filtered = []
+        for p in candidates:
+            haystack = (p.title or "") + " " + (p.ai_tags or "")
+            has_men = bool(_MEN_RE.search(haystack))
+            has_women = bool(_WOMEN_RE.search(haystack))
+            # Drop products whose gender tag CONTRADICTS the query.
+            if query_wants_women and has_men and not has_women:
+                continue
+            if query_wants_men and has_women and not has_men:
+                continue
+            filtered.append(p)
+        candidates = filtered
+        if not candidates:
+            return []
+
     # 4. Python-side scoring. Pure functions, no I/O.
     scored = []
     for p in candidates:
