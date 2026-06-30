@@ -65,6 +65,15 @@ logger = logging.getLogger(__name__)
 _MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 _FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-flash-latest"]
 
+# The strict-match JUDGE benefits from a stronger model than the
+# rest of the pipeline — Flash-lite frequently misses gender ("Homme"
+# leaking into a "for women" query) and fine sub-type distinctions
+# (ankle-boot passing as knee-high). Upgrade to gemini-2.5-flash by
+# default and fall back to flash-lite only if it's unavailable.
+# Override via env: SEARCH_JUDGE_MODEL.
+_JUDGE_MODEL = os.getenv("SEARCH_JUDGE_MODEL", "gemini-2.5-flash")
+_JUDGE_FALLBACK_MODELS = ["gemini-2.5-flash-lite", "gemini-flash-latest"]
+
 
 def _gemini_url(model: str) -> str:
     return (
@@ -575,10 +584,37 @@ DROP a product (match=false) if ANY constraint is wrong:
     - Query "tracksuit"        -> drop separate joggers/hoodies UNLESS sold as a matching set, drop blazers, drop dresses
     - Query "wedding dress"    -> drop wedding-guest dresses, cocktail dresses, anything for the GUEST not the BRIDE
     - Query "midi skirt"       -> drop maxi or mini skirts
+    - WORKED EXAMPLE for "knee-high boots":
+        title "Black Knee-High Suede Boots"          -> match=true
+        title "Tall Knee Boot in Tan Leather"         -> match=true   (tall knee = knee-high)
+        title "Over-the-Knee Black Boot"              -> match=true   (over-the-knee >= knee-high)
+        title "Mid-Calf Boots in Brown"               -> match=false  (mid-calf, not knee-high)
+        title "Ankle Boots Black Suede"               -> match=false  (ankle != knee-high)
+        title "Bottines Femme en Daim"                -> match=false  (Bottines = ankle/short boots in FR)
+        title "Stiefeletten" (de)                     -> match=false  (Stiefeletten = ankle boots)
+        title "Stiefel Damen Kniehoch"                -> match=true   (Kniehoch = knee-high)
+        title "Hiking Boots Waterproof"               -> match=false  (hiking style, not fashion knee-high)
 
-  GENDER (CRITICAL — never let this slip)
-    - Query "for women" / "woman" / "ladies" / "femme" / "damen" -> drop men's products
-    - Query "for men" / "man" / "homme" / "herren" -> drop women's products
+  GENDER (CRITICAL — NEVER let this slip)
+    - Query mentions "women" / "woman" / "ladies" / "for her" /
+      French "femme" / German "damen" / Spanish "mujer" / Italian
+      "donna" -> drop ALL men's products. A title containing
+      "Homme" / "Herren" / "Men's" / "Hombre" / "Uomo" / "Heren"
+      is a MEN'S product and MUST be dropped from a women's query.
+    - Query mentions "men" / "man" / "for him" / French "homme" /
+      German "herren" -> drop ALL women's products (femme/damen/
+      mujer/donna/dames).
+    - When gender is in the query, the product's gender tag MUST
+      match. Tags like "men", "men's", "Herren", "Homme" in the
+      product title or ai_tags are dispositive evidence — drop
+      against the query's gender even if every other constraint
+      matches perfectly.
+    - WORKED EXAMPLE for "puffer jacket for women":
+        title "Pufferjacke Damen mit Kapuze"        -> match=true
+        title "Doudoune Femme 90% Duvet"            -> match=true
+        title "Doudoune Homme Coupe-Vent"           -> match=false  (HOMME = men)
+        title "Men's Down Puffer Jacket"            -> match=false  (Men's)
+        title "Pufferjacke mit Kapuze" (no gender)  -> match=true   (default assumed women's puffer)
     - Query "kids" -> drop adult products
 
   COLOR (when explicitly named)
@@ -699,7 +735,7 @@ async def rerank_with_gemini(
         },
     }
 
-    for model in [_MODEL, *_FALLBACK_MODELS]:
+    for model in [_JUDGE_MODEL, *_JUDGE_FALLBACK_MODELS]:
         try:
             async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                 r = await client.post(
