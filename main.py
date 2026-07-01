@@ -1071,7 +1071,24 @@ def build_ai_tag_filters(search_query: str):
             conds.append(or_(*word_or))
     return conds
 
-async def hybrid_search(
+# Serialize expensive semantic searches. Each search does synchronous
+# DB queries + numpy similarity + a fan of Gemini calls; running several
+# at once on the single-worker 512MB instance saturated the event loop
+# and starved the health check, causing restart-loops. This semaphore
+# caps concurrent searches to 1 — a 2nd search QUEUES (still completes)
+# rather than piling on. Fine for a single-user internal tool.
+_SEARCH_SEM = asyncio.Semaphore(1)
+
+
+async def hybrid_search(db, base_query, search_text, *, limit=300, rerank=True):
+    """Serialized wrapper around the real search. See _hybrid_search."""
+    async with _SEARCH_SEM:
+        return await _hybrid_search(
+            db, base_query, search_text, limit=limit, rerank=rerank,
+        )
+
+
+async def _hybrid_search(
     db: Session,
     base_query,
     search_text: str,
