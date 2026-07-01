@@ -340,6 +340,54 @@ def test_search_results_ranked_by_relevance(client, seeded):
             f"literal {literal_positions} should beat tagged {tagged_positions}"
 
 
+def test_vision_tag_boosts_score():
+    """Products carrying `img:type:cocktail-dress` from the vision
+    classifier score dramatically higher than plain-text matches for
+    a "cocktail dress" query — the image is the ground truth."""
+    exp = query_expander.ExpansionResult(
+        original="cocktail dress",
+        canonical_terms=["cocktail-dress", "cocktail dress"],
+        occasion_tags=["cocktail", "party"],
+    )
+    with_vision = query_expander.score_product_against_expansion(
+        title="Elegant Mini Dress",
+        ai_tags="img:type:cocktail-dress, img:gender:women, img:attr:sleeveless "
+                "|| dress, elegant, party",
+        product_category="dress", subniche="fashion",
+        product_type="", handle="elegant-mini", exp=exp,
+    )
+    without_vision = query_expander.score_product_against_expansion(
+        title="Elegant Mini Dress",
+        ai_tags="dress, elegant, party",
+        product_category="dress", subniche="fashion",
+        product_type="", handle="elegant-mini", exp=exp,
+    )
+    assert with_vision > without_vision + 8, (with_vision, without_vision)
+
+
+def test_vision_conflict_penalty_drops_wrong_subtype():
+    """`img:type:ankle-boots` on a "knee-high boots" query gets a
+    conflict penalty so ankle boots can't win over untagged results."""
+    exp = query_expander.ExpansionResult(
+        original="knee-high boots",
+        canonical_terms=["knee-high-boots"],
+    )
+    ankle_boot_with_vision = query_expander.score_product_against_expansion(
+        title="Black Boots",
+        ai_tags="img:type:ankle-boots, img:gender:women || boot, black",
+        product_category="shoe", subniche="fashion",
+        product_type="", handle="black-boots", exp=exp,
+    )
+    knee_high_with_vision = query_expander.score_product_against_expansion(
+        title="Tall Boots",
+        ai_tags="img:type:knee-high-boots, img:gender:women || boot, tall",
+        product_category="shoe", subniche="fashion",
+        product_type="", handle="tall-boots", exp=exp,
+    )
+    assert knee_high_with_vision > ankle_boot_with_vision, \
+        (knee_high_with_vision, ankle_boot_with_vision)
+
+
 def test_rerank_returns_match_shape_not_score():
     """User demanded "100% accuracy, prefer zero results over
     inaccurate results". The judge now returns match=true|false

@@ -72,6 +72,12 @@ class Product(Base):
 
     last_scraped = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Timestamp of the last successful image-based classification.
+    # Populated by classify_images_batch (image_classifier.py) — used
+    # by the backfill endpoint to skip products whose ai_tags already
+    # contain `img:*` tokens and by observability to answer "when was
+    # this product last seen by the vision model?".
+    vision_classified_at = Column(DateTime, nullable=True, index=True)
 
     store = relationship("Store", back_populates="products")
     history = relationship(

@@ -973,6 +973,63 @@ def score_product_against_expansion(
         if term in handle_tokens:
             score += 1
 
+    # --- VISION TAG BONUS ---
+    # Products whose ai_tags carry `img:*` tokens have been visually
+    # classified by Gemini vision. These are the strongest signals we
+    # have — the image doesn't lie. Weight them heavier than any
+    # text-derived signal, and apply a mutual-exclusion penalty when
+    # the visual product_type contradicts the query intent (e.g.
+    # query="knee-high boots", product has img:type:ankle-boots).
+    ai_tags_l = ai_tags_lc  # already lowercased above
+    if "img:" in ai_tags_l:
+        # Direct product_type match: img:type:cocktail-dress hit by
+        # any expansion term meaning "cocktail dress". Highest weight.
+        for term in exp.canonical_terms + list(exp.tag_terms()):
+            t = (term or "").strip().lower().replace(" ", "-")
+            if not t or len(t) < 3:
+                continue
+            if f"img:type:{t}" in ai_tags_l:
+                score += 10
+            elif f"img:{t}" in ai_tags_l:
+                score += 6
+            if f"img:attr:{t}" in ai_tags_l:
+                score += 5
+            if f"img:color:{t}" in ai_tags_l:
+                score += 3
+            if f"img:material:{t}" in ai_tags_l:
+                score += 3
+            if f"img:occasion:{t}" in ai_tags_l:
+                score += 4
+
+        # Mutual-exclusion penalty. If the query strongly implies one
+        # sub-type and the image says another, drag the score down.
+        # Keeps ankle boots out of knee-high queries.
+        _CONFLICT_MAP = {
+            "knee-high-boots": {"ankle-boots", "chelsea-boots", "loafers",
+                                "sneakers", "sandals", "flats", "mules"},
+            "ankle-boots":     {"knee-high-boots", "thigh-high-boots",
+                                "over-the-knee"},
+            "cocktail-dress":  {"maxi-dress", "sundress", "shirt-dress",
+                                "wedding-dress", "sweater-dress"},
+            "puffer-jacket":   {"blazer", "denim-jacket", "leather-jacket",
+                                "bomber-jacket", "trench-coat", "sport-coat"},
+            "tracksuit":       {"suit", "linen-set", "matching-set",
+                                "two-piece-set", "jumpsuit"},
+            "wedding-dress":   {"bridesmaid-dress", "cocktail-dress",
+                                "mini-dress"},
+        }
+        query_terms_norm = [
+            (t or "").strip().lower().replace(" ", "-")
+            for t in exp.canonical_terms
+        ]
+        for query_type in query_terms_norm:
+            forbidden = _CONFLICT_MAP.get(query_type)
+            if not forbidden:
+                continue
+            for bad_type in forbidden:
+                if f"img:type:{bad_type}" in ai_tags_l:
+                    score -= 8
+
     return score
 
 

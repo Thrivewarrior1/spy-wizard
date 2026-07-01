@@ -1758,6 +1758,99 @@ async def admin_reset_products(db: Session = Depends(get_db)):
     )
     return {"success": True, "deleted": counts}
 
+
+@app.get("/api/debug/vision")
+async def debug_vision(image_url: str):
+    """Diagnostic: classify a single product image via Gemini vision.
+    Returns the raw vision JSON + the flattened `img:` tag string
+    that would be prepended to Product.ai_tags. Use to smoke-test
+    the vision pipeline in production without triggering a full
+    scrape or backfill."""
+    from image_classifier import classify_single_image
+    return await classify_single_image(image_url)
+
+
+@app.post("/api/admin/backfill-vision")
+async def admin_backfill_vision(
+    limit: int = Query(50, ge=1, le=500),
+    only_fashion: bool = Query(True),
+    force: bool = Query(False),
+    store_id: Optional[int] = Query(None),
+    concurrency: int = Query(8, ge=1, le=16),
+    db: Session = Depends(get_db),
+):
+    """Backfill vision classification onto existing products.
+
+    Iterates products that have not yet been vision-classified,
+    fetches their primary image, runs the vision model, and prepends
+    `img:*` tokens to `ai_tags`. Idempotent — skips rows with
+    `vision_classified_at IS NOT NULL` unless `force=true`.
+
+    Cost math: ~$0.00011 per image on Flash-lite. Backfilling 5,000
+    fashion products = ~$0.55, ~15 minutes at 8x concurrency.
+
+    Query params:
+      limit          max products this call (1..500, default 50)
+      only_fashion   skip general/electronics (default true)
+      force          reclassify even if already vision-classified
+      store_id       optional per-store filter
+      concurrency    parallel Gemini calls (1..16, default 8)
+    """
+    from image_classifier import classify_images_batch
+
+    q = db.query(Product).filter(Product.image_url != "")
+    if only_fashion:
+        q = q.filter(Product.is_fashion == True)
+    if not force:
+        q = q.filter(Product.vision_classified_at.is_(None))
+    if store_id is not None:
+        q = q.filter(Product.store_id == store_id)
+    q = q.order_by(Product.last_scraped.desc()).limit(limit)
+    products = q.all()
+
+    if not products:
+        return {"processed": 0, "errors": [], "message": "no candidates"}
+
+    # Shape a per-product dict the vision classifier expects.
+    dicts = [
+        {
+            "product_id": p.id,
+            "image_url": p.image_url or "",
+            "ai_tags": p.ai_tags or "",
+            "handle": p.handle or "",
+        }
+        for p in products
+    ]
+
+    import time
+    t0 = time.monotonic()
+    errors = await classify_images_batch(dicts, concurrency=concurrency)
+    elapsed = time.monotonic() - t0
+
+    # Persist changes back to the DB row.
+    now = datetime.utcnow()
+    processed = 0
+    classified = 0
+    skipped_not_a_product = 0
+    for prod, d in zip(products, dicts):
+        if d.get("vision_classified"):
+            classified += 1
+            prod.ai_tags = d.get("ai_tags") or prod.ai_tags
+            prod.vision_classified_at = now
+            if d.get("_excluded"):
+                skipped_not_a_product += 1
+        processed += 1
+    db.commit()
+
+    return {
+        "processed": processed,
+        "vision_classified": classified,
+        "flagged_not_a_product": skipped_not_a_product,
+        "elapsed_seconds": round(elapsed, 1),
+        "errors": errors[:5],
+    }
+
+
 @app.get("/api/debug/search")
 async def debug_search(q: str, db: Session = Depends(get_db)):
     """Diagnostic: show the live Gemini expansion + per-candidate

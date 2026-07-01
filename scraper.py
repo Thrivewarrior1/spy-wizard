@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from models import Store, Product, PositionHistory, LabelEvent
 from classifier import classify_products_batch
+from image_classifier import classify_images_batch
 from categories import assign_product_category
 from labels import (
     compute_and_write_events,
@@ -1451,6 +1452,31 @@ async def _classify_or_fail(batch: list):
             f"items; dropped {len(missing)} unclassified: {sample}{more}"
         )
 
+    # --- VISION PASS ---
+    # After text classification, run image-based classification on the
+    # fashion products only. This adds `img:...` tokens to ai_tags for
+    # much sharper search precision (knee-high vs ankle boots, cocktail
+    # vs maxi dress, puffer vs bomber jacket, tracksuit vs linen set).
+    # Non-fashion (electronics/home/lamp/etc.) doesn't benefit and would
+    # just waste Gemini quota — skipped intentionally.
+    vision_batch = [
+        p for p in batch
+        if p.get("is_fashion") is True
+        and not p.get("_excluded")
+        and p.get("image_url")
+    ]
+    if vision_batch:
+        try:
+            vision_errors = await classify_images_batch(vision_batch)
+        except Exception as e:
+            errors.append(f"vision exception: {type(e).__name__}: {e}")
+        else:
+            if vision_errors:
+                # Cap error surface — the user only cares about the
+                # first couple of unique failure modes.
+                for msg in vision_errors[:2]:
+                    errors.append(f"vision error: {msg}")
+
     return True, errors
 
 
@@ -1548,6 +1574,10 @@ def _upsert_one(
             product_type=product_data.get("product_type", ""),
         )
         product.last_scraped = now
+        # Vision-classification timestamp — set when the vision pass
+        # populated `img:*` tokens on this product's ai_tags.
+        if product_data.get("vision_classified"):
+            product.vision_classified_at = now
     else:
         product = Product(
             store_id=store.id,
@@ -1572,6 +1602,9 @@ def _upsert_one(
                 product_type=product_data.get("product_type", ""),
             ),
             last_scraped=now,
+            vision_classified_at=(
+                now if product_data.get("vision_classified") else None
+            ),
         )
         db.add(product)
         db.flush()

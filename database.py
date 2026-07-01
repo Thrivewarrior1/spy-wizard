@@ -222,6 +222,11 @@ def widen_text_columns():
         # backfill so existing rows get categorised without waiting for
         # the next scrape cycle.
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS product_category VARCHAR(64) DEFAULT ''",
+        # Vision classification timestamp — populated by
+        # image_classifier.classify_images_batch. Nullable so backfill
+        # can skip already-processed rows.
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS vision_classified_at TIMESTAMP NULL",
+        "CREATE INDEX IF NOT EXISTS ix_products_vision_classified_at ON products (vision_classified_at)",
         "CREATE INDEX IF NOT EXISTS ix_products_product_category ON products(product_category)",
         # Persistent hero/villain event log. Table created via
         # Base.metadata.create_all on first boot; these statements are
