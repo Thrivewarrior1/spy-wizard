@@ -382,17 +382,31 @@ def _validate_store_payload(name: str, url: str) -> Optional[str]:
 @app.get("/api/stores")
 async def get_stores(db: Session = Depends(get_db)):
     stores = db.query(Store).order_by(Store.name).all()
-    # Counts are split by feed and exposed separately so the UI can show
-    # whichever is relevant. The Stores tab no longer surfaces them at
-    # all per the latest design decision, but the API still returns
-    # them for /api/stats and any future consumer.
+    # Per-store counts via aggregate GROUP BY queries — NOT by loading
+    # every product into memory via the s.products relationship (that
+    # pulled all 7000+ rows per call and was a memory / latency sink
+    # on the 512MB instance).
+    fashion_counts = dict(
+        db.query(Product.store_id, func.count(Product.id))
+        .filter(Product.is_fashion == True)
+        .group_by(Product.store_id).all()
+    )
+    general_counts = dict(
+        db.query(Product.store_id, func.count(Product.id))
+        .filter(Product.is_fashion == False, Product.subniche != "")
+        .group_by(Product.store_id).all()
+    )
+    last_scraped = dict(
+        db.query(Product.store_id, func.max(Product.last_scraped))
+        .group_by(Product.store_id).all()
+    )
     return [{
         "id": s.id, "name": s.name, "url": s.url,
         "monthly_visitors": s.monthly_visitors, "niche": s.niche,
         "country": s.country,
-        "product_count": sum(1 for p in s.products if p.is_fashion),
-        "general_count": sum(1 for p in s.products if not p.is_fashion and p.subniche),
-        "last_scraped": max((p.last_scraped for p in s.products if p.is_fashion or p.subniche), default=None),
+        "product_count": fashion_counts.get(s.id, 0),
+        "general_count": general_counts.get(s.id, 0),
+        "last_scraped": last_scraped.get(s.id),
     } for s in stores]
 
 @app.post("/api/stores", status_code=201)
@@ -2703,10 +2717,27 @@ async def get_stats(
         # stores ("Fashion" / "General") are not.
         return ("&" in n) or ("multi" in n) or ("mixed" in n)
 
+    # Per-store fashion/general counts via TWO aggregate GROUP BY
+    # queries — NOT by loading every product into memory. The old
+    # `for s in stores: sum(1 for p in s.products ...)` pulled all
+    # 7000+ Product rows into memory on every call, which (this being
+    # the Render health-check path) crash-looped the 512MB instance.
+    fashion_counts = dict(
+        db.query(Product.store_id, func.count(Product.id))
+        .filter(Product.is_fashion == True)
+        .group_by(Product.store_id)
+        .all()
+    )
+    general_counts = dict(
+        db.query(Product.store_id, func.count(Product.id))
+        .filter(Product.is_fashion == False, Product.subniche != "")
+        .group_by(Product.store_id)
+        .all()
+    )
     unhealthy_stores = []
     for s in db.query(Store).all():
-        fashion_n = sum(1 for p in s.products if p.is_fashion)
-        general_n = sum(1 for p in s.products if not p.is_fashion and p.subniche)
+        fashion_n = fashion_counts.get(s.id, 0)
+        general_n = general_counts.get(s.id, 0)
         if fashion_n == 0 and general_n == 0:
             unhealthy_stores.append({
                 "id": s.id, "name": s.name, "url": s.url,
