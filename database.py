@@ -231,6 +231,10 @@ def widen_text_columns():
         # the strict search judge for semantic matching (no exact-tag
         # match required).
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS vision_description TEXT NULL",
+        # Semantic embedding vector (JSON float array) + the text that
+        # produced it. Primary multilingual search-retrieval signal.
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS embedding TEXT NULL",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS embedding_text TEXT NULL",
         "CREATE INDEX IF NOT EXISTS ix_products_product_category ON products(product_category)",
         # Persistent hero/villain event log. Table created via
         # Base.metadata.create_all on first boot; these statements are

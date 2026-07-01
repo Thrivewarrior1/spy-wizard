@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -119,10 +120,55 @@ async def daily_scrape():
         _scrape_state["running"] = False
 
 
+async def _embed_missing_products(db, *, cap: int = 6000) -> int:
+    """Embed any products that don't yet have an embedding. Called
+    after every scrape so newly-scraped products join the semantic
+    search index automatically. Fast — batches of 100 per API call."""
+    from embeddings import (
+        embed_texts, build_embedding_text, invalidate_index,
+    )
+    pending = (
+        db.query(Product)
+        .filter(Product.embedding.is_(None))
+        .order_by(Product.last_scraped.desc())
+        .limit(cap)
+        .all()
+    )
+    if not pending:
+        return 0
+    total = 0
+    for start in range(0, len(pending), 100):
+        chunk = pending[start:start + 100]
+        texts = [
+            build_embedding_text(
+                title=p.title or "",
+                vision_description=getattr(p, "vision_description", "") or "",
+                ai_tags=p.ai_tags or "",
+            )
+            for p in chunk
+        ]
+        vectors = await embed_texts(texts)
+        for p, txt, vec in zip(chunk, texts, vectors):
+            if vec is not None:
+                p.embedding = json.dumps(vec)
+                p.embedding_text = txt[:2000]
+                total += 1
+        db.commit()
+    invalidate_index()
+    logger.info("post-scrape embedding: embedded %d products", total)
+    return total
+
+
 async def _background_scrape_all():
     db = SessionLocal()
     try:
         _scrape_state["result"] = await scrape_all_stores(db)
+        # Auto-embed newly scraped products so semantic search stays
+        # current without a manual backfill call.
+        try:
+            await _embed_missing_products(db)
+        except Exception as e:
+            logger.warning("post-scrape embedding failed: %s", e)
     except Exception as e:
         _scrape_state["result"] = {
             "stores": [], "total_products": 0,
@@ -1066,18 +1112,37 @@ async def hybrid_search(
     # 1. Query expansion (cached, ~500ms first call, <1ms cached)
     exp = await expand_query(s)
 
-    # 2. SQL prefilter. KEY CHANGE: only OR-match against title and
-    #    ai_tags — NOT product_category / subniche / product_type /
-    #    handle. Those weaker columns frequently contain shared common
-    #    tokens (e.g. subniche='fashion', product_category='dress')
-    #    and ORing %term% against them turned the prefilter into a
-    #    near-full-table scan that returned irrelevant cross-category
-    #    candidates. Title and ai_tags are curated per-product
-    #    signals; weaker columns get used in Python scoring only.
-    strong_terms = exp.strong_signal_terms()
-    if not strong_terms:
+    # 2. RECALL — embedding retrieval (primary) UNIONed with keyword
+    #    prefilter (fallback). This is the multilingual, semantic
+    #    recall stage: the query is embedded and products are ranked
+    #    by cosine similarity, so a German "Kniehohe Stiefel" surfaces
+    #    for an English "knee-high boots" query with no shared tokens.
+    #    The keyword ILIKE union catches (a) products not yet embedded
+    #    and (b) exact substring matches, so nothing obvious is lost.
+    from embeddings import embed_query, rank_ids_by_query
+
+    # Scope: the set of product ids the base_query permits (respects
+    # is_fashion / store / label filters already applied upstream).
+    scoped_ids = {row[0] for row in base_query.with_entities(Product.id).all()}
+    if not scoped_ids:
         return []
 
+    sim_map: dict[int, float] = {}
+    qvec = await embed_query(s)
+    if qvec is not None:
+        # Pull a generous top-K by similarity so the judge has room to
+        # cut. 200 candidates keeps the judge batch manageable while
+        # ensuring cross-language matches make the cut.
+        for pid, sim in rank_ids_by_query(
+            db, qvec, scoped_ids=scoped_ids, top_k=200,
+        ):
+            sim_map[pid] = sim
+
+    # Keyword prefilter union — ILIKE on title+ai_tags for the
+    # expansion terms. Adds ids the embedding index missed (e.g.
+    # products scraped since the last embedding backfill).
+    strong_terms = exp.strong_signal_terms()
+    keyword_ids: set[int] = set()
     or_clauses = []
     for term in strong_terms:
         if len(term) < 3:
@@ -1085,57 +1150,23 @@ async def hybrid_search(
         like_pat = f"%{term}%"
         or_clauses.append(Product.title.ilike(like_pat))
         or_clauses.append(Product.ai_tags.ilike(like_pat))
+    if or_clauses:
+        for row in (
+            base_query.filter(or_(*or_clauses))
+            .with_entities(Product.id).limit(200).all()
+        ):
+            keyword_ids.add(row[0])
 
-    if not or_clauses:
+    candidate_ids = set(sim_map.keys()) | keyword_ids
+    if not candidate_ids:
         return []
 
-    candidate_query = base_query.filter(or_(*or_clauses)).limit(limit * 5)
-    candidates = candidate_query.all()
-
+    # Fetch the actual Product rows for the union.
+    candidates = base_query.filter(Product.id.in_(list(candidate_ids))).all()
     if not candidates:
         return []
 
-    # 3. HARD CATEGORY GATE. If the expander committed to one or more
-    #    intent_types (e.g. "dress", "shoes", "bag"), every returned
-    #    product MUST contain at least one keyword for one of those
-    #    types in its title or ai_tags. This is what stops "Mini Dress"
-    #    from polluting a shoe search and "Derby Dress Shoes" from
-    #    polluting a dress search. Open-ended queries (intent_types
-    #    is empty) skip this gate.
-    #
-    #    CRITICAL: use word-boundary matching, NOT substring. Plain
-    #    substring caused "ring" (in jewelry kws) to match "spring"
-    #    (in a dress title), polluting earrings search with dresses.
-    #    Same for "lamp" matching "lamp" but NOT "blamp" / "lampoon"
-    #    / "Klampenstein". Compile pattern once per call so the
-    #    regex cost is constant per query.
-    intent_kws = exp.intent_keywords()
-    if intent_kws:
-        # Build a single alternation pattern for cheap N-product
-        # match against every intent keyword at once.
-        escaped = [_re.escape(kw) for kw in intent_kws if kw]
-        # \b is the standard Python word-boundary which handles
-        # multilingual unicode word characters via re.UNICODE.
-        # For hyphenated kws (mary-jane, faux-leather) \b on the
-        # outside works because the hyphen IS a word boundary.
-        gate_re = _re.compile(
-            r"\b(?:" + "|".join(escaped) + r")\b",
-            _re.IGNORECASE | _re.UNICODE,
-        )
-        gated = []
-        for p in candidates:
-            haystack = (
-                (p.title or "").lower()
-                + " "
-                + (p.ai_tags or "").lower()
-            )
-            if gate_re.search(haystack):
-                gated.append(p)
-        candidates = gated
-        if not candidates:
-            return []
-
-    # 3b. DETERMINISTIC GENDER FILTER. Gemini Flash-lite is
+    # 3. DETERMINISTIC GENDER FILTER. Gemini Flash-lite is
     #     unreliable on this specific axis — a "puffer jacket for
     #     women" query kept leaking "Doudoune Homme" because Flash
     #     ignored the explicit gender constraint. This filter is a
@@ -1182,32 +1213,37 @@ async def hybrid_search(
         if not candidates:
             return []
 
-    # 4. Python-side scoring. Pure functions, no I/O.
+    # 4. RANK. Primary order is embedding cosine similarity (the
+    #    semantic/multilingual signal). Products that only came in via
+    #    the keyword union (no embedding yet) get a small keyword
+    #    score so they rank below embedded matches but still appear.
     scored = []
     for p in candidates:
-        score = score_product_against_expansion(
-            title=p.title or "",
-            ai_tags=p.ai_tags or "",
-            product_category=p.product_category or "",
-            subniche=p.subniche or "",
-            product_type=p.product_type or "",
-            handle=p.handle or "",
-            exp=exp,
-        )
-        # Min-score threshold: a product needs at least one real
-        # signal (not just an accidental category/handle token hit).
-        # Raised from 0 to 4 to cut the long tail of "barely matches"
-        # results the user complained about. With Gemini expansion
-        # active in production, tagged-relevant products score 20+
-        # easily; this threshold only filters the noise tier.
-        if score >= 4:
-            scored.append((score, p))
+        sim = sim_map.get(p.id)
+        if sim is not None:
+            # Embedding similarity is in [~0.6, ~0.95] for plausible
+            # matches — scale to a 0-100ish band for readability.
+            rank_score = 100.0 * float(sim)
+        else:
+            # Keyword-only match — score via the legacy token scorer
+            # so it's ordered sensibly, but capped below any real
+            # embedding hit.
+            kw = score_product_against_expansion(
+                title=p.title or "",
+                ai_tags=p.ai_tags or "",
+                product_category=p.product_category or "",
+                subniche=p.subniche or "",
+                product_type=p.product_type or "",
+                handle=p.handle or "",
+                exp=exp,
+            )
+            rank_score = min(59.0, float(kw))
+        scored.append((rank_score, p))
 
     if not scored:
         return []
 
-    # 5. Sort by score desc, then by current_position asc (tie-break
-    #    on bestseller rank — lower is better).
+    # Sort by rank_score desc, then bestseller position asc.
     scored.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
 
     # 6. STRICT MATCH JUDGE (Gemini). For every candidate, Gemini
@@ -1874,6 +1910,83 @@ async def admin_backfill_vision(
         "elapsed_seconds": round(elapsed, 1),
         "errors": errors[:5],
         "sample": sample,
+    }
+
+
+@app.post("/api/admin/backfill-embeddings")
+async def admin_backfill_embeddings(
+    limit: int = Query(500, ge=1, le=2000),
+    force: bool = Query(False),
+    store_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Compute semantic embeddings for products. FAST — the embedding
+    API batches 100 texts per call, so the whole fashion catalog
+    (~5000 products) embeds in ~2-3 minutes for ~2 cents, vs. hours
+    for per-image vision.
+
+    Embedding source text = title + vision_description + cleaned tags.
+    Idempotent: skips products whose embedding_text hasn't changed
+    (unless force=true). Invalidates the in-memory search index so the
+    next query picks up the new vectors.
+    """
+    from embeddings import (
+        embed_texts, build_embedding_text, invalidate_index,
+    )
+    import time
+
+    q = db.query(Product)
+    if store_id is not None:
+        q = q.filter(Product.store_id == store_id)
+    if not force:
+        q = q.filter(Product.embedding.is_(None))
+    q = q.order_by(Product.last_scraped.desc()).limit(limit)
+    products = q.all()
+    if not products:
+        return {"processed": 0, "embedded": 0, "message": "no candidates"}
+
+    texts = [
+        build_embedding_text(
+            title=p.title or "",
+            vision_description=getattr(p, "vision_description", "") or "",
+            ai_tags=p.ai_tags or "",
+        )
+        for p in products
+    ]
+
+    t0 = time.monotonic()
+    vectors = await embed_texts(texts)
+    elapsed = time.monotonic() - t0
+
+    embedded = 0
+    for p, txt, vec in zip(products, texts, vectors):
+        if vec is not None:
+            p.embedding = json.dumps(vec)
+            p.embedding_text = txt[:2000]
+            embedded += 1
+    db.commit()
+    invalidate_index()
+
+    return {
+        "processed": len(products),
+        "embedded": embedded,
+        "elapsed_seconds": round(elapsed, 1),
+        "sample_text": texts[0][:300] if texts else "",
+    }
+
+
+@app.get("/api/debug/embeddings")
+async def debug_embeddings(db: Session = Depends(get_db)):
+    """Report embedding index stats + coverage."""
+    from embeddings import index_stats, ensure_index
+    total = db.query(Product).count()
+    with_emb = db.query(Product).filter(Product.embedding.isnot(None)).count()
+    ensure_index(db)
+    return {
+        "products_total": total,
+        "products_with_embedding": with_emb,
+        "coverage_pct": round(100.0 * with_emb / total, 1) if total else 0.0,
+        "index": index_stats(),
     }
 
 

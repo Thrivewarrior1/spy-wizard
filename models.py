@@ -93,6 +93,20 @@ class Product(Base):
     # controlled-vocab tag was "over-the-knee-boots".
     vision_description = Column(Text, nullable=True)
 
+    # Semantic embedding vector (JSON array of 768 floats) from
+    # gemini-embedding-001, computed over title + vision_description
+    # + cleaned tags. This is the PRIMARY search retrieval signal:
+    # the query is embedded the same way and products are ranked by
+    # cosine similarity. Multilingual by construction — an English
+    # query "knee-high boots" retrieves German "Kniehohe Stiefel" and
+    # French "Bottes hautes" products with no translation step, and
+    # semantic — "summer dress" retrieves "light floral sundress"
+    # with zero shared keywords.
+    embedding = Column(Text, nullable=True)
+    # The exact text that was embedded — used for idempotency (skip
+    # re-embedding when the source text hasn't changed) and debugging.
+    embedding_text = Column(Text, nullable=True)
+
     store = relationship("Store", back_populates="products")
     history = relationship(
         "PositionHistory",
