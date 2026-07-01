@@ -2630,6 +2630,17 @@ async def debug_gemini():
         ],
     }
 
+@app.get("/healthz")
+async def healthz():
+    """Trivial liveness probe for Render's health check. Does NO
+    database work — returns instantly so the health check can never
+    fail on DB slowness / load and trigger a restart loop. The old
+    health check path (/api/stats) iterates every store's products
+    + label events over 7000+ rows, which under memory pressure was
+    slow enough to fail Render's probe and crash-loop the instance."""
+    return {"ok": True}
+
+
 @app.get("/api/stats")
 async def get_stats(
     days: int = Query(1, ge=1, le=LABEL_EVENT_RETENTION_DAYS),

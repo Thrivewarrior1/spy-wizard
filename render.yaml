@@ -28,7 +28,11 @@ services:
     branch: main
     autoDeploy: true
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /api/stats
+    # Trivial DB-free liveness probe. Was /api/stats, which iterates
+    # every store's products + label events over 7000+ rows — under
+    # memory pressure it was slow enough to fail the probe and
+    # crash-loop the instance.
+    healthCheckPath: /healthz
     envVars:
       # DB connection auto-wired from the spy-wizard-db block above.
       - key: DATABASE_URL
