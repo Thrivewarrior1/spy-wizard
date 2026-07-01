@@ -331,7 +331,46 @@ function _syncGlobalDaysPill(){
 // "(last 7 days)", etc.). Single source of truth for window phrasing.
 function _windowLabel(d){return d===1?'(today)':`(last ${d} days)`}
 
-function debounceSearch(fn){clearTimeout(searchTimer);searchTimer=setTimeout(fn,400)}
+// Longer debounce for search: each search is an expensive semantic
+// query (embedding + Gemini judge, can take 30-90s cold). 400ms fired
+// a fresh query on nearly every keystroke-pause, wasting API calls and
+// racing responses. 700ms waits for the user to actually stop typing.
+function debounceSearch(fn){clearTimeout(searchTimer);searchTimer=setTimeout(fn,700)}
+
+// Per-grid load guard. Fixes the "1-2 results show, then the rest pop
+// in 60s later" bug: as the user types, several searches fire, and
+// without this an earlier (shorter-query) response would overwrite the
+// spinner with partial results before the final full response arrived.
+//
+// _loadGrid guarantees ATOMIC rendering per grid:
+//   - each call bumps a generation counter for that grid
+//   - the previous in-flight fetch is aborted
+//   - the spinner stays up until the LATEST request fully completes
+//   - a stale/superseded response is ignored (never rendered)
+// Result: loading -> (wait for everything) -> all results at once.
+const _gridState={};
+function _loadGrid(gridId, url, emptyMsg){
+  const st=_gridState[gridId]||(_gridState[gridId]={gen:0,controller:null});
+  if(st.controller){try{st.controller.abort();}catch(e){}}
+  const myGen=++st.gen;
+  const controller=(typeof AbortController!=='undefined')?new AbortController():null;
+  st.controller=controller;
+  const el=document.getElementById(gridId);
+  el.innerHTML='<div class="loading"><div class="spinner"></div>Searching… loading all results</div>';
+  const opts=controller?{signal:controller.signal}:{};
+  return fetch(url,opts)
+    .then(r=>r.json())
+    .then(products=>{
+      if(myGen!==st.gen)return;            // superseded by a newer search
+      if(!products.length){el.innerHTML=`<div class="empty">${emptyMsg}</div>`;return}
+      el.innerHTML=products.map((p,i)=>card(p,i+1)).join('');
+    })
+    .catch(err=>{
+      if(err&&err.name==='AbortError')return; // cancelled — ignore
+      if(myGen!==st.gen)return;
+      el.innerHTML='<div class="empty">Failed to load.</div>';
+    });
+}
 
 function loadStats(){
   const feed=_feedForCounter();
@@ -353,11 +392,7 @@ function loadCombined(){
   const search=document.getElementById('searchAll').value;
   let url=`${API}/bestsellers/combined?sort=${sort}&limit=300&label=${cFilter}&days=${globalDays}`;
   if(search)url+=`&search=${encodeURIComponent(search)}`;
-  document.getElementById('gridAll').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
-  fetch(url).then(r=>r.json()).then(products=>{
-    if(!products.length){document.getElementById('gridAll').innerHTML='<div class="empty">No products found. Click "Scrape All Stores" to fetch data.</div>';return}
-    document.getElementById('gridAll').innerHTML=products.map((p,i)=>card(p,i+1)).join('')
-  }).catch(()=>document.getElementById('gridAll').innerHTML='<div class="empty">Failed to load.</div>')
+  _loadGrid('gridAll', url, 'No products found. Click "Scrape All Stores" to fetch data.');
 }
 
 function loadStore(){
@@ -366,11 +401,7 @@ function loadStore(){
   const search=document.getElementById('searchStore').value;
   let url=`${API}/bestsellers/store/${id}?sort=${sort}&limit=300&label=${sFilter}&days=${globalDays}`;
   if(search)url+=`&search=${encodeURIComponent(search)}`;
-  document.getElementById('gridStore').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
-  fetch(url).then(r=>r.json()).then(products=>{
-    if(!products.length){document.getElementById('gridStore').innerHTML='<div class="empty">No products found for this store.</div>';return}
-    document.getElementById('gridStore').innerHTML=products.map((p,i)=>card(p,i+1)).join('')
-  })
+  _loadGrid('gridStore', url, 'No products found for this store.');
 }
 
 // === General tab ===
@@ -379,11 +410,7 @@ function loadCombinedGeneral(){
   const search=document.getElementById('searchAllG').value;
   let url=`${API}/general/combined?sort=${sort}&limit=100&label=${gFilter}&days=${globalDays}`;
   if(search) url+=`&search=${encodeURIComponent(search)}`;
-  document.getElementById('gridAllG').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
-  fetch(url).then(r=>r.json()).then(products=>{
-    if(!products.length){document.getElementById('gridAllG').innerHTML='<div class="empty">No general products found yet. Run a scrape to populate this tab.</div>';return}
-    document.getElementById('gridAllG').innerHTML=products.map((p,i)=>card(p,i+1)).join('')
-  }).catch(()=>document.getElementById('gridAllG').innerHTML='<div class="empty">Failed to load.</div>')
+  _loadGrid('gridAllG', url, 'No general products found yet. Run a scrape to populate this tab.');
 }
 
 function loadStoreGeneral(){
@@ -392,11 +419,7 @@ function loadStoreGeneral(){
   const search=document.getElementById('searchStoreG').value;
   let url=`${API}/general/store/${id}?sort=${sort}&limit=100&label=${sgFilter}&days=${globalDays}`;
   if(search)url+=`&search=${encodeURIComponent(search)}`;
-  document.getElementById('gridStoreG').innerHTML='<div class="loading"><div class="spinner"></div>Loading...</div>';
-  fetch(url).then(r=>r.json()).then(products=>{
-    if(!products.length){document.getElementById('gridStoreG').innerHTML='<div class="empty">No general products for this store.</div>';return}
-    document.getElementById('gridStoreG').innerHTML=products.map((p,i)=>card(p,i+1)).join('')
-  })
+  _loadGrid('gridStoreG', url, 'No general products for this store.');
 }
 
 function loadStoresG(){
