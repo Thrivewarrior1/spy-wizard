@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel
@@ -1278,42 +1278,62 @@ async def hybrid_search(
         and len(scored) >= 1
     )
     if judge_enabled:
-        top_n = min(100, len(scored))
+        # Judge up to 150 candidates for completeness (don't miss a
+        # real match ranked in the tail). To keep it FAST, split into
+        # small batches and run them CONCURRENTLY — one 150-product
+        # Gemini call takes 60-90s (the model generates 150 verdicts
+        # serially); 6 parallel calls of 25 finish in the time of the
+        # slowest single call (~15-25s). Wall time ~4x faster.
+        top_n = min(150, len(scored))
+        page = scored[:top_n]
         judge_candidates = [
             {
                 "id": p.id,
                 "title": p.title or "",
                 "ai_tags": p.ai_tags or "",
                 "subniche": p.subniche or "",
-                # THE ground-truth field — a natural-language
-                # description of what's actually in the product photo,
-                # written by Gemini vision at scrape/backfill time.
-                # The judge is instructed to trust this over the
-                # title and reasons semantically about match — no
-                # exact tag match required.
+                # Ground-truth: a natural-language description of what's
+                # actually in the product photo (vision model). The
+                # judge trusts this over the title and reasons
+                # SEMANTICALLY — no exact tag match required.
                 "vision_description": getattr(p, "vision_description", None) or "",
             }
-            for _, p in scored[:top_n]
+            for _, p in page
         ]
-        try:
-            verdicts = await rerank_with_gemini(s, judge_candidates)
-        except Exception as e:
-            logger.warning(
-                "hybrid_search: strict judge failed: %s — falling back to hybrid order",
-                e,
-            )
-            verdicts = [
-                {"idx": i, "match": True, "reason": "judge errored"}
-                for i in range(top_n)
-            ]
-        match_by_idx = {v["idx"]: v["match"] for v in verdicts}
-        kept = []
-        for i, (orig_score, p) in enumerate(scored[:top_n]):
-            if match_by_idx.get(i, False):
-                kept.append((orig_score, p))
+
+        BATCH = 25
+        batches = [
+            judge_candidates[i:i + BATCH]
+            for i in range(0, len(judge_candidates), BATCH)
+        ]
+
+        async def _judge_batch(batch):
+            try:
+                return await rerank_with_gemini(s, batch)
+            except Exception as e:
+                logger.warning("hybrid_search: judge batch failed: %s", e)
+                # Fail-open for this batch — keep its items.
+                return [{"idx": i, "match": True, "reason": "batch error"}
+                        for i in range(len(batch))]
+
+        batch_verdicts = await asyncio.gather(*[_judge_batch(b) for b in batches])
+
+        # Flatten verdicts back to global candidate indices.
+        match_global: dict[int, bool] = {}
+        for bi, verdicts in enumerate(batch_verdicts):
+            base = bi * BATCH
+            for v in verdicts:
+                gi = base + v["idx"]
+                if 0 <= gi < len(page):
+                    match_global[gi] = v["match"]
+
+        kept = [
+            (orig_score, p)
+            for gi, (orig_score, p) in enumerate(page)
+            if match_global.get(gi, False)
+        ]
         kept.sort(key=lambda sp: (-sp[0], sp[1].current_position or 999999))
-        # NO tail. Strict mode means: only items the judge approved.
-        # Anything in scored[top_n:] wasn't judged → not shown.
+        # NO tail — only judge-approved items are shown.
         scored = kept
 
     return [p for _, p in scored[:limit]]
@@ -1391,13 +1411,18 @@ async def get_combined_bestsellers(
         pairs = pairs[:limit]
         return _label_events_to_product_dicts(pairs, is_fashion=True)
 
-    query = db.query(Product).join(Store).filter(Product.is_fashion == True)
+    # joinedload(Product.store) eager-loads each product's Store in the
+    # same query — kills the N+1 that made _product_dict fire a lazy
+    # store lookup per product.
+    query = (
+        db.query(Product)
+        .options(joinedload(Product.store))
+        .filter(Product.is_fashion == True)
+    )
     query = _apply_label_filter(query, db, label)
 
     if search and search.strip():
-        # AI-powered search: Gemini query expansion + OR-merged
-        # prefilter + Python scoring + Gemini re-rank top 50. See
-        # hybrid_search() docstring for the full pipeline.
+        # AI-powered search: semantic embedding recall + Gemini judge.
         products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
     else:
         products = query.all()
@@ -1411,9 +1436,7 @@ async def get_combined_bestsellers(
     # else: leave hybrid_search's relevance order intact when search
     # is active (no explicit secondary sort).
 
-    label_map = _compute_label_map(db, products)
-    products = _filter_products_by_computed_label(products, label_map, label)
-    products = products[:limit]
+    products, label_map = _labels_for_page(db, products, label, limit)
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
 
@@ -1429,15 +1452,17 @@ async def get_store_bestsellers(
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
-    query = db.query(Product).filter(Product.store_id == store_id, Product.is_fashion == True)
+    query = (
+        db.query(Product)
+        .options(joinedload(Product.store))
+        .filter(Product.store_id == store_id, Product.is_fashion == True)
+    )
     query = _apply_label_filter(query, db, label)
     if search and search.strip():
         products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
     else:
         products = query.order_by(Product.current_position).all()
-    label_map = _compute_label_map(db, products)
-    products = _filter_products_by_computed_label(products, label_map, label)
-    products = products[:limit]
+    products, label_map = _labels_for_page(db, products, label, limit)
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
 # =====================================================================
@@ -1513,6 +1538,30 @@ def _store_catalog_sizes(db: Session, store_ids: set, *, is_fashion: bool) -> di
         q = q.filter(Product.is_fashion == False, Product.subniche != "")
     rows = q.group_by(Product.store_id).all()
     return {sid: cnt for sid, cnt in rows}
+
+
+def _labels_for_page(db: Session, products: list, label, limit: int):
+    """Return (page_products, label_map) computing hero/villain labels
+    ONLY for the products actually shown.
+
+    Perf fix: the no-search feed used to compute labels for ALL ~2900
+    fashion products, then slice to `limit` (300). That's a giant
+    PositionHistory query for rows that are never displayed. When the
+    label isn't a filter we care about (None / 'all'), slice FIRST and
+    compute labels for just the visible page — cuts the label query
+    from ~2900 ids to ~300, taking the endpoint from ~8s to ~1s.
+
+    For label='normal'/'new', we still need labels for every product
+    before filtering, so those keep the compute-then-filter path.
+    """
+    if label in (None, "", "all"):
+        page = products[:limit]
+        return page, _compute_label_map(db, page)
+    # Label acts as a filter (normal / new): need labels for all, then
+    # filter, then slice.
+    label_map = _compute_label_map(db, products)
+    filtered = _filter_products_by_computed_label(products, label_map, label)
+    return filtered[:limit], label_map
 
 
 def _compute_label_map(db: Session, products: list) -> dict:
@@ -1654,9 +1703,13 @@ def _product_dict(p, label_info=None):
 
 
 def _general_base_query(db: Session, store_id: Optional[int] = None):
-    q = db.query(Product).join(Store).filter(
-        Product.is_fashion == False,
-        Product.subniche != "",
+    q = (
+        db.query(Product)
+        .options(joinedload(Product.store))
+        .filter(
+            Product.is_fashion == False,
+            Product.subniche != "",
+        )
     )
     if store_id is not None:
         q = q.filter(Product.store_id == store_id)
@@ -1719,9 +1772,7 @@ async def get_combined_general(
         products.sort(key=lambda p: p.current_position)
     # else: leave hybrid_search relevance order intact
 
-    label_map = _compute_label_map(db, products)
-    products = _filter_products_by_computed_label(products, label_map, label)
-    products = products[:limit]
+    products, label_map = _labels_for_page(db, products, label, limit)
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
 
@@ -1743,9 +1794,7 @@ async def get_store_general(
         products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
     else:
         products = query.order_by(Product.current_position).all()
-    label_map = _compute_label_map(db, products)
-    products = _filter_products_by_computed_label(products, label_map, label)
-    products = products[:limit]
+    products, label_map = _labels_for_page(db, products, label, limit)
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
 
