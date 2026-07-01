@@ -235,6 +235,13 @@ def widen_text_columns():
         # produced it. Primary multilingual search-retrieval signal.
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS embedding TEXT NULL",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS embedding_text TEXT NULL",
+        # Feed-page indexes: the fashion / general / per-store feeds do
+        # ORDER BY current_position + LIMIT. Without these the free-tier
+        # Postgres full-scans + sorts 7000+ rows on every page load
+        # (the slow-initial-load the user hit). Composite so the DB can
+        # satisfy the filter AND the sort from one index.
+        "CREATE INDEX IF NOT EXISTS ix_products_fashion_pos ON products(is_fashion, current_position)",
+        "CREATE INDEX IF NOT EXISTS ix_products_store_pos ON products(store_id, current_position)",
         "CREATE INDEX IF NOT EXISTS ix_products_product_category ON products(product_category)",
         # Persistent hero/villain event log. Table created via
         # Base.metadata.create_all on first boot; these statements are

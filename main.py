@@ -1424,17 +1424,11 @@ async def get_combined_bestsellers(
     if search and search.strip():
         # AI-powered search: semantic embedding recall + Gemini judge.
         products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
+        if sort == "volume":
+            products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position or 0))
+        # else keep hybrid relevance order
     else:
-        products = query.all()
-
-    if sort == "volume":
-        products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position))
-    elif sort == "low-high":
-        products.sort(key=lambda p: (-p.current_position,))
-    elif sort == "high-low":
-        products.sort(key=lambda p: p.current_position)
-    # else: leave hybrid_search's relevance order intact when search
-    # is active (no explicit secondary sort).
+        products = _fetch_feed_no_search(query, sort, label, limit)
 
     products, label_map = _labels_for_page(db, products, label, limit)
     return [_product_dict(p, label_map.get(p.id)) for p in products]
@@ -1461,7 +1455,7 @@ async def get_store_bestsellers(
     if search and search.strip():
         products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
     else:
-        products = query.order_by(Product.current_position).all()
+        products = _fetch_feed_no_search(query, sort, label, limit)
     products, label_map = _labels_for_page(db, products, label, limit)
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
@@ -1538,6 +1532,36 @@ def _store_catalog_sizes(db: Session, store_ids: set, *, is_fashion: bool) -> di
         q = q.filter(Product.is_fashion == False, Product.subniche != "")
     rows = q.group_by(Product.store_id).all()
     return {sid: cnt for sid, cnt in rows}
+
+
+def _fetch_feed_no_search(query, sort: str, label, limit: int) -> list:
+    """Fetch the visible feed page for the NO-SEARCH case, pushing the
+    sort + limit into SQL so the DB returns ~limit rows instead of the
+    whole ~2900-product catalog. This is THE fix for the slow initial
+    load: `query.all()` was pulling every fashion product (with joined
+    store) into memory on the free-tier Postgres before slicing to 300.
+
+    Only two paths still load everything:
+      - sort == 'volume' (rare) — visitor parsing happens in Python.
+      - label in ('normal','new') — those filter on a computed label
+        that isn't in SQL, so all rows are needed before filtering.
+    """
+    wants_all = (sort == "volume") or (label not in (None, "", "all"))
+    if wants_all:
+        products = query.all()
+        if sort == "volume":
+            products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position or 0))
+        elif sort == "low-high":
+            products.sort(key=lambda p: -(p.current_position or 0))
+        elif sort == "high-low":
+            products.sort(key=lambda p: (p.current_position or 0))
+        return products
+    # Common fast path: SQL ORDER BY + LIMIT.
+    order = (
+        Product.current_position.desc() if sort == "low-high"
+        else Product.current_position.asc()
+    )
+    return query.order_by(order).limit(limit).all()
 
 
 def _labels_for_page(db: Session, products: list, label, limit: int):
@@ -1761,16 +1785,10 @@ async def get_combined_general(
 
     if search and search.strip():
         products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
+        if sort == "volume":
+            products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position or 0))
     else:
-        products = query.all()
-
-    if sort == "volume":
-        products.sort(key=lambda p: (-parse_visitors(p.store.monthly_visitors), p.current_position))
-    elif sort == "low-high":
-        products.sort(key=lambda p: (-p.current_position,))
-    elif sort == "high-low":
-        products.sort(key=lambda p: p.current_position)
-    # else: leave hybrid_search relevance order intact
+        products = _fetch_feed_no_search(query, sort, label, limit)
 
     products, label_map = _labels_for_page(db, products, label, limit)
     return [_product_dict(p, label_map.get(p.id)) for p in products]
@@ -1793,7 +1811,7 @@ async def get_store_general(
     if search and search.strip():
         products = await hybrid_search(db, query, search.strip(), limit=limit * 3)
     else:
-        products = query.order_by(Product.current_position).all()
+        products = _fetch_feed_no_search(query, sort, label, limit)
     products, label_map = _labels_for_page(db, products, label, limit)
     return [_product_dict(p, label_map.get(p.id)) for p in products]
 
@@ -2704,6 +2722,10 @@ async def healthz():
     return {"ok": True}
 
 
+_STATS_CACHE: dict = {}
+_STATS_TTL = 60.0  # seconds
+
+
 @app.get("/api/stats")
 async def get_stats(
     days: int = Query(1, ge=1, le=LABEL_EVENT_RETENTION_DAYS),
@@ -2714,18 +2736,21 @@ async def get_stats(
     `days` window AND the active tab — Fashion tab counts only
     fashion-feed events; General tab counts only general-feed events.
 
-    `feed` query param:
-      - "fashion"  → is_fashion=True
-      - "general"  → is_fashion=False
-      - omitted    → BOTH feeds combined (backward-compat for older
-                     clients; new UI always sends explicit feed)
-
-    Source of truth is the LabelEvent ledger (same as the feed
-    endpoints) — de-duplicated by product_id, taking the most recent
-    qualifying event per product. Pre-DATA_START_DATE events are
-    excluded by fetch_label_events_window so the numbers here always
-    match what the user sees in the hero/villain filtered grids.
+    Result is cached for 60s per (days, feed) — the counts only change
+    after a scrape, so recomputing the label-event windows on every
+    page load (it was ~20s) is wasteful and made the page feel slow.
     """
+    # 60s TTL cache. Disabled under pytest (PYTEST_CURRENT_TEST set) so
+    # tests that seed different data and re-query see fresh counts.
+    import time as _time
+    _cache_on = "PYTEST_CURRENT_TEST" not in os.environ
+    ck = (days, feed)
+    now_m = _time.monotonic()
+    if _cache_on:
+        hit = _STATS_CACHE.get(ck)
+        if hit and (now_m - hit[0]) < _STATS_TTL:
+            return hit[1]
+
     total_stores = db.query(Store).count()
     total_products = db.query(Product).filter(Product.is_fashion == True).count()
     # Resolve `feed` to the is_fashion arg fetch_label_events_window expects:
@@ -2817,7 +2842,7 @@ async def get_stats(
             len(unhealthy_stores),
             [u["name"] for u in unhealthy_stores],
         )
-    return {
+    result = {
         "stores": total_stores,
         "products": total_products,
         "heroes": heroes,
@@ -2827,6 +2852,9 @@ async def get_stats(
         "data_start_date": DATA_START_DATE.date().isoformat(),
         "unhealthy_stores": unhealthy_stores,
     }
+    if _cache_on:
+        _STATS_CACHE[ck] = (now_m, result)
+    return result
 
 # --- Serve Frontend ---
 frontend_path = os.path.dirname(__file__)
