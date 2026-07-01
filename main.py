@@ -1842,12 +1842,27 @@ async def admin_backfill_vision(
         processed += 1
     db.commit()
 
+    # Sample first 3 products' tags AFTER commit for observability.
+    sample = []
+    for prod in products[:3]:
+        db.refresh(prod)
+        sample.append({
+            "id": prod.id,
+            "title": (prod.title or "")[:60],
+            "ai_tags": (prod.ai_tags or "")[:250],
+            "vision_classified_at": (
+                prod.vision_classified_at.isoformat()
+                if prod.vision_classified_at else None
+            ),
+        })
+
     return {
         "processed": processed,
         "vision_classified": classified,
         "flagged_not_a_product": skipped_not_a_product,
         "elapsed_seconds": round(elapsed, 1),
         "errors": errors[:5],
+        "sample": sample,
     }
 
 
