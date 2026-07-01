@@ -74,10 +74,24 @@ class Product(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     # Timestamp of the last successful image-based classification.
     # Populated by classify_images_batch (image_classifier.py) — used
-    # by the backfill endpoint to skip products whose ai_tags already
-    # contain `img:*` tokens and by observability to answer "when was
+    # by the backfill endpoint to skip products whose vision has
+    # already been analysed and by observability to answer "when was
     # this product last seen by the vision model?".
     vision_classified_at = Column(DateTime, nullable=True, index=True)
+
+    # Natural-language description of what the product looks like in
+    # the image (1-3 sentences: silhouette, cut, length, gender
+    # presentation, colors, materials, distinctive features, occasion
+    # inference). Written by the vision classifier at scrape time.
+    #
+    # Used by the strict search judge INSTEAD of tag matching — the
+    # judge reads the description and reasons semantically about
+    # whether it satisfies the user's query. This is the fix for the
+    # "knee-high boots misses when tag says over-the-knee" problem:
+    # a description like "tall black boots reaching just below the
+    # knee" wins for a "knee-high boots" query even though the
+    # controlled-vocab tag was "over-the-knee-boots".
+    vision_description = Column(Text, nullable=True)
 
     store = relationship("Store", back_populates="products")
     history = relationship(

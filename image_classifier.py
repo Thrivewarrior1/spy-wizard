@@ -95,6 +95,7 @@ PROMPT_TEXT = """You are a fashion / e-commerce product vision classifier. You w
 
 Output JSON:
 {
+  "description":  "<1-3 sentence natural-language description of what the image shows — see DESCRIPTION RULES below>",
   "product_type": "<one of the FINE_TYPES below, or 'other'>",
   "gender":       "<women | men | unisex | kids | unknown>",
   "colors":       "<comma-separated from COLORS>",
@@ -104,6 +105,45 @@ Output JSON:
   "confidence":   "<high | medium | low>",
   "not_a_product": <true if the image is a logo, banner, size chart, empty scene, or non-product>
 }
+
+DESCRIPTION RULES (the MOST important field — the search judge reads
+this directly and reasons about semantic match against the user's
+query):
+- Write 1-3 short sentences (max ~300 characters) describing what
+  is ACTUALLY IN THE IMAGE.
+- Cover EVERY axis a shopper might search by:
+    * exact product category ("knee-high boots" not just "boots";
+      "cocktail dress" not just "dress"; "puffer jacket" not
+      "jacket"; "lederhosen" not "pants";)
+    * length / height / silhouette ("reaching just below the knee",
+      "floor-length", "ankle-length", "cropped at the waist",
+      "oversized fit", "bodycon fit")
+    * gender presentation ("women's", "men's", "unisex")
+    * dominant colors and pattern ("black", "floral print",
+      "cream and beige")
+    * material or texture cues ("leather", "quilted", "satin",
+      "sequin", "chiffon", "knit")
+    * key style features ("pointed toe", "sweetheart neckline",
+      "high split", "cargo pockets", "faux-fur trim", "hooded")
+    * intended occasion ("evening formal", "casual streetwear",
+      "athletic sportswear", "beach vacation")
+- Use everyday English shopping vocabulary the way a real shopper
+  would describe the product to a friend. Do NOT use tag syntax
+  (no "knee-high-boots" hyphenated tokens — write "knee-high boots").
+- Do NOT include marketing language, brand names, or price info.
+- WORKED EXAMPLES (aim for this level of specificity):
+    "Tall black leather knee-high boots on a mannequin, reaching
+     just below the knee with a pointed toe and low block heel.
+     Sleek fitted silhouette for women's evening or workwear."
+    "A short women's puffer jacket in bright red with a hood and
+     zip front. Quilted channels typical of a down puffer,
+     mid-hip length, suitable for cold-weather casual wear."
+    "Bavarian men's lederhosen — traditional brown leather
+     knee-length shorts with green suspenders and embroidered
+     detailing. Oktoberfest / cultural costume style."
+    "A casual women's linen shirt-and-shorts summer set in beige.
+     Short-sleeve button-up top with matching mid-thigh shorts.
+     Beach/resort styling — this is NOT athletic sportswear."
 
 FINE_TYPES (pick exactly ONE):
   # Footwear
@@ -197,6 +237,7 @@ Return ONLY the JSON object, no prose."""
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
+        "description":   {"type": "string"},
         "product_type":  {"type": "string"},
         "gender":        {"type": "string"},
         "colors":        {"type": "string"},
@@ -206,7 +247,7 @@ RESPONSE_SCHEMA = {
         "confidence":    {"type": "string"},
         "not_a_product": {"type": "boolean"},
     },
-    "required": ["product_type", "gender", "colors", "confidence", "not_a_product"],
+    "required": ["description", "product_type", "gender", "colors", "confidence", "not_a_product"],
 }
 
 
@@ -445,6 +486,9 @@ async def classify_images_batch(
             # Success: mutate the product dict.
             existing = p.get("ai_tags") or ""
             p["ai_tags"] = _render_tags(vision_json, existing)
+            p["vision_description"] = (
+                (vision_json.get("description") or "").strip()
+            )
             p["vision_type"] = (vision_json.get("product_type") or "").lower()
             p["vision_confidence"] = (vision_json.get("confidence") or "").lower()
             p["vision_classified"] = True

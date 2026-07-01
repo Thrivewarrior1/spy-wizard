@@ -607,6 +607,32 @@ _RERANK_PROMPT_TEMPLATE = """You are the STRICT MATCH JUDGE for a product search
 
 The user searched: {query!r}
 
+For each candidate below you will see:
+  vision_description — a natural-language description of what is
+    ACTUALLY IN THE IMAGE (written by a vision model looking at the
+    product photo). This is the ground truth about the product's
+    real category, shape, silhouette, color, material, gender,
+    length/height, and occasion. TRUST THIS FIELD over the title.
+  title — the merchant's raw title. Often vague ("Women's Boots",
+    "Elegant Dress") or SEO-stuffed. Cross-reference but do NOT
+    trust in isolation.
+  ai_tags — comma-separated keyword tags. Useful as a fallback ONLY
+    when vision_description is missing / empty.
+
+Decide match=true ONLY if the vision_description makes it
+unambiguously clear that this product matches EVERY constraint the
+user's query implies:
+  - the specific product sub-type ("knee-high boots" -> the
+    description must say the boots reach the knee or above; if it
+    says "ankle" or "mid-calf", match=false)
+  - gender (query says "for women" -> the description must indicate
+    women's / feminine styling)
+  - color / material / occasion if those are explicit in the query
+
+When the description is empty or the required attribute is not
+mentioned at all, prefer match=false — the user prefers zero
+results to inaccurate ones.
+
 For EACH of the {n} candidate products below, decide if it EXACTLY matches every constraint in the user's query. Be RUTHLESSLY STRICT. The user explicitly prefers ZERO results over inaccurate results.
 
 DROP a product (match=false) if ANY constraint is wrong:
@@ -765,11 +791,14 @@ async def rerank_with_gemini(
         cache_key = None
 
     # Trim each candidate dict to just the fields the judge needs.
+    # vision_description is FIRST because it's the ground-truth
+    # signal — the judge is instructed to trust it over the title.
     items_for_prompt = [
         {
             "idx": i,
+            "vision_description": (c.get("vision_description") or "")[:400],
             "title": (c.get("title") or "")[:200],
-            "ai_tags": (c.get("ai_tags") or "")[:300],
+            "ai_tags": (c.get("ai_tags") or "")[:200],
             "subniche": (c.get("subniche") or "")[:30],
         }
         for i, c in enumerate(candidates)

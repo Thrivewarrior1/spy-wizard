@@ -1235,6 +1235,13 @@ async def hybrid_search(
                 "title": p.title or "",
                 "ai_tags": p.ai_tags or "",
                 "subniche": p.subniche or "",
+                # THE ground-truth field — a natural-language
+                # description of what's actually in the product photo,
+                # written by Gemini vision at scrape/backfill time.
+                # The judge is instructed to trust this over the
+                # title and reasons semantically about match — no
+                # exact tag match required.
+                "vision_description": getattr(p, "vision_description", None) or "",
             }
             for _, p in scored[:top_n]
         ]
@@ -1836,6 +1843,9 @@ async def admin_backfill_vision(
         if d.get("vision_classified"):
             classified += 1
             prod.ai_tags = d.get("ai_tags") or prod.ai_tags
+            prod.vision_description = (
+                d.get("vision_description") or prod.vision_description
+            )
             prod.vision_classified_at = now
             if d.get("_excluded"):
                 skipped_not_a_product += 1
@@ -1849,7 +1859,8 @@ async def admin_backfill_vision(
         sample.append({
             "id": prod.id,
             "title": (prod.title or "")[:60],
-            "ai_tags": (prod.ai_tags or "")[:250],
+            "vision_description": prod.vision_description,
+            "ai_tags": (prod.ai_tags or "")[:150],
             "vision_classified_at": (
                 prod.vision_classified_at.isoformat()
                 if prod.vision_classified_at else None

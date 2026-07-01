@@ -227,6 +227,10 @@ def widen_text_columns():
         # can skip already-processed rows.
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS vision_classified_at TIMESTAMP NULL",
         "CREATE INDEX IF NOT EXISTS ix_products_vision_classified_at ON products (vision_classified_at)",
+        # Natural-language description from the vision model. Read by
+        # the strict search judge for semantic matching (no exact-tag
+        # match required).
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS vision_description TEXT NULL",
         "CREATE INDEX IF NOT EXISTS ix_products_product_category ON products(product_category)",
         # Persistent hero/villain event log. Table created via
         # Base.metadata.create_all on first boot; these statements are
