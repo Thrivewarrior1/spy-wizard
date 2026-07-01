@@ -125,7 +125,7 @@ async def _embed_missing_products(db, *, cap: int = 6000) -> int:
     after every scrape so newly-scraped products join the semantic
     search index automatically. Fast — batches of 100 per API call."""
     from embeddings import (
-        embed_texts, build_embedding_text, invalidate_index,
+        embed_texts, build_embedding_text, invalidate_index, encode_vector,
     )
     pending = (
         db.query(Product)
@@ -150,7 +150,7 @@ async def _embed_missing_products(db, *, cap: int = 6000) -> int:
         vectors = await embed_texts(texts)
         for p, txt, vec in zip(chunk, texts, vectors):
             if vec is not None:
-                p.embedding = json.dumps(vec)
+                p.embedding = encode_vector(vec)
                 p.embedding_text = txt[:2000]
                 total += 1
         db.commit()
@@ -1931,7 +1931,7 @@ async def admin_backfill_embeddings(
     next query picks up the new vectors.
     """
     from embeddings import (
-        embed_texts, build_embedding_text, invalidate_index,
+        embed_texts, build_embedding_text, invalidate_index, encode_vector,
     )
     import time
 
@@ -1961,7 +1961,7 @@ async def admin_backfill_embeddings(
     embedded = 0
     for p, txt, vec in zip(products, texts, vectors):
         if vec is not None:
-            p.embedding = json.dumps(vec)
+            p.embedding = encode_vector(vec)
             p.embedding_text = txt[:2000]
             embedded += 1
     db.commit()

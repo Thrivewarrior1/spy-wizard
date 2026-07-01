@@ -41,9 +41,11 @@ Cosine similarity over the whole matrix is a single numpy matvec
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import struct
 import threading
 from typing import Optional
 
@@ -218,8 +220,28 @@ def invalidate_index() -> None:
         _INDEX["loaded"] = False
 
 
+def encode_vector(vec: list[float]) -> str:
+    """Compact storage: pack floats as little-endian float32 bytes and
+    base64-encode. ~4KB per 768-dim vector vs ~10KB for JSON, and
+    decoding via frombuffer avoids building a huge list of Python
+    float objects (the memory spike that can OOM a 512MB instance
+    when loading thousands of vectors). Prefixed 'b64:' so the loader
+    can distinguish it from legacy JSON storage."""
+    buf = struct.pack("<%df" % len(vec), *[float(x) for x in vec])
+    return "b64:" + base64.b64encode(buf).decode("ascii")
+
+
 def _parse_vector(raw: str):
+    """Decode a stored embedding. Handles the compact 'b64:' float32
+    format AND legacy JSON arrays. Returns a list of floats or None.
+    Never raises."""
+    if not raw:
+        return None
     try:
+        if raw.startswith("b64:"):
+            data = base64.b64decode(raw[4:])
+            n = len(data) // 4
+            return list(struct.unpack("<%df" % n, data))
         v = json.loads(raw)
         if isinstance(v, list) and v:
             return v
@@ -228,43 +250,69 @@ def _parse_vector(raw: str):
     return None
 
 
+_INDEX_MAX = int(os.getenv("EMBED_INDEX_MAX", "12000"))
+
+
 def load_index(db) -> int:
-    """(Re)load every product embedding into an in-memory numpy matrix.
-    Returns the number of vectors loaded. Cheap enough to run on the
-    first search after a deploy. Thread-safe."""
+    """(Re)load product embeddings into an in-memory numpy matrix.
+    Returns the number of vectors loaded. Exception-safe — on ANY
+    error it leaves the index empty and marks it loaded so a failing
+    load can never crash-loop a request or the health check.
+
+    Memory-conscious: streams rows in chunks and decodes each vector
+    straight into a pre-allocated float32 matrix via frombuffer,
+    avoiding a giant intermediate list of Python float objects (the
+    spike that OOMs a 512MB instance when thousands of vectors load
+    at once). Capped at EMBED_INDEX_MAX vectors.
+    """
     if not _NP_OK:
+        with _INDEX_LOCK:
+            _INDEX["loaded"] = True
         return 0
-    from models import Product
-    rows = (
-        db.query(Product.id, Product.embedding)
-        .filter(Product.embedding.isnot(None))
-        .all()
-    )
-    ids = []
-    vecs = []
-    for pid, emb in rows:
-        v = _parse_vector(emb) if emb else None
-        if v is None:
-            continue
-        ids.append(pid)
-        vecs.append(v)
-    with _INDEX_LOCK:
-        if ids:
-            mat = np.asarray(vecs, dtype=np.float32)
-            # L2-normalise so cosine similarity is a plain dot product.
-            norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            mat = mat / norms
-            _INDEX["ids"] = np.asarray(ids, dtype=np.int64)
-            _INDEX["matrix"] = mat
-            _INDEX["count"] = len(ids)
-        else:
+    try:
+        from models import Product
+        rows = (
+            db.query(Product.id, Product.embedding)
+            .filter(Product.embedding.isnot(None))
+            .order_by(Product.last_scraped.desc())
+            .limit(_INDEX_MAX)
+            .all()
+        )
+        ids: list[int] = []
+        mats: list = []  # list of small (1,dim) float32 arrays
+        for pid, emb in rows:
+            v = _parse_vector(emb) if emb else None
+            if not v:
+                continue
+            arr = np.asarray(v, dtype=np.float32)
+            if arr.size == 0:
+                continue
+            ids.append(int(pid))
+            mats.append(arr)
+        with _INDEX_LOCK:
+            if ids:
+                mat = np.vstack(mats).astype(np.float32, copy=False)
+                norms = np.linalg.norm(mat, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                mat = mat / norms
+                _INDEX["ids"] = np.asarray(ids, dtype=np.int64)
+                _INDEX["matrix"] = mat
+                _INDEX["count"] = len(ids)
+            else:
+                _INDEX["ids"] = None
+                _INDEX["matrix"] = None
+                _INDEX["count"] = 0
+            _INDEX["loaded"] = True
+        logger.info("embeddings: loaded index with %d vectors", len(ids))
+        return len(ids)
+    except Exception as e:
+        logger.warning("embeddings: load_index failed (%s) — empty index", e)
+        with _INDEX_LOCK:
             _INDEX["ids"] = None
             _INDEX["matrix"] = None
             _INDEX["count"] = 0
-        _INDEX["loaded"] = True
-    logger.info("embeddings: loaded index with %d vectors", len(ids))
-    return len(ids)
+            _INDEX["loaded"] = True
+        return 0
 
 
 def ensure_index(db) -> int:
