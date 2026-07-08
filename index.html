@@ -430,6 +430,20 @@ function loadStoresG(){
   })
 }
 
+// Shopify CDN images support on-the-fly resizing via the ?width= query
+// param. The scraper stores full-resolution URLs (often 1-2 MB each);
+// at 300 cards that's hundreds of MB on initial load — the "everything
+// takes forever" the user reported. Requesting a 400px thumbnail cuts
+// each image ~5-10x. Only Shopify CDN URLs are transformed; anything
+// else is left untouched. Cards render at ~160-260px, so 400 covers
+// retina crisply.
+function _thumb(url,w){
+  if(!url) return '';
+  if(!/\/cdn\/shop\/|cdn\.shopify\.com/.test(url)) return url; // not Shopify CDN
+  if(/[?&]width=/.test(url)) return url;                        // already sized
+  return url + (url.includes('?') ? '&' : '?') + 'width=' + (w||400);
+}
+
 function card(p,rank){
   const visitors = p.store_visitors || '';
   const lc=p.label==='hero'?'lbl-hero':p.label==='villain'?'lbl-villain':'lbl-normal';
@@ -443,7 +457,7 @@ function card(p,rank){
   // (fashion cards already share an implicit niche).
   const sub = p.subniche && p.subniche!=='fashion' ? `<span class="lbl lbl-sub">${p.subniche}</span>` : '';
   return`<div class="card" onclick="window.open('${p.product_url}','_blank')">
-    <div class="card-img-wrap"><img src="${p.image_url||''}" onerror="this.style.background='var(--s2)';this.style.height='80px'" loading="lazy">${visitors?`<span class="visitor-badge">${visitors} /mo</span>`:''}</div>
+    <div class="card-img-wrap"><img src="${_thumb(p.image_url||'',400)}" onerror="this.style.background='var(--s2)';this.style.height='80px'" loading="lazy" decoding="async">${visitors?`<span class="visitor-badge">${visitors} /mo</span>`:''}</div>
     <div class="card-body"><div class="card-top"><span class="rank">#${rank}</span><span class="lbl ${lc}">${lt}</span></div>
     <div class="card-title">${p.title}</div><div class="card-meta"><span class="card-price">${price}</span>${pc}</div>
     <div class="card-store">${p.store_name} · Pos #${p.current_position}${p.previous_position>0?' (was #'+p.previous_position+')':''} ${sub}</div></div></div>`
