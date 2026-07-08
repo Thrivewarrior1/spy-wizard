@@ -269,6 +269,13 @@ function _feedForCounter(){
   return currentTab==='general' ? 'general' : 'fashion';
 }
 
+// Per-grid atomic-load state. MUST be declared here, above the
+// `if(sw==='1')showApp()` auto-load below — showApp() calls
+// loadCombined()->_loadGrid() which reads _gridState, and a `const`
+// declared further down would be in its temporal dead zone at that
+// point, throwing and leaving the feed stuck on the spinner forever.
+var _gridState={};
+
 function doLogin(){
   fetch(API+'/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})})
   .then(r=>{if(!r.ok)throw 0;return r.json()}).then(()=>{localStorage.setItem('sw','1');showApp()})
@@ -348,7 +355,12 @@ function debounceSearch(fn){clearTimeout(searchTimer);searchTimer=setTimeout(fn,
 //   - the spinner stays up until the LATEST request fully completes
 //   - a stale/superseded response is ignored (never rendered)
 // Result: loading -> (wait for everything) -> all results at once.
-const _gridState={};
+// NOTE: _gridState is declared at the top of the script (near the other
+// state vars) — NOT here — because the logged-in auto-load
+// `if(sw==='1')showApp()` runs BEFORE this point in the script, and
+// showApp()->loadCombined()->_loadGrid() would hit a temporal-dead-zone
+// crash on `const _gridState` if it were declared here. (That crash left
+// the feed stuck on the loading spinner forever — the "endless loading".)
 function _loadGrid(gridId, url, emptyMsg){
   const st=_gridState[gridId]||(_gridState[gridId]={gen:0,controller:null});
   if(st.controller){try{st.controller.abort();}catch(e){}}
