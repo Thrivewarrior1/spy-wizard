@@ -2182,6 +2182,6 @@ async def scrape_all_stores(db: Session) -> dict:
     logger.info(
         f"Scrape complete: {results['total_products']} fashion + "
         f"{results['total_general']} general across "
-        f"{results['stores_with_products']}/{len(stores)} stores"
+        f"{results['stores_with_products']}/{len(store_ids)} stores"
     )
     return results
